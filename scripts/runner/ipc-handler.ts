@@ -19,7 +19,9 @@ import {
   assertUpdateCanHardSync,
   assertBranchCanHardSync,
   evaluateDesktopShell,
+  rebuildDesktopShell,
 } from "./git-ops.js";
+import { inspectDesktopToolchain } from "../desktop-toolchain.js";
 import { readEnvConfig, writeTrustAnyOrigin } from "./env-config.js";
 import { getCurrentBranch } from "./lib/git.js";
 import {
@@ -124,6 +126,43 @@ export async function handleIPCMessage(msg: any, sink?: ResponseSink): Promise<v
       // The tray reports the revision it was compiled from; only the checkout
       // can say whether that predates its desktop sources.
       respond(id, true, evaluateDesktopShell(payload?.builtSha ?? null));
+      break;
+    }
+
+    case "rebuild-desktop": {
+      if (operationInProgress) {
+        respond(id, false, undefined, `Operation '${operationInProgress}' already in progress`);
+        break;
+      }
+
+      // Refuse before compiling rather than after. A missing linker surfaces
+      // as a Rust error several minutes in, which is a poor way to learn a
+      // prerequisite is absent.
+      const toolchain = await inspectDesktopToolchain();
+      if (!toolchain.ready) {
+        const missing = toolchain.checks
+          .filter((check) => check.status === "missing")
+          .map((check) => check.label)
+          .join(", ");
+        respond(id, false, undefined, `Missing desktop build prerequisites: ${missing}`);
+        break;
+      }
+
+      operationInProgress = "rebuild-desktop";
+      try {
+        // Unlike apply-update this answers on completion instead of acking
+        // early. Nothing here stops the server, so no in-flight request dies
+        // waiting, and the caller wants the bundle path the build produced.
+        const bundlePath = await rebuildDesktopShell((message) =>
+          progress(id, "rebuild-desktop", message),
+        );
+        respond(id, true, { bundlePath });
+      } catch (err) {
+        console.error("[runner] Desktop rebuild failed:", err);
+        respond(id, false, undefined, err instanceof Error ? err.message : "Desktop rebuild failed");
+      } finally {
+        operationInProgress = null;
+      }
       break;
     }
 

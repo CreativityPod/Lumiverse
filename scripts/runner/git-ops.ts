@@ -1,5 +1,6 @@
-import { join } from "path";
-import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
+import { delimiter, join } from "path";
+import { homedir } from "os";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { runGit, getUpstreamRef, getCurrentBranch } from "./lib/git.js";
 import {
   PROJECT_ROOT,
@@ -10,6 +11,7 @@ import {
   TIMEOUT_BUN_INSTALL_MS,
   TIMEOUT_BUN_INSTALL_TERMUX_MS,
   TIMEOUT_BUN_BUILD_MS,
+  TIMEOUT_DESKTOP_BUILD_MS,
 } from "./lib/constants.js";
 import { spawnAsync } from "./lib/spawn-async.js";
 import { npmCmd } from "./lib/termux-cli.js";
@@ -365,11 +367,12 @@ export async function runWithServerStopped(
 
 async function runCommandOrThrow(
   cmd: string[],
-  opts: { cwd: string; timeoutMs: number; label: string }
+  opts: { cwd: string; timeoutMs: number; label: string; env?: Record<string, string | undefined> }
 ): Promise<void> {
   const result = await spawnAsync(cmd, {
     cwd: opts.cwd,
     timeoutMs: opts.timeoutMs,
+    env: opts.env,
   });
 
   if (result.exitCode === 0) return;
@@ -875,6 +878,136 @@ export const FRONTEND_BUILD_STEPS = [
     command: ["bun", "run", "scripts/build-frontend.ts"],
   },
 ] as const;
+
+export const DESKTOP_BUILD_STEPS = [
+  {
+    label: "desktop dependency install",
+    progress: "Installing desktop app dependencies...",
+    // Resolved at run time: bunInstallCmd() carries the Windows copyfile
+    // backend and the Termux proot wrapping that a bare `bun install` lacks.
+    command: null,
+  },
+  {
+    label: "desktop Tauri build",
+    progress: "Compiling the desktop app — this can take several minutes...",
+    command: ["bun", "run", "tauri", "build"],
+  },
+] as const satisfies ReadonlyArray<{ label: string; progress: string; command: readonly string[] | null }>;
+
+/**
+ * PATH for the build steps. The tray is a GUI app and launches the runner with
+ * the minimal PATH GUI apps receive, plus bun's own directory — cargo is not on
+ * it. `tauri build` shells out to cargo, so without this the toolchain check
+ * passes (it finds `~/.cargo/bin` itself) and the build then fails to find the
+ * very tool it just confirmed. Mirrors the tray's `prepend_bun_dir_to_path`.
+ */
+function desktopBuildEnv(): Record<string, string | undefined> {
+  const cargoBin = join(homedir(), ".cargo", "bin");
+  const current = process.env.PATH ?? "";
+  const alreadyPresent = current.split(delimiter).includes(cargoBin);
+  return {
+    ...process.env,
+    PATH: alreadyPresent ? current : [cargoBin, current].filter(Boolean).join(delimiter),
+  };
+}
+
+/**
+ * Where `tauri build` leaves the installable artifact, per platform. Checked in
+ * order; the first hit wins. macOS names its bundle deterministically, so it is
+ * matched directly, while the Windows and Linux artifacts carry the version in
+ * their filenames and are found by extension.
+ */
+const DESKTOP_BUNDLE_CANDIDATES: Array<{ dir: string; exact?: string; extensions?: string[] }> = [
+  { dir: "macos", exact: "Lumiverse Desktop.app" },
+  { dir: "dmg", extensions: [".dmg"] },
+  { dir: "msi", extensions: [".msi"] },
+  { dir: "nsis", extensions: [".exe"] },
+  { dir: "appimage", extensions: [".AppImage"] },
+  { dir: "deb", extensions: [".deb"] },
+  { dir: "rpm", extensions: [".rpm"] },
+];
+
+/**
+ * Resolve the freshly built bundle so the tray can point the user straight at
+ * it. Returns the bundle root when no known artifact is present — a directory
+ * the user can open is more useful than reporting nothing.
+ */
+export function resolveDesktopBundlePath(): string | null {
+  return selectDesktopBundleArtifact(
+    join(PROJECT_ROOT, "desktop", "src-tauri", "target", "release", "bundle"),
+  );
+}
+
+/** The artifact-picking half of {@link resolveDesktopBundlePath}, taking an
+ * explicit root so it can be exercised against fixtures. */
+export function selectDesktopBundleArtifact(bundleRoot: string): string | null {
+  if (!existsSync(bundleRoot)) return null;
+
+  for (const candidate of DESKTOP_BUNDLE_CANDIDATES) {
+    const dir = join(bundleRoot, candidate.dir);
+    if (!existsSync(dir)) continue;
+
+    if (candidate.exact) {
+      const exact = join(dir, candidate.exact);
+      if (existsSync(exact)) return exact;
+      continue;
+    }
+
+    // Newest by mtime, not last by name: `bundle/` is never cleared, so a
+    // stale artifact from an earlier version can sit beside the fresh one,
+    // and "0.9.0" sorts after "0.10.0" lexicographically.
+    const match = readdirSync(dir)
+      .filter((entry) => candidate.extensions?.some((ext) => entry.endsWith(ext)))
+      .map((entry) => ({ entry, mtimeMs: statSync(join(dir, entry)).mtimeMs }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+    if (match) return join(dir, match.entry);
+  }
+
+  return bundleRoot;
+}
+
+/**
+ * Build the desktop shell in place.
+ *
+ * Deliberately not wrapped in `runWithServerStopped`. The frontend rebuild
+ * stops the server because it replaces the bundle the server is actively
+ * serving; a Tauri build only writes to `desktop/src-tauri/target`, which
+ * nothing serves. Users can keep chatting while it compiles.
+ *
+ * Note this cannot replace the running tray — it produces a bundle, and
+ * installing it is a separate step.
+ */
+export async function rebuildDesktopShell(reportProgress?: ProgressReporter): Promise<string | null> {
+  const desktopDir = join(PROJECT_ROOT, "desktop");
+  if (!existsSync(join(desktopDir, "src-tauri"))) {
+    throw new Error("This checkout has no desktop/src-tauri directory to build");
+  }
+
+  log("Rebuilding the desktop shell...");
+  const deadline = Date.now() + TIMEOUT_DESKTOP_BUILD_MS;
+  const env = desktopBuildEnv();
+
+  for (const step of DESKTOP_BUILD_STEPS) {
+    const timeoutMs = deadline - Date.now();
+    if (timeoutMs <= 0) {
+      throw new Error(
+        `${step.label} did not start because the desktop build exceeded its ${TIMEOUT_DESKTOP_BUILD_MS / 60_000}m timeout`,
+      );
+    }
+
+    reportProgress?.(step.progress);
+    log(step.progress);
+    await runCommandOrThrow(step.command ? [...step.command] : bunInstallCmd(), {
+      cwd: desktopDir,
+      timeoutMs,
+      label: step.label,
+      env,
+    });
+  }
+
+  log("Desktop shell rebuilt successfully.");
+  return resolveDesktopBundlePath();
+}
 
 export async function rebuildFrontend(
   frontendDir: string,

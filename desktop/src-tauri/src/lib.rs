@@ -148,6 +148,7 @@ pub fn run() {
             runner::desktop_shell_sha,
             runner::quit_app,
             runner::alert,
+            runner::confirm,
             runner::pick_folder,
             frontend::show_frontend,
             frontend::hide_frontend,
