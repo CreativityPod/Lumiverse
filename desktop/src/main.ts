@@ -60,8 +60,6 @@ let updateState: UpdateState = { available: false, commitsBehind: 0, latestMessa
 // carrying desktop changes leaves this process running superseded code.
 let desktopShellStale = false;
 let desktopShellNoticeShown = false;
-let desktopShellChecked = false;
-let updateJustApplied = false;
 let customFrontendUrl: string | null = null;
 let openIntegratedBrowserWhenReady = false;
 
@@ -311,17 +309,33 @@ async function checkForUpdates(interactive: boolean): Promise<void> {
  */
 async function refreshDesktopShellState(): Promise<void> {
   if (!repoDir || !(await client.alive())) return;
-  let state: DesktopShellState;
+
+  // Separate the two failure modes. A runner that predates this message is
+  // expected and transient — stay quiet and keep any verdict we already hold.
+  // The command failing is not: it means the shell is misconfigured, and
+  // swallowing that is what let this check silently never run at all.
+  let builtSha: string | null;
   try {
-    const builtSha = await invoke<string | null>("desktop_shell_sha");
-    state = await client.request<DesktopShellState>("desktop-shell-status", { builtSha }, 15_000);
-  } catch {
-    // An unreachable or older runner cannot answer. Leave the previous
-    // verdict alone rather than clearing a warning we still believe.
+    builtSha = await invoke<string | null>("desktop_shell_sha");
+  } catch (error) {
+    console.error(
+      "[desktop-shell] Could not read this build's revision, so the " +
+        "rebuild check cannot run. Is desktop_shell_sha missing from the " +
+        "tray-commands permission?",
+      error,
+    );
     return;
   }
 
-  desktopShellChecked = true;
+  let state: DesktopShellState;
+  try {
+    state = await client.request<DesktopShellState>("desktop-shell-status", { builtSha }, 15_000);
+  } catch {
+    // An older runner does not know this message. Leave the previous verdict
+    // alone rather than clearing a warning we still believe.
+    return;
+  }
+
   const becameStale = state.stale && !desktopShellStale;
   desktopShellStale = state.stale;
   // A rebuild clears the condition; let the notice fire again if it recurs.
@@ -348,7 +362,6 @@ async function refreshDesktopShellState(): Promise<void> {
 
 async function applyUpdate(): Promise<void> {
   await ensureRunner();
-  updateJustApplied = true;
   busyMessage = "Applying update…";
   await updateMenu();
   try {
@@ -688,10 +701,13 @@ async function boot(): Promise<void> {
     if (state === "running" || state === "stopped" || state === "crashed") {
       busyMessage = null;
     }
-    // The check needs a live runner, so the first chance to run it is the
-    // server coming up. Repeat it once an applied update has settled.
-    if (state === "running" && (!desktopShellChecked || updateJustApplied)) {
-      updateJustApplied = false;
+    // Re-check on every start, not just the first. The checkout can move
+    // underneath a long-running tray — a git pull outside the app is the most
+    // likely way a desktop change arrives, and it fires no event here. A
+    // latch would mean the notice waited for the next app launch. The cost is
+    // three git commands, and the dialog is gated on the stale transition
+    // rather than on this call, so restarting the server cannot nag.
+    if (state === "running") {
       void refreshDesktopShellState();
     }
     void refreshStatus().then(updateMenu);
