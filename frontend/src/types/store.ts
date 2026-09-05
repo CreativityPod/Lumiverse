@@ -91,7 +91,7 @@ export interface ChatSlice {
   /** Current raw (unflushed) streaming buffers — used to request pool deltas. */
   getStreamBuffers: () => { content: string; reasoning: string }
   setStreamingReasoningStartedAt: (ts: number | null) => void
-  /** Set the swipe index the active generation streams into (null when unknown). */
+  /** Set the confirmed streaming swipe index and recover its slot if a staging event was missed. */
   setStreamingSwipeId: (swipeId: number | null) => void
   /** Flag a freshly-generated swipe as unseen (drives the "new swipe ready" badge). */
   setUnseenSwipe: (messageId: string, swipeId: number) => void
@@ -452,6 +452,11 @@ export interface GuidedGeneration {
   mode: 'persistent' | 'oneshot'
   enabled: boolean
   color?: string | null
+  /** Optional context rule that activates this guide in addition to the manual switch. */
+  autoEnable?: {
+    scope: 'connection' | 'chat' | 'character'
+    id: string
+  } | null
 }
 
 export interface QuickReply {
@@ -875,7 +880,7 @@ export interface DrawerSettings {
 export interface SpindleSettings {
   interceptorTimeoutMs: number
   dockPanelDesktopSide: 'left' | 'right'
-  /** Show routine Spindle lifecycle and WebSocket events in the browser console. */
+  /** Show routine WebSocket and Spindle lifecycle events in the browser console. */
   infoLoggingEnabled: boolean
   /** Per-extension opt-out for update notification toasts. */
   extensionUpdateToastDisabled: Record<string, boolean>

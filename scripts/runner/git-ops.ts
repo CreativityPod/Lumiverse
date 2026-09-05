@@ -1,5 +1,6 @@
-import { join } from "path";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import { delimiter, join } from "path";
+import { homedir } from "os";
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { runGit, getUpstreamRef, getCurrentBranch } from "./lib/git.js";
 import {
   PROJECT_ROOT,
@@ -8,7 +9,9 @@ import {
   TIMEOUT_GIT_PULL_MS,
   TIMEOUT_GIT_CHECKOUT_MS,
   TIMEOUT_BUN_INSTALL_MS,
+  TIMEOUT_BUN_INSTALL_TERMUX_MS,
   TIMEOUT_BUN_BUILD_MS,
+  TIMEOUT_DESKTOP_BUILD_MS,
 } from "./lib/constants.js";
 import { spawnAsync } from "./lib/spawn-async.js";
 import { npmCmd } from "./lib/termux-cli.js";
@@ -17,6 +20,15 @@ export interface UpdateState {
   available: boolean;
   commitsBehind: number;
   latestMessage: string;
+}
+
+export interface DesktopShellState {
+  /** The checkout contains desktop changes the running binary predates. */
+  stale: boolean;
+  /** Commit the running desktop shell was compiled from, if it reported one. */
+  builtSha: string | null;
+  /** Newest commit touching `desktop/` in the checkout. */
+  requiredSha: string | null;
 }
 
 type ProgressReporter = (message: string) => void;
@@ -70,6 +82,43 @@ function shouldRebuildFrontend(changedFiles: string[] | null): boolean {
   return changedFiles === null || changedFiles.some(isFrontendBuildInput);
 }
 
+/** Newest commit that touched the desktop shell's sources. */
+function getLastDesktopShellCommit(): string | null {
+  const log = runGit("log", "-1", "--format=%H", "--", "desktop");
+  if (!log.ok || !log.out) return null;
+  return log.out;
+}
+
+function commitExists(sha: string): boolean {
+  return runGit("cat-file", "-e", `${sha}^{commit}`).ok;
+}
+
+/**
+ * Decide whether the running desktop shell predates the checkout's desktop
+ * sources.
+ *
+ * The shell is a compiled binary that `applyUpdate` cannot replace, so a pull
+ * carrying `desktop/` changes leaves the user running code the checkout has
+ * already moved past — with no symptom other than the old behaviour
+ * persisting. Equality is the wrong test: the stamped revision is whatever
+ * HEAD was at build time, which normally sits *ahead* of the last commit that
+ * touched `desktop/`. What matters is whether that commit is already reachable
+ * from the build.
+ *
+ * Every branch that cannot answer confidently reports "not stale". A shell
+ * built from an archive, or from a history this checkout does not share, is
+ * unknowable rather than out of date, and a false warning telling someone to
+ * rebuild a current binary is worse than staying quiet.
+ */
+export function evaluateDesktopShell(builtSha: string | null): DesktopShellState {
+  const requiredSha = getLastDesktopShellCommit();
+  if (!builtSha || !requiredSha) return { stale: false, builtSha, requiredSha };
+  if (!commitExists(builtSha)) return { stale: false, builtSha, requiredSha };
+
+  const containsDesktopSources = runGit("merge-base", "--is-ancestor", requiredSha, builtSha).ok;
+  return { stale: !containsDesktopSources, builtSha, requiredSha };
+}
+
 // Termux/proot detection. start.sh exports LUMIVERSE_IS_TERMUX /
 // LUMIVERSE_IS_PROOT before launching the runner so we can mirror its
 // install-time workarounds (copyfile backend, pre-install cache flush) on
@@ -82,14 +131,36 @@ function isProotRuntime(): boolean {
   return process.env.LUMIVERSE_IS_PROOT === "true";
 }
 
-export function bunInstallCmd(platform: NodeJS.Platform = process.platform): string[] {
-  if (isTermuxRuntime() || isProotRuntime()) {
-    // Android filesystem emulation can't hardlink — copyfile is the only
-    // backend that reliably installs without "Cannot find package" corruption.
-    // --ignore-scripts: proot's path translation makes getcwd() fail when bun
-    // forks lifecycle scripts (ssh2, cpu-features), producing spurious
-    // CouldntReadCurrentDirectory errors. Both packages fall back to pure-JS.
-    return ["bun", "install", "--backend=copyfile", "--ignore-scripts"];
+export function bunInstallCmd(
+  platform: NodeJS.Platform = process.platform,
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  const installArgs = ["install", "--backend=copyfile", "--ignore-scripts"];
+
+  if (env.LUMIVERSE_IS_TERMUX === "true") {
+    // Native Termux needs syscall interception for bun install even when the
+    // bun-termux wrapper or grun can execute ordinary Bun commands. Mirror
+    // start.sh's _proot_bun path rather than spawning bare Bun from the runner.
+    const bunPath = env.LUMIVERSE_BUN_PATH || "bun";
+    const method = env.LUMIVERSE_BUN_METHOD;
+    if (method === "direct") {
+      return ["proot", "--link2symlink", "-0", bunPath, ...installArgs];
+    }
+    if (method === "grun") {
+      return ["proot", "--link2symlink", "-0", "grun", bunPath, ...installArgs];
+    }
+
+    const prefix = env.PREFIX || "/data/data/com.termux/files/usr";
+    return [
+      "proot", "--link2symlink", "-0",
+      `${prefix}/glibc/lib/ld-linux-aarch64.so.1`,
+      "--library-path", `${prefix}/glibc/lib`,
+      bunPath, ...installArgs,
+    ];
+  }
+  if (env.LUMIVERSE_IS_PROOT === "true") {
+    // A proot-distro shell already provides syscall interception.
+    return ["bun", ...installArgs];
   }
   if (platform === "win32") {
     // Windows normally hardlinks packages from Bun's cache. Filesystem filters
@@ -97,6 +168,14 @@ export function bunInstallCmd(platform: NodeJS.Platform = process.platform): str
     return ["bun", "install", "--backend=copyfile"];
   }
   return ["bun", "install"];
+}
+
+export function bunInstallTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  return env.LUMIVERSE_IS_TERMUX === "true" || env.LUMIVERSE_IS_PROOT === "true"
+    ? TIMEOUT_BUN_INSTALL_TERMUX_MS
+    : TIMEOUT_BUN_INSTALL_MS;
 }
 
 function clearBunInstallCacheIfTermux(): void {
@@ -288,11 +367,12 @@ export async function runWithServerStopped(
 
 async function runCommandOrThrow(
   cmd: string[],
-  opts: { cwd: string; timeoutMs: number; label: string }
+  opts: { cwd: string; timeoutMs: number; label: string; env?: Record<string, string | undefined> }
 ): Promise<void> {
   const result = await spawnAsync(cmd, {
     cwd: opts.cwd,
     timeoutMs: opts.timeoutMs,
+    env: opts.env,
   });
 
   if (result.exitCode === 0) return;
@@ -536,6 +616,7 @@ export async function switchBranch(
 const INSTALL_STAMP = "node_modules/.lumiverse-install-complete";
 const INSTALL_BACKUP_PREFIX = "node_modules.lumiverse-backup-";
 const MAX_MISSING_DEP_PREVIEW = 5;
+const LOCAL_INSTALL_INPUTS = ["package.json", "bun.lock", "bunfig.toml", ".npmrc"];
 
 interface DependencyTreeState {
   hasNodeModules: boolean;
@@ -591,6 +672,29 @@ export function summarizeMissingDependencyPackages(missingPackages: string[]): s
 
 function writeInstallStamp(dir: string): void {
   try { writeFileSync(join(dir, INSTALL_STAMP), `${Date.now()}\n`); } catch {}
+}
+
+/**
+ * Detect an install that began after new dependency inputs landed but never
+ * reached writeInstallStamp(). This lets the next update retry even when the
+ * failed update already advanced HEAD and its manifest delta is no longer in
+ * the next changed-file range. Missing stamps may belong to a healthy manual
+ * install, so only an existing, provably older stamp is considered stale.
+ */
+export function dependencyInstallStampIsStale(dir: string): boolean {
+  const stampPath = join(dir, INSTALL_STAMP);
+  if (!existsSync(stampPath)) return false;
+
+  try {
+    const stampMtime = statSync(stampPath).mtimeMs;
+    return LOCAL_INSTALL_INPUTS.some((relativePath) => {
+      const inputPath = join(dir, relativePath);
+      return existsSync(inputPath) && statSync(inputPath).mtimeMs > stampMtime;
+    });
+  } catch {
+    // A concurrently replaced stamp/input is safest to reconcile by reinstalling.
+    return true;
+  }
 }
 
 export function prepareDependencyInstall(dir: string, label: string): PreparedDependencyInstall {
@@ -688,7 +792,7 @@ async function installDependenciesForDir(
   try {
     await runCommandOrThrow(installCmd, {
       cwd: dir,
-      timeoutMs: TIMEOUT_BUN_INSTALL_MS,
+      timeoutMs: bunInstallTimeoutMs(),
       label: `${label} install`,
     });
     if (postInstall) await postInstall();
@@ -728,19 +832,30 @@ async function ensureChangedDependencies(
     isTermuxRuntime() || isProotRuntime(),
     manifestRefs,
   );
+  const retryBackendInstall = !plan.installBackend && dependencyInstallStampIsStale(PROJECT_ROOT);
+  const retryFrontendInstall = !plan.installFrontend && dependencyInstallStampIsStale(frontendDir);
+  const installBackend = plan.installBackend || retryBackendInstall;
+  const installFrontend = plan.installFrontend || retryFrontendInstall;
 
-  if (plan.installBackend) {
+  if (retryBackendInstall) {
+    log("Backend dependency inputs are newer than the last successful install; retrying.");
+  }
+  if (retryFrontendInstall) {
+    log("Frontend dependency inputs are newer than the last successful install; retrying.");
+  }
+
+  if (installBackend) {
     reportProgress?.("Installing backend dependencies...");
     await ensureBackendDependencies();
   }
-  if (plan.installFrontend) {
+  if (installFrontend) {
     reportProgress?.("Installing frontend dependencies...");
     await ensureFrontendDependencies(frontendDir);
   }
-  if (!plan.installBackend && !plan.installFrontend) {
+  if (!installBackend && !installFrontend) {
     log("Dependency manifests are unchanged; skipping package installation.");
   }
-  if (plan.repairTermuxFrontendNativeDeps) {
+  if (plan.repairTermuxFrontendNativeDeps && !installFrontend) {
     reportProgress?.("Repairing Termux frontend native bindings...");
     await repairTermuxFrontendNativeDeps(frontendDir);
   }
@@ -763,6 +878,136 @@ export const FRONTEND_BUILD_STEPS = [
     command: ["bun", "run", "scripts/build-frontend.ts"],
   },
 ] as const;
+
+export const DESKTOP_BUILD_STEPS = [
+  {
+    label: "desktop dependency install",
+    progress: "Installing desktop app dependencies...",
+    // Resolved at run time: bunInstallCmd() carries the Windows copyfile
+    // backend and the Termux proot wrapping that a bare `bun install` lacks.
+    command: null,
+  },
+  {
+    label: "desktop Tauri build",
+    progress: "Compiling the desktop app — this can take several minutes...",
+    command: ["bun", "run", "tauri", "build"],
+  },
+] as const satisfies ReadonlyArray<{ label: string; progress: string; command: readonly string[] | null }>;
+
+/**
+ * PATH for the build steps. The tray is a GUI app and launches the runner with
+ * the minimal PATH GUI apps receive, plus bun's own directory — cargo is not on
+ * it. `tauri build` shells out to cargo, so without this the toolchain check
+ * passes (it finds `~/.cargo/bin` itself) and the build then fails to find the
+ * very tool it just confirmed. Mirrors the tray's `prepend_bun_dir_to_path`.
+ */
+function desktopBuildEnv(): Record<string, string | undefined> {
+  const cargoBin = join(homedir(), ".cargo", "bin");
+  const current = process.env.PATH ?? "";
+  const alreadyPresent = current.split(delimiter).includes(cargoBin);
+  return {
+    ...process.env,
+    PATH: alreadyPresent ? current : [cargoBin, current].filter(Boolean).join(delimiter),
+  };
+}
+
+/**
+ * Where `tauri build` leaves the installable artifact, per platform. Checked in
+ * order; the first hit wins. macOS names its bundle deterministically, so it is
+ * matched directly, while the Windows and Linux artifacts carry the version in
+ * their filenames and are found by extension.
+ */
+const DESKTOP_BUNDLE_CANDIDATES: Array<{ dir: string; exact?: string; extensions?: string[] }> = [
+  { dir: "macos", exact: "Lumiverse Desktop.app" },
+  { dir: "dmg", extensions: [".dmg"] },
+  { dir: "msi", extensions: [".msi"] },
+  { dir: "nsis", extensions: [".exe"] },
+  { dir: "appimage", extensions: [".AppImage"] },
+  { dir: "deb", extensions: [".deb"] },
+  { dir: "rpm", extensions: [".rpm"] },
+];
+
+/**
+ * Resolve the freshly built bundle so the tray can point the user straight at
+ * it. Returns the bundle root when no known artifact is present — a directory
+ * the user can open is more useful than reporting nothing.
+ */
+export function resolveDesktopBundlePath(): string | null {
+  return selectDesktopBundleArtifact(
+    join(PROJECT_ROOT, "desktop", "src-tauri", "target", "release", "bundle"),
+  );
+}
+
+/** The artifact-picking half of {@link resolveDesktopBundlePath}, taking an
+ * explicit root so it can be exercised against fixtures. */
+export function selectDesktopBundleArtifact(bundleRoot: string): string | null {
+  if (!existsSync(bundleRoot)) return null;
+
+  for (const candidate of DESKTOP_BUNDLE_CANDIDATES) {
+    const dir = join(bundleRoot, candidate.dir);
+    if (!existsSync(dir)) continue;
+
+    if (candidate.exact) {
+      const exact = join(dir, candidate.exact);
+      if (existsSync(exact)) return exact;
+      continue;
+    }
+
+    // Newest by mtime, not last by name: `bundle/` is never cleared, so a
+    // stale artifact from an earlier version can sit beside the fresh one,
+    // and "0.9.0" sorts after "0.10.0" lexicographically.
+    const match = readdirSync(dir)
+      .filter((entry) => candidate.extensions?.some((ext) => entry.endsWith(ext)))
+      .map((entry) => ({ entry, mtimeMs: statSync(join(dir, entry)).mtimeMs }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+    if (match) return join(dir, match.entry);
+  }
+
+  return bundleRoot;
+}
+
+/**
+ * Build the desktop shell in place.
+ *
+ * Deliberately not wrapped in `runWithServerStopped`. The frontend rebuild
+ * stops the server because it replaces the bundle the server is actively
+ * serving; a Tauri build only writes to `desktop/src-tauri/target`, which
+ * nothing serves. Users can keep chatting while it compiles.
+ *
+ * Note this cannot replace the running tray — it produces a bundle, and
+ * installing it is a separate step.
+ */
+export async function rebuildDesktopShell(reportProgress?: ProgressReporter): Promise<string | null> {
+  const desktopDir = join(PROJECT_ROOT, "desktop");
+  if (!existsSync(join(desktopDir, "src-tauri"))) {
+    throw new Error("This checkout has no desktop/src-tauri directory to build");
+  }
+
+  log("Rebuilding the desktop shell...");
+  const deadline = Date.now() + TIMEOUT_DESKTOP_BUILD_MS;
+  const env = desktopBuildEnv();
+
+  for (const step of DESKTOP_BUILD_STEPS) {
+    const timeoutMs = deadline - Date.now();
+    if (timeoutMs <= 0) {
+      throw new Error(
+        `${step.label} did not start because the desktop build exceeded its ${TIMEOUT_DESKTOP_BUILD_MS / 60_000}m timeout`,
+      );
+    }
+
+    reportProgress?.(step.progress);
+    log(step.progress);
+    await runCommandOrThrow(step.command ? [...step.command] : bunInstallCmd(), {
+      cwd: desktopDir,
+      timeoutMs,
+      label: step.label,
+      env,
+    });
+  }
+
+  log("Desktop shell rebuilt successfully.");
+  return resolveDesktopBundlePath();
+}
 
 export async function rebuildFrontend(
   frontendDir: string,

@@ -74,6 +74,7 @@ import { WorkerHostImageGenApi } from "./worker-host-image-gen-api";
 import { WorkerHostProcessApi } from "./worker-host-process-api";
 import { WorkerHostInteractionApi } from "./worker-host-interaction-api";
 import { WorkerHostPresentationApi } from "./worker-host-presentation-api";
+import { WorkerHostMcpApi } from "./worker-host-mcp-api";
 import { createRuntimeTransport, type RuntimeTransport } from "./runtime-transport";
 import {
   providerRegistry,
@@ -120,6 +121,7 @@ import { join, resolve, sep } from "path";
 const sharedRpcPermissionScope = new AsyncLocalStorage<string | undefined>();
 
 type ManagedSpindlePermission = Parameters<typeof managerSvc.hasPermission>[1];
+type RuntimeSpindlePermission = ManagedSpindlePermission | "mcp_servers" | "mcp_servers.create";
 type TokenModelSource = "main" | "sidecar" | "explicit";
 
 type ChatAppendGenerationOptions = {
@@ -314,6 +316,7 @@ type RuntimeWorkerToHost =
     }
   | { type: "toast_show"; toastType: "success" | "warning" | "error" | "info"; message: string; title?: string; duration?: number; userId?: string }
   | { type: "prompt_regex_set_owned"; chatIds: string[] }
+  | { type: "image_gen_generate_native"; requestId: string; input: any }
   | { type: "user_storage_read_binary"; requestId: string; path: string; userId?: string }
   | { type: "user_get_role"; requestId: string; userId?: string }
   | {
@@ -575,6 +578,13 @@ type RuntimeWorkerToHost =
     }
   | { type: "image_gen_generate_stream"; requestId: string; input: Record<string, unknown> }
   | { type: "image_gen_cancel_stream"; requestId: string }
+  | { type: "mcp_servers_list"; requestId: string; limit?: number; offset?: number; userId?: string }
+  | { type: "mcp_servers_get"; requestId: string; serverId: string; userId?: string }
+  | { type: "mcp_servers_create"; requestId: string; input: import("../types/mcp-server").SpindleMcpServerCreateDTO; userId?: string }
+  | { type: "mcp_servers_connect"; requestId: string; serverId: string; userId?: string }
+  | { type: "mcp_servers_status"; requestId: string; serverId: string; userId?: string }
+  | { type: "mcp_tools_list"; requestId: string; serverId: string; userId?: string }
+  | { type: "mcp_tools_call"; requestId: string; serverId: string; toolName: string; args: Record<string, unknown>; timeoutMs?: number; userId?: string }
   | ProviderWorkerToHost;
 
 type RuntimeHostToWorker =
@@ -862,6 +872,11 @@ function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {
 export class WorkerHost {
   private runtime: RuntimeTransport | null = null;
   private eventUnsubscribers = new Map<string, () => void>();
+  // Events queued before the worker subscribes (extension start replays);
+  // flushed by handleSubscribeEvent once the subscription lands. Entries
+  // expire so a late subscriber cannot receive boot-time state as fresh.
+  private pendingEventReplays = new Map<string, Array<{ payload: unknown; userId: string; queuedAt: number }>>();
+  private static readonly EVENT_REPLAY_TTL_MS = 30_000;
   private pendingRequests = new Map<
     string,
     { resolve: (value: unknown) => void; reject: (reason: unknown) => void }
@@ -900,6 +915,7 @@ export class WorkerHost {
   private readonly processApi: WorkerHostProcessApi;
   private readonly interactionApi: WorkerHostInteractionApi;
   private readonly presentationApi: WorkerHostPresentationApi;
+  private readonly mcpApi: WorkerHostMcpApi;
   private sharedRpcPermissionScopes = new Map<string, Set<string>>();
 
   constructor(
@@ -977,6 +993,12 @@ export class WorkerHost {
       enforceScopedUser: (userId) => this.enforceScopedUser(userId),
       post: (message) => this.postToWorker(message),
     });
+    this.mcpApi = new WorkerHostMcpApi({
+      hasPermission: (permission) => this.hasPermission(permission),
+      resolveEffectiveUserId: (userId) => this.resolveEffectiveUserId(userId),
+      enforceScopedUser: (userId) => this.enforceScopedUser(userId),
+      postResponse: (message) => this.postToWorker(message),
+    });
     providerRegistry.configure({ getSecret, approvedBrokerOrigins: getApprovedBrokerOrigins() });
     providerRegistry.attachWorker(this.extensionId, (message) => {
       this.postToWorker(message);
@@ -998,7 +1020,7 @@ export class WorkerHost {
     }
   }
 
-  private getGrantedPermissions(): ManagedSpindlePermission[] {
+  private getGrantedPermissions(): RuntimeSpindlePermission[] {
     const granted = managerSvc.getGrantedPermissions(this.manifest.identifier);
     const scopeId = sharedRpcPermissionScope.getStore();
     if (!scopeId) return granted;
@@ -1008,12 +1030,12 @@ export class WorkerHost {
     return granted.filter((permission) => scoped.has(permission));
   }
 
-  private hasPermission(permission: ManagedSpindlePermission): boolean {
+  private hasPermission(permission: RuntimeSpindlePermission): boolean {
     const scopeId = sharedRpcPermissionScope.getStore();
-    if (!scopeId) return managerSvc.hasPermission(this.manifest.identifier, permission);
+    if (!scopeId) return managerSvc.hasPermission(this.manifest.identifier, permission as ManagedSpindlePermission);
 
     const scoped = this.sharedRpcPermissionScopes.get(scopeId);
-    return Boolean(scoped?.has(permission)) && managerSvc.hasPermission(this.manifest.identifier, permission);
+    return Boolean(scoped?.has(permission)) && managerSvc.hasPermission(this.manifest.identifier, permission as ManagedSpindlePermission);
   }
 
   private getStorageRootPath(identifier: string = this.manifest.identifier): string {
@@ -1194,6 +1216,7 @@ export class WorkerHost {
         capabilities: Object.freeze({
           ...SPINDLE_HOST_CAPABILITIES,
           "frontend-runtime-capabilities-v1": 1,
+          "mcp-servers-v1": 1,
         }),
         extensionInstallationId: this.extensionId,
       },
@@ -1447,20 +1470,26 @@ export class WorkerHost {
    * Forwarded on its own top-level field (same rationale as `councilMember`:
    * host-provided truth that must not collide with user-space `args`).
    * Multipart content is flattened to its text portion via `getTextContent`.
+   *
+   * `userId` is authenticated host context supplied by the generation path. It is
+   * transported separately from model-controlled `args` and must never be sourced
+   * from an invocation argument.
    */
   invokeExtensionTool(
     toolName: string,
     args: Record<string, unknown>,
     timeoutMs = 30_000,
+    userId: string,
     councilMember?: CouncilMemberContext,
     contextMessages?: LlmMessage[]
   ): Promise<string> {
+    if (!userId) return Promise.reject(new Error("Extension tool invocation requires authenticated user context"));
     const requestId = crypto.randomUUID();
 
-    // Defensive strip: never forward authentication-style metadata to the
-    // worker. Even if a caller leaks `__userId` or similar in args, the
-    // extension handler must not see it — extensions identify themselves via
-    // their worker context, not a string parameter they could exfiltrate.
+    // Defensive strip: never trust authentication-shaped metadata from tool
+    // args. Even if model-controlled input leaks `__userId` or similar, keep
+    // it out of the payload. The only user identity delivered to the worker is
+    // authenticated host context on the top-level invocation envelope.
     const sanitizedArgs: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(args)) {
       if (key === "__userId" || key === "__user_id" || key === "userId") continue;
@@ -1480,6 +1509,7 @@ export class WorkerHost {
       requestId,
       toolName,
       args: sanitizedArgs,
+      userId,
       ...(councilMember ? { councilMember } : {}),
       ...(contextMessagesDTO ? { contextMessages: contextMessagesDTO } : {}),
     });
@@ -2441,6 +2471,9 @@ export class WorkerHost {
       case "image_gen_generate":
         void this.imageGenApi.handleGenerate(msg.requestId, msg.input);
         break;
+      case "image_gen_generate_native":
+        void this.imageGenApi.handleGenerateNative(msg.requestId, msg.input);
+        break;
       case "image_gen_providers":
         this.imageGenApi.handleProviders(msg.requestId);
         break;
@@ -2458,6 +2491,28 @@ export class WorkerHost {
         break;
       case "image_gen_cancel_stream":
         this.imageGenApi.cancelStream(msg.requestId);
+        break;
+      // ─── MCP servers (gated and user-scoped) ───────────────────────────
+      case "mcp_servers_list":
+        this.mcpApi.handleList(msg.requestId, msg.limit, msg.offset, msg.userId);
+        break;
+      case "mcp_servers_get":
+        this.mcpApi.handleGet(msg.requestId, msg.serverId, msg.userId);
+        break;
+      case "mcp_servers_create":
+        this.mcpApi.handleCreate(msg.requestId, msg.input, msg.userId);
+        break;
+      case "mcp_servers_connect":
+        this.mcpApi.handleConnect(msg.requestId, msg.serverId, msg.userId);
+        break;
+      case "mcp_servers_status":
+        this.mcpApi.handleStatus(msg.requestId, msg.serverId, msg.userId);
+        break;
+      case "mcp_tools_list":
+        this.mcpApi.handleListTools(msg.requestId, msg.serverId, msg.userId);
+        break;
+      case "mcp_tools_call":
+        this.mcpApi.handleCallTool(msg.requestId, msg.serverId, msg.toolName, msg.args, msg.timeoutMs, msg.userId);
         break;
       // ─── Chat style mode (gated: "app_manipulation") ────────────────────
       case "chat_set_style_mode":
@@ -2570,6 +2625,41 @@ export class WorkerHost {
       });
     });
     this.eventUnsubscribers.set(event, unsub);
+
+    const queued = this.pendingEventReplays.get(event);
+    if (queued) {
+      this.pendingEventReplays.delete(event);
+      const freshAfter = Date.now() - WorkerHost.EVENT_REPLAY_TTL_MS;
+      for (const replay of queued) {
+        if (replay.queuedAt < freshAfter) continue;
+        if (scopedUserId && replay.userId !== scopedUserId) continue;
+        this.postToWorker({
+          type: "event",
+          event,
+          payload: replay.payload,
+          userId: replay.userId,
+        });
+      }
+    }
+  }
+
+  /**
+   * Deliver an event to the worker even though it fired before the worker
+   * subscribed. Used on extension start to replay one-shot state such as the
+   * open chat, which otherwise leaves a restarted extension blind until the
+   * next real event. Posts immediately when already subscribed, else queues
+   * until handleSubscribeEvent lands.
+   */
+  queueEventReplay(event: string, payload: unknown, userId: string): void {
+    if (this.eventUnsubscribers.has(event)) {
+      const scopedUserId = this.getScopedUserId();
+      if (scopedUserId && userId !== scopedUserId) return;
+      this.postToWorker({ type: "event", event, payload, userId });
+      return;
+    }
+    const list = this.pendingEventReplays.get(event) ?? [];
+    list.push({ payload, userId, queuedAt: Date.now() });
+    this.pendingEventReplays.set(event, list);
   }
 
   private handleUnsubscribeEvent(event: string): void {

@@ -31,6 +31,12 @@ export interface UpdateState {
   latestMessage: string;
 }
 
+export interface DesktopShellState {
+  stale: boolean;
+  builtSha: string | null;
+  requiredSha: string | null;
+}
+
 interface ResponsePayload {
   success: boolean;
   data?: unknown;

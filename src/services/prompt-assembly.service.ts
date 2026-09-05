@@ -22,7 +22,6 @@ import type {
   CustomBody,
   AuthorsNote,
   AdvancedSettings,
-  PromptVariableDef,
   PromptVariableValue,
   PromptVariableValues,
 } from "../types/preset";
@@ -36,6 +35,10 @@ import type { Message, MessageAttachment } from "../types/message";
 import type { Preset } from "../types/preset";
 import type { ConnectionProfile } from "../types/connection-profile";
 import {
+  normalizeGuidedGenerations,
+  type GuidedGeneration,
+} from "./guided-generations";
+import {
   evaluate,
   buildEnv,
   cloneEnv,
@@ -45,6 +48,8 @@ import {
   withPromptBlockContext,
 } from "../macros";
 import type { MacroEnv } from "../macros";
+import { coercePromptVariable } from "../utils/prompt-variable-values";
+import { createActivationInputSnapshot } from "../utils/regex-activation-inputs";
 import {
   activateWorldInfo,
   applyWorldInfoGroupLogic,
@@ -121,6 +126,7 @@ import { getCharacterDatabankIds } from "../utils/character-databanks";
 import { getSidecarSettings } from "./sidecar-settings.service";
 import { getChatBackgroundSignal, trackChatBackgroundTask } from "./chat-background.service";
 import * as regexScriptsSvc from "./regex-scripts.service";
+import { applyPromptActivations } from "./prompt-activation.service";
 import { createPromptAssemblyProfiler } from "./prompt-assembly-profiler";
 import { rankVectorWorldInfoCandidatesInWorker } from "./world-info-vector-ranking-worker-host";
 import {
@@ -1194,15 +1200,6 @@ const SAMPLER_DEFAULTS: Record<string, number> = {
   temperature: 1.0,
 };
 
-interface GuidedGeneration {
-  id: string;
-  name: string;
-  content: string;
-  position: "system" | "user_prefix" | "user_suffix";
-  mode: "persistent" | "oneshot";
-  enabled: boolean;
-}
-
 function isAppendRole(role: string): boolean {
   return role === "user_append" || role === "assistant_append";
 }
@@ -1477,91 +1474,7 @@ export function resolvePromptVariables(
   }
 }
 
-interface CoercedPromptVar {
-  /** What {{var::name}} resolves to (or its stringified form). */
-  rendered: string | number;
-  /** Currently selected option ids — only meaningful for multiselect/select; empty otherwise. */
-  selectedIds: string[];
-}
-
-export function coercePromptVariable(
-  def: PromptVariableDef,
-  raw: unknown,
-): CoercedPromptVar {
-  switch (def.type) {
-    case "text":
-    case "textarea": {
-      if (raw === undefined || raw === null) return { rendered: def.defaultValue ?? "", selectedIds: [] };
-      return { rendered: String(raw), selectedIds: [] };
-    }
-    case "number": {
-      const fallback =
-        typeof def.defaultValue === "number" ? def.defaultValue : 0;
-      const n = raw === undefined || raw === null ? fallback : Number(raw);
-      const v = Number.isFinite(n) ? n : fallback;
-      return { rendered: clampNumber(v, def.min, def.max), selectedIds: [] };
-    }
-    case "slider": {
-      const fallback = def.defaultValue;
-      const n = raw === undefined || raw === null ? fallback : Number(raw);
-      const v = Number.isFinite(n) ? n : fallback;
-      return { rendered: clampNumber(v, def.min, def.max), selectedIds: [] };
-    }
-    case "select": {
-      const options = def.options ?? [];
-      const validIds = new Set(options.map((o) => o.id));
-      const fallback = validIds.has(def.defaultValue)
-        ? def.defaultValue
-        : options[0]?.id ?? "";
-      const candidate =
-        raw === undefined || raw === null ? fallback : String(raw);
-      const selectedId = validIds.has(candidate) ? candidate : fallback;
-      const match = options.find((o) => o.id === selectedId);
-      return {
-        rendered: match?.value ?? "",
-        selectedIds: selectedId ? [selectedId] : [],
-      };
-    }
-    case "switch": {
-      const fallback: 0 | 1 = def.defaultValue === 1 ? 1 : 0;
-      if (raw === undefined || raw === null) {
-        return { rendered: fallback, selectedIds: [] };
-      }
-      // Accept booleans, "0"/"1", "true"/"false", and numeric 0/1.
-      let on = false;
-      if (typeof raw === "boolean") on = raw;
-      else if (typeof raw === "number") on = raw === 1;
-      else {
-        const s = String(raw).trim().toLowerCase();
-        on = s === "1" || s === "true" || s === "on" || s === "yes";
-      }
-      return { rendered: on ? 1 : 0, selectedIds: [] };
-    }
-    case "multiselect": {
-      const options = def.options ?? [];
-      const validIds = new Set(options.map((o) => o.id));
-      let rawIds: string[];
-      if (Array.isArray(raw)) {
-        rawIds = raw.map((v) => String(v));
-      } else if (raw === undefined || raw === null) {
-        rawIds = Array.isArray(def.defaultValue) ? def.defaultValue.slice() : [];
-      } else if (typeof raw === "string" && raw.length > 0) {
-        rawIds = raw.split(",").map((s) => s.trim()).filter(Boolean);
-      } else {
-        rawIds = [];
-      }
-      // Preserve option-declaration order so the joined output is stable
-      // regardless of the order the end user clicked the checkboxes in.
-      const selectedSet = new Set(rawIds.filter((id) => validIds.has(id)));
-      const orderedSelected = options.filter((o) => selectedSet.has(o.id));
-      const separator = typeof def.separator === "string" ? def.separator : "\n\n";
-      return {
-        rendered: orderedSelected.map((o) => o.value).join(separator),
-        selectedIds: orderedSelected.map((o) => o.id),
-      };
-    }
-  }
-}
+export { coercePromptVariable } from "../utils/prompt-variable-values";
 
 const PROMPT_BLOCK_ROLES = new Set<PromptBlock["role"]>([
   "system",
@@ -1640,17 +1553,6 @@ export function resolvePromptBlockPlacements(
       depth: Math.floor(placement.depth),
     };
   });
-}
-
-function clampNumber(
-  value: number,
-  min: number | undefined,
-  max: number | undefined,
-): number {
-  let v = value;
-  if (typeof min === "number" && v < min) v = min;
-  if (typeof max === "number" && v > max) v = max;
-  return v;
 }
 
 interface PendingAppend {
@@ -1872,6 +1774,26 @@ export async function assemblePrompt(
   if (resolvedProfile.binding && blocks.length) {
     presetProfilesSvc.applyProfileToBlocks(blocks, resolvedProfile.binding);
   }
+  const activationScripts = preset && blocks.length
+    ? regexScriptsSvc.getPresetActivationScripts(ctx.userId, preset.id, { chatId: chat.id, characterId }) : [];
+  const activationInputs = createActivationInputSnapshot({
+    characterName: getEffectiveCharacterName(character),
+    userName: persona?.name || "User",
+    chatVariables: chat.metadata?.chat_variables,
+    preset,
+    profileValues: resolvedProfile.binding?.prompt_variables,
+    patterns: activationScripts.map((script) => script.find_regex),
+  });
+  const promptActivation = preset && blocks.length
+    ? await applyPromptActivations(
+        blocks,
+        activationScripts,
+        messages,
+        preset.id,
+        ctx.signal,
+        activationInputs,
+      )
+    : { states: [], errors: [] };
   presetProfilesSvc.normalizeCategoryBlockStates(blocks);
 
   profiler.addPhase("load-core-data", performance.now() - phaseStartedAt);
@@ -2557,6 +2479,8 @@ export async function assemblePrompt(
     macroEnv.extra.presetId = preset.id;
     macroEnv.extra.presetMetadata = preset.metadata || {};
   }
+  macroEnv.extra.promptActivation = promptActivation;
+  macroEnv.extra.activationInputSnapshots = new Map(preset ? [[preset.id, activationInputs]] : []);
 
   // Prompt variables — resolve creator-defined schemas + end-user overrides and
   // surface them on env.extra so {{var::name}} / {{hasVar::name}} / {{varDefault::name}}
@@ -3067,6 +2991,13 @@ export async function assemblePrompt(
     if (!promptBlockMatchesCharacterTags(block.characterTagTrigger, focusedCharacter.tags)) {
       continue;
     }
+    // Structural world-info slots are unique. Presets can acquire duplicate
+    // markers during import/merge, while their independent display names can
+    // hide the collision (for example, a second marker named "Databank").
+    // Skip duplicates before marker-pinned entries are handled as those would
+    // otherwise be repeated too.
+    if (block.marker === "world_info_before" && hasWiBefore) continue;
+    if (block.marker === "world_info_after" && hasWiAfter) continue;
     // Marker-pinned WI: emit this block's "before" entries ahead of its own
     // output, and queue its "after" entries for the next-iteration flush.
     const pin = block.marker ? pinnedByMarker.get(block.marker) : undefined;
@@ -3797,6 +3728,11 @@ export async function assemblePrompt(
   // Guided generations (from batch-loaded settings)
   const guided = normalizeGuidedGenerations(
     settingsMap.get("guidedGenerations"),
+    {
+      connectionProfileId: connection?.id ?? null,
+      chatId: chat.id,
+      characterId,
+    },
   );
   if (guided.length > 0) {
     await applyGuidedGenerations(result, guided, macroEnv, breakdown);
@@ -4336,33 +4272,6 @@ export async function assemblePrompt(
     resolveCortexGate?.();
     profiler.finish();
   }
-}
-
-function normalizeGuidedGenerations(input: unknown): GuidedGeneration[] {
-  if (!Array.isArray(input)) return [];
-  const out: GuidedGeneration[] = [];
-  for (const item of input) {
-    if (!item || typeof item !== "object") continue;
-    const g = item as Partial<GuidedGeneration>;
-    if (!g.enabled) continue;
-    if (typeof g.content !== "string" || !g.content.trim()) continue;
-    const position =
-      g.position === "user_prefix" || g.position === "user_suffix"
-        ? g.position
-        : "system";
-    out.push({
-      id: typeof g.id === "string" ? g.id : "",
-      name:
-        typeof g.name === "string" && g.name.trim()
-          ? g.name
-          : "Guided Generation",
-      content: g.content,
-      position,
-      mode: g.mode === "oneshot" ? "oneshot" : "persistent",
-      enabled: true,
-    });
-  }
-  return out;
 }
 
 async function applyGuidedGenerations(

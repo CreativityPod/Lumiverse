@@ -311,6 +311,21 @@ pub fn discover_repo() -> Option<String> {
     None
 }
 
+/// The commit this desktop shell was compiled from, or `None` when the build
+/// carried no git metadata to stamp (a source-archive build, for example).
+///
+/// The runner compares this against the checkout to decide whether a pulled
+/// update contains desktop changes the running binary predates.
+#[tauri::command]
+pub fn desktop_shell_sha() -> Option<String> {
+    let sha = env!("LUMIVERSE_DESKTOP_SHA");
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_owned())
+    }
+}
+
 /// Locate a usable bun binary. GUI apps on macOS get a minimal PATH, so
 /// probe the common install locations before falling back to PATH lookup.
 #[tauri::command]
@@ -380,6 +395,33 @@ pub fn alert(app: AppHandle, title: String, message: String, error: bool) {
             MessageDialogKind::Info
         })
         .show(move |_| rehide_host_window(&app_for_rehide));
+}
+
+/// Two-button question with no parent window (see `alert`). Resolves to
+/// `true` when the user picks the affirmative button.
+///
+/// `async` so the blocking `recv` runs on Tauri's command pool rather than
+/// the main thread the dialog itself needs — the same shape as `pick_folder`.
+#[tauri::command]
+pub async fn confirm(
+    app: AppHandle,
+    title: String,
+    message: String,
+    ok_label: String,
+    cancel_label: String,
+) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .message(message)
+        .title(title)
+        .buttons(MessageDialogButtons::OkCancelCustom(ok_label, cancel_label))
+        .show(move |answer| {
+            let _ = tx.send(answer);
+        });
+    let answer = rx.recv().unwrap_or(false);
+    rehide_host_window(&app);
+    answer
 }
 
 /// Folder picker with no parent window (see `alert`).

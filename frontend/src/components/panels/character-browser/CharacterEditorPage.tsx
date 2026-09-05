@@ -96,6 +96,18 @@ import AlternateAvatarManager from './AlternateAvatarManager'
 import type { AlternateAvatarEntry } from './AlternateAvatarManager'
 import CharacterTokenReportModal, { type CharacterTokenReportItem } from './CharacterTokenReportModal'
 import { GuideViewer } from '@/components/shared/GuideViewer'
+import {
+  getGreetingTitle,
+  moveAlternateGreetingMetadata,
+  remapGreetingIndexForMove,
+  removeAlternateGreetingMetadata,
+  setGreetingTitle,
+} from '@/lib/greetingMetadata'
+import {
+  parseCharacterSourceInput,
+  readCharacterSourceUrl,
+  setCharacterSource,
+} from '@/lib/characterSource'
 
 const DEBOUNCE_MS = 2000
 const MAX_PERSPECTIVE_LAYERS = 5
@@ -245,22 +257,78 @@ function SortablePerspectiveLayer({ layer, index, disabled, onLabelChange, onInt
   )
 }
 
-function isRecord(value: unknown): value is Record<string, any> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+function SortableGreetingItem({
+  id,
+  disabled,
+  children,
+}: {
+  id: string
+  disabled: boolean
+  children: React.ReactNode
+}) {
+  const { t } = useTranslation('panels')
+  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id, disabled })
+  const { setNodeRef, style } = useScaledSortableStyle({ setNodeRef: setSortableRef, transform, transition, isDragging })
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={clsx(styles.greetingItem, styles.greetingItemSortable, isDragging && styles.greetingItemDragging)}
+    >
+      <button
+        type="button"
+        className={styles.greetingDragHandle}
+        disabled={disabled}
+        title={t('characterEditor.reorderGreeting')}
+        aria-label={t('characterEditor.reorderGreeting')}
+        {...attributes}
+        {...listeners}
+      >
+        <GripVertical size={15} />
+      </button>
+      {children}
+    </div>
+  )
 }
 
-function readChubFullPath(extensions: unknown): string | null {
-  if (!isRecord(extensions)) return null
+function GreetingNameInput({
+  value,
+  resetKey,
+  placeholder,
+  ariaLabel,
+  onChange,
+}: {
+  value: string
+  resetKey: string
+  placeholder: string
+  ariaLabel?: string
+  onChange: (value: string) => void
+}) {
+  const [draft, setDraft] = useState(value)
 
-  const chub = isRecord(extensions.chub) ? extensions.chub : null
-  const fullPath =
-    typeof chub?.full_path === 'string' ? chub.full_path
-      : typeof chub?.fullPath === 'string' ? chub.fullPath
-        : typeof extensions._lumiverse_chub_slug === 'string' ? extensions._lumiverse_chub_slug
-          : ''
+  useEffect(() => {
+    setDraft(value)
+  }, [resetKey, value])
 
-  const normalized = fullPath.trim().replace(/^\/+|\/+$/g, '')
-  return normalized || null
+  return (
+    <input
+      type="text"
+      className={styles.greetingNameInput}
+      value={draft}
+      onChange={(event) => {
+        setDraft(event.target.value)
+        onChange(event.target.value)
+      }}
+      onBlur={() => setDraft(value)}
+      placeholder={placeholder}
+      aria-label={ariaLabel}
+    />
+  )
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
 function trimTrailingUrlPunctuation(url: string): string {
@@ -407,8 +475,6 @@ export default function CharacterEditorPage() {
 
   const character = allCharacters.find((c) => c.id === editingCharacterId) ?? null
   const isOpen = !!editingCharacterId
-  const chubFullPath = useMemo(() => readChubFullPath(character?.extensions), [character?.extensions])
-  const chubAttributionUrl = chubFullPath ? `https://chub.ai/characters/${chubFullPath}` : null
   const tabs = useMemo<{ id: TabId; label: string }[]>(() => [
     ...builtInTabs,
     ...characterEditorTabs.map((tab) => ({ id: tab.id, label: tab.title })),
@@ -422,7 +488,11 @@ export default function CharacterEditorPage() {
   const [newTag, setNewTag] = useState('')
   const [guideOpen, setGuideOpen] = useState(false)
   const [alternateGreetings, setAlternateGreetings] = useState<string[]>([])
+  const [alternateGreetingIds, setAlternateGreetingIds] = useState<string[]>([])
+  const [greetingBackgroundPickerIndex, setGreetingBackgroundPickerIndex] = useState<number | null>(null)
   const [alternateCharacterName, setAlternateCharacterName] = useState('')
+  const [sourceLinkDraft, setSourceLinkDraft] = useState('')
+  const [sourceLinkError, setSourceLinkError] = useState<string | null>(null)
   const [extensionsJson, setExtensionsJson] = useState('')
   const [jsonError, setJsonError] = useState<string | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
@@ -518,7 +588,11 @@ export default function CharacterEditorPage() {
     })
     setTags(character.tags || [])
     setAlternateGreetings(character.alternate_greetings || [])
+    setAlternateGreetingIds((character.alternate_greetings || []).map(() => uuidv7()))
+    setGreetingBackgroundPickerIndex(null)
     setAlternateCharacterName(character.extensions?.alternate_character_name || '')
+    setSourceLinkDraft(readCharacterSourceUrl(character.extensions) || '')
+    setSourceLinkError(null)
     setExtensionsJson(JSON.stringify(character.extensions || {}, null, 2))
     setJsonError(null)
     pendingExtensionsRef.current = null
@@ -812,6 +886,7 @@ export default function CharacterEditorPage() {
 
     return pendingExtensionsRef.current ?? character?.extensions ?? {}
   }, [extensionsJson, character?.extensions])
+  const attributionUrl = useMemo(() => readCharacterSourceUrl(workingExtensions), [workingExtensions])
 
   // This report intentionally uses the editor's local draft state rather than
   // the saved card, so it remains useful while the user is still typing.
@@ -850,14 +925,15 @@ export default function CharacterEditorPage() {
 
     items.push({
       id: 'greeting:first',
-      label: t('characterEditor.firstMessage'),
+      label: getGreetingTitle(workingExtensions, 0) || t('characterEditor.firstMessage'),
       text: fields.first_mes || '',
       group: 'greeting',
     })
     alternateGreetings.forEach((greeting, index) => {
       items.push({
         id: `greeting:${index}`,
-        label: t('characterEditor.greetingNumber', { n: index + 1 }),
+        label: getGreetingTitle(workingExtensions, index + 1)
+          || t('characterEditor.greetingNumber', { n: index + 1 }),
         text: greeting,
         group: 'greeting',
       })
@@ -1025,6 +1101,26 @@ export default function CharacterEditorPage() {
     [mutateExtensions]
   )
 
+  const commitSourceLink = useCallback(() => {
+    const value = sourceLinkDraft.trim()
+    if (!value) {
+      setSourceLinkDraft('')
+      setSourceLinkError(null)
+      mutateExtensions((ext) => setCharacterSource(ext, null), true)
+      return
+    }
+
+    const source = parseCharacterSourceInput(value)
+    if (!source) {
+      setSourceLinkError(t('characterEditor.originalSourceInvalid'))
+      return
+    }
+
+    setSourceLinkDraft(source.url)
+    setSourceLinkError(null)
+    mutateExtensions((ext) => setCharacterSource(ext, source), true)
+  }, [mutateExtensions, sourceLinkDraft, t])
+
   const handleAvatarSelect = useCallback(
     async (avatarEntryId: string) => {
       if (!activeChatId || !character) return
@@ -1072,9 +1168,36 @@ export default function CharacterEditorPage() {
     [alternateGreetings, debouncedSave]
   )
 
+  const handleGreetingTitleChange = useCallback(
+    (greetingIndex: number, value: string) => {
+      mutateExtensions((ext) => setGreetingTitle(ext, greetingIndex, value), false)
+    },
+    [mutateExtensions]
+  )
+
+  const handleGreetingBackgroundChange = useCallback(
+    (greetingIndex: number, imageId: string | null) => {
+      mutateExtensions((ext) => {
+        const next = { ...ext }
+        const backgrounds = isRecord(ext.greeting_backgrounds)
+          ? { ...ext.greeting_backgrounds }
+          : {}
+        if (imageId) backgrounds[greetingIndex] = imageId
+        else delete backgrounds[greetingIndex]
+        if (Object.keys(backgrounds).length > 0) next.greeting_backgrounds = backgrounds
+        else delete next.greeting_backgrounds
+        return next
+      }, false)
+      setGreetingBackgroundPickerIndex(null)
+    },
+    [mutateExtensions]
+  )
+
   const handleAddGreeting = useCallback(() => {
+    clearTimeout(timers.current['alternate_greetings'])
     const updated = [...alternateGreetings, '']
     setAlternateGreetings(updated)
+    setAlternateGreetingIds((current) => [...current, uuidv7()])
     if (editingCharacterId) {
       showSaving()
       browser.updateCharacter(editingCharacterId, { alternate_greetings: updated })
@@ -1083,8 +1206,11 @@ export default function CharacterEditorPage() {
 
   const handleRemoveGreeting = useCallback(
     (index: number) => {
+      clearTimeout(timers.current['alternate_greetings'])
       const updated = alternateGreetings.filter((_, i) => i !== index)
       setAlternateGreetings(updated)
+      setAlternateGreetingIds((current) => current.filter((_, i) => i !== index))
+      setGreetingBackgroundPickerIndex(null)
       const removedGreetingIndex = index + 1
       mutateExtensions((ext) => {
         const nextBindings: AvatarBindings = {}
@@ -1110,7 +1236,7 @@ export default function CharacterEditorPage() {
           if (Object.keys(backgrounds).length > 0) next.greeting_backgrounds = backgrounds
           else delete next.greeting_backgrounds
         }
-        return next
+        return removeAlternateGreetingMetadata(next, index)
       }, false)
       if (editingCharacterId) {
         showSaving()
@@ -1118,6 +1244,66 @@ export default function CharacterEditorPage() {
       }
     },
     [alternateGreetings, editingCharacterId, browser, mutateExtensions, showSaving]
+  )
+
+  const handleGreetingDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event
+      if (!over || active.id === over.id) return
+      const oldIndex = alternateGreetingIds.indexOf(String(active.id))
+      const newIndex = alternateGreetingIds.indexOf(String(over.id))
+      if (oldIndex < 0 || newIndex < 0) return
+
+      clearTimeout(timers.current['alternate_greetings'])
+      const reorderedGreetings = arrayMove(alternateGreetings, oldIndex, newIndex)
+      setAlternateGreetings(reorderedGreetings)
+      setAlternateGreetingIds((current) => arrayMove(current, oldIndex, newIndex))
+      setGreetingBackgroundPickerIndex(null)
+
+      const oldGreetingIndex = oldIndex + 1
+      const newGreetingIndex = newIndex + 1
+      mutateExtensions((ext) => {
+        let next = moveAlternateGreetingMetadata(ext, oldIndex, newIndex)
+
+        if (isRecord(next.greeting_backgrounds)) {
+          const backgrounds: Record<string, unknown> = {}
+          for (const [rawIndex, imageId] of Object.entries(next.greeting_backgrounds)) {
+            const greetingIndex = Number(rawIndex)
+            if (!Number.isInteger(greetingIndex) || greetingIndex < 0) {
+              backgrounds[rawIndex] = imageId
+              continue
+            }
+            backgrounds[String(remapGreetingIndexForMove(greetingIndex, oldGreetingIndex, newGreetingIndex))] = imageId
+          }
+          next = { ...next, greeting_backgrounds: backgrounds }
+        }
+
+        if (isRecord(next.avatar_bindings)) {
+          const bindings: AvatarBindings = {}
+          for (const [avatarId, rawBinding] of Object.entries(next.avatar_bindings)) {
+            if (!isRecord(rawBinding)) continue
+            const binding = { ...rawBinding } as AvatarBindings[string]
+            if (typeof binding.greeting_index === 'number') {
+              binding.greeting_index = remapGreetingIndexForMove(
+                binding.greeting_index,
+                oldGreetingIndex,
+                newGreetingIndex,
+              )
+            }
+            bindings[avatarId] = binding
+          }
+          next = { ...next, avatar_bindings: bindings }
+        }
+
+        return next
+      }, false)
+
+      if (editingCharacterId) {
+        showSaving()
+        void browser.updateCharacter(editingCharacterId, { alternate_greetings: reorderedGreetings })
+      }
+    },
+    [alternateGreetingIds, alternateGreetings, browser, editingCharacterId, mutateExtensions, showSaving]
   )
 
   const handleExtensionsChange = useCallback(
@@ -1781,21 +1967,25 @@ export default function CharacterEditorPage() {
                         <Upload size={14} />
                       )}
                     </div>
-                    <input
-                      ref={fileRef}
-                      type="file"
-                      accept="image/*"
-                      className={styles.hiddenInput}
-                      onChange={handleFileSelected}
-                    />
-                    <input
-                      ref={cardReplaceFileRef}
-                      type="file"
-                      accept=".json,application/json,.png,image/png"
-                      className={styles.hiddenInput}
-                      onChange={handleReplaceCard}
-                    />
                   </div>
+
+                  {/* Keep these inputs outside the clickable avatar zone. A
+                      programmatic click on the card input bubbles; nesting it
+                      above would also trigger the avatar's image-only picker. */}
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    accept="image/*"
+                    className={styles.hiddenInput}
+                    onChange={handleFileSelected}
+                  />
+                  <input
+                    ref={cardReplaceFileRef}
+                    type="file"
+                    accept=".json,application/json,.png,image/png"
+                    className={styles.hiddenInput}
+                    onChange={handleReplaceCard}
+                  />
 
                   <div className={styles.headerInfo}>
                     <input
@@ -1971,6 +2161,30 @@ export default function CharacterEditorPage() {
 
                   {activeTab === 'greetings' && (
                     <>
+                      <div className={styles.greetingMetaRow}>
+                        <label className={styles.greetingNameField}>
+                          <span>{t('characterEditor.greetingName')}</span>
+                          <GreetingNameInput
+                            value={getGreetingTitle(workingExtensions, 0) || ''}
+                            resetKey={`${character.id}:default`}
+                            onChange={(value) => handleGreetingTitleChange(0, value)}
+                            placeholder={t('characterEditor.greetingNamePlaceholder')}
+                          />
+                        </label>
+                        <GreetingBackgroundControl
+                          greetingIndex={0}
+                          imageId={readGreetingBackground(workingExtensions, 0)}
+                          galleryItems={galleryItems}
+                          open={greetingBackgroundPickerIndex === 0}
+                          onToggle={() => setGreetingBackgroundPickerIndex((current) => current === 0 ? null : 0)}
+                          onSelect={handleGreetingBackgroundChange}
+                          labels={{
+                            set: t('characterEditor.setGreetingBackground'),
+                            clear: t('characterEditor.clearGreetingBackground'),
+                            empty: t('characterEditor.noGalleryImages'),
+                          }}
+                        />
+                      </div>
                       <Field
                         label={t('characterEditor.firstMessage')}
                         helper={t('characterEditor.firstMessageHelper')}
@@ -1992,12 +2206,41 @@ export default function CharacterEditorPage() {
                         <span className={styles.fieldHelper}>
                           {t('characterEditor.alternateGreetingsHelper')}
                         </span>
-                        {alternateGreetings.map((greeting, i) => (
-                          <div key={i} className={styles.greetingItem}>
+                        <DndContext
+                          sensors={perspectiveLayerSensors}
+                          collisionDetection={closestCenter}
+                          onDragEnd={handleGreetingDragEnd}
+                        >
+                          <SortableContext
+                            items={alternateGreetings.map((_, index) => alternateGreetingIds[index] ?? `greeting-${index}`)}
+                            strategy={verticalListSortingStrategy}
+                          >
+                            <div className={styles.greetingList}>
+                              {alternateGreetings.map((greeting, i) => {
+                                const greetingId = alternateGreetingIds[i] ?? `greeting-${i}`
+                                return (
+                                  <SortableGreetingItem
+                                    key={greetingId}
+                                    id={greetingId}
+                                    disabled={alternateGreetings.length < 2}
+                                  >
                             <div className={styles.greetingHeader}>
                               <span className={styles.greetingLabel}>{t('characterEditor.greetingNumber', { n: i + 1 })}</span>
                               <div className={styles.greetingActions}>
                                 <TokenCountButton text={greeting} />
+                                <GreetingBackgroundControl
+                                  greetingIndex={i + 1}
+                                  imageId={readGreetingBackground(workingExtensions, i + 1)}
+                                  galleryItems={galleryItems}
+                                  open={greetingBackgroundPickerIndex === i + 1}
+                                  onToggle={() => setGreetingBackgroundPickerIndex((current) => current === i + 1 ? null : i + 1)}
+                                  onSelect={handleGreetingBackgroundChange}
+                                  labels={{
+                                    set: t('characterEditor.setGreetingBackground'),
+                                    clear: t('characterEditor.clearGreetingBackground'),
+                                    empty: t('characterEditor.noGalleryImages'),
+                                  }}
+                                />
                                 <button
                                   type="button"
                                   className={styles.removeBtn}
@@ -2008,6 +2251,13 @@ export default function CharacterEditorPage() {
                                 </button>
                               </div>
                             </div>
+                            <GreetingNameInput
+                              value={getGreetingTitle(workingExtensions, i + 1) || ''}
+                              resetKey={`${character.id}:${greetingId}`}
+                              onChange={(value) => handleGreetingTitleChange(i + 1, value)}
+                              placeholder={t('characterEditor.greetingNamePlaceholder')}
+                              ariaLabel={t('characterEditor.greetingNameFor', { number: i + 1 })}
+                            />
                             <ExpandableTextarea
                               className={styles.fieldTextarea}
                               value={greeting}
@@ -2016,8 +2266,12 @@ export default function CharacterEditorPage() {
                               title={t('characterEditor.greetingNumber', { n: i + 1 })}
                               placeholder={t('characterEditor.alternateGreetingPlaceholder')}
                             />
-                          </div>
-                        ))}
+                                  </SortableGreetingItem>
+                                )
+                              })}
+                            </div>
+                          </SortableContext>
+                        </DndContext>
                         <button type="button" className={styles.addBtn} onClick={handleAddGreeting}>
                           <Plus size={12} /> {t('characterEditor.addGreeting')}
                         </button>
@@ -2051,22 +2305,48 @@ export default function CharacterEditorPage() {
                         onChange={(v) => handleFieldChange('creator', v)}
                         multiline={false}
                       />
-                      {chubAttributionUrl && (
-                        <div className={styles.creatorAttribution}>
-                          <span className={styles.fieldHelper}>
-                            {t('characterEditor.chubAttribution', { defaultValue: 'Original source' })}
-                          </span>
+                      <div className={styles.fieldGroup}>
+                        <span className={styles.fieldLabel}>{t('characterEditor.originalSource')}</span>
+                        <span className={styles.fieldHelper}>{t('characterEditor.originalSourceHelper')}</span>
+                        <div className={styles.creatorSourceRow}>
+                          <input
+                            type="text"
+                            inputMode="url"
+                            className={styles.fieldInput}
+                            value={sourceLinkDraft}
+                            onChange={(event) => {
+                              setSourceLinkDraft(event.target.value)
+                              setSourceLinkError(null)
+                            }}
+                            onBlur={commitSourceLink}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') {
+                                event.preventDefault()
+                                event.currentTarget.blur()
+                              } else if (event.key === 'Escape') {
+                                event.preventDefault()
+                                setSourceLinkDraft(attributionUrl || '')
+                                setSourceLinkError(null)
+                              }
+                            }}
+                            placeholder={t('characterEditor.originalSourcePlaceholder')}
+                            aria-invalid={sourceLinkError ? true : undefined}
+                          />
+                          {attributionUrl && (
                           <a
-                            href={chubAttributionUrl}
+                            href={attributionUrl}
                             target="_blank"
                             rel="noreferrer"
-                            className={styles.creatorAttributionLink}
+                            className={styles.creatorSourceLink}
+                            title={t('characterEditor.openOriginalSource')}
+                            aria-label={t('characterEditor.openOriginalSource')}
                           >
-                            <span>{chubFullPath}</span>
-                            <ExternalLink size={12} />
+                            <ExternalLink size={14} />
                           </a>
+                          )}
                         </div>
-                      )}
+                        {sourceLinkError && <span className={styles.creatorSourceError}>{sourceLinkError}</span>}
+                      </div>
                       <Field
                         label={t('characterEditor.creatorNotes')}
                         helper={t('characterEditor.creatorNotesHelper')}
@@ -2616,6 +2896,84 @@ function Field({
           onChange={(e) => onChange(e.target.value)}
           placeholder={`${label}...`}
         />
+      )}
+    </div>
+  )
+}
+
+function readGreetingBackground(extensions: Record<string, any>, greetingIndex: number): string | null {
+  const backgrounds = extensions.greeting_backgrounds
+  if (!isRecord(backgrounds)) return null
+  const imageId = backgrounds[greetingIndex]
+  return typeof imageId === 'string' && imageId ? imageId : null
+}
+
+function GreetingBackgroundControl({
+  greetingIndex,
+  imageId,
+  galleryItems,
+  open,
+  onToggle,
+  onSelect,
+  labels,
+}: {
+  greetingIndex: number
+  imageId: string | null
+  galleryItems: CharacterGalleryItem[]
+  open: boolean
+  onToggle: () => void
+  onSelect: (greetingIndex: number, imageId: string | null) => void
+  labels: { set: string; clear: string; empty: string }
+}) {
+  return (
+    <div className={styles.greetingBackgroundControl}>
+      <button
+        type="button"
+        className={styles.greetingBackgroundButton}
+        onClick={onToggle}
+        title={labels.set}
+        aria-label={labels.set}
+        aria-expanded={open}
+      >
+        {imageId ? (
+          <img src={imagesApi.smallUrl(imageId)} alt="" />
+        ) : (
+          <ImagePlus size={14} />
+        )}
+      </button>
+      {open && (
+        <div className={styles.greetingBackgroundPopover}>
+          {galleryItems.length > 0 ? (
+            <div className={styles.greetingBackgroundGrid}>
+              {galleryItems.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={clsx(
+                    styles.greetingBackgroundItem,
+                    imageId === item.image_id && styles.greetingBackgroundItemActive,
+                  )}
+                  onClick={() => onSelect(greetingIndex, item.image_id)}
+                  title={item.caption || labels.set}
+                >
+                  <img src={characterGalleryApi.smallUrl(item.image_id)} alt={item.caption || ''} />
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className={styles.greetingBackgroundEmpty}>{labels.empty}</span>
+          )}
+          {imageId && (
+            <button
+              type="button"
+              className={styles.greetingBackgroundClear}
+              onClick={() => onSelect(greetingIndex, null)}
+            >
+              <X size={11} />
+              {labels.clear}
+            </button>
+          )}
+        </div>
       )}
     </div>
   )

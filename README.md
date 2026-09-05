@@ -248,7 +248,9 @@ with Lumiverse's integrated browser as its primary interface and a macOS menu
 bar / Windows system tray / Linux StatusNotifier icon for controls. It starts
 and stops a local server, shows serving stats, opens the same address in your
 default browser on request, and applies updates through the runner. See
-[desktop/README.md](desktop/README.md) for build instructions.
+[desktop/README.md](desktop/README.md) for build instructions. There is no
+prebuilt download — run `bun run desktop:doctor` to check whether this machine
+can build it.
 
 ## Configuration
 
