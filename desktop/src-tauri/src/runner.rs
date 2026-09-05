@@ -311,6 +311,21 @@ pub fn discover_repo() -> Option<String> {
     None
 }
 
+/// The commit this desktop shell was compiled from, or `None` when the build
+/// carried no git metadata to stamp (a source-archive build, for example).
+///
+/// The runner compares this against the checkout to decide whether a pulled
+/// update contains desktop changes the running binary predates.
+#[tauri::command]
+pub fn desktop_shell_sha() -> Option<String> {
+    let sha = env!("LUMIVERSE_DESKTOP_SHA");
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_owned())
+    }
+}
+
 /// Locate a usable bun binary. GUI apps on macOS get a minimal PATH, so
 /// probe the common install locations before falling back to PATH lookup.
 #[tauri::command]

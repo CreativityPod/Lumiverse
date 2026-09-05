@@ -18,6 +18,7 @@ import {
   runWithServerStopped,
   assertUpdateCanHardSync,
   assertBranchCanHardSync,
+  evaluateDesktopShell,
 } from "./git-ops.js";
 import { readEnvConfig, writeTrustAnyOrigin } from "./env-config.js";
 import { getCurrentBranch } from "./lib/git.js";
@@ -116,6 +117,13 @@ export async function handleIPCMessage(msg: any, sink?: ResponseSink): Promise<v
         commitsBehind: lastUpdateState.commitsBehind,
         latestUpdateMessage: lastUpdateState.latestMessage,
       });
+      break;
+    }
+
+    case "desktop-shell-status": {
+      // The tray reports the revision it was compiled from; only the checkout
+      // can say whether that predates its desktop sources.
+      respond(id, true, evaluateDesktopShell(payload?.builtSha ?? null));
       break;
     }
 
