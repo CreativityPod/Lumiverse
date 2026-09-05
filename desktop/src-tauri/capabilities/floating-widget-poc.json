@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "floating-widget-poc",
-  "description": "Minimal native-window controls for local and extension-backed floating widgets.",
-  "local": false,
+  "description": "Minimal native-window controls for local and extension-backed floating widgets. Both origins are required: the proof-of-concept window loads widget.html from the app bundle, while extension widgets load a remote URL. A remote-only capability matches the POC's label but not its origin, silently granting it nothing.",
+  "local": true,
   "windows": ["widget-*"],
   "remote": {
     "urls": ["http://127.0.0.1:*", "http://localhost:*", "http://*", "https://*"]
