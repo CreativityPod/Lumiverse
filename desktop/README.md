@@ -55,6 +55,9 @@ surface. Browser and PWA rendering ignore this desktop-only setting.
 
 ## Prerequisites
 
+Run `bun run desktop:doctor` from the repository root to check all of these at
+once. It reports what is missing and the exact command to install it.
+
 - [Bun](https://bun.sh) ≥ 1.4.0 (also required by the server itself)
 - [Rust](https://rustup.rs) stable (Tauri v2 builds the native shell)
 
