@@ -18,7 +18,7 @@ import {
 import { TrayIcon } from "@tauri-apps/api/tray";
 import { listen } from "@tauri-apps/api/event";
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as autostartEnabled } from "@tauri-apps/plugin-autostart";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   RunnerClient,
   type DesktopShellState,
@@ -31,6 +31,9 @@ import trayMacIcon from "./assets/tray-mac.png";
 import trayWinIcon from "./assets/tray-win.png";
 
 const POLL_INTERVAL_MS = 15_000;
+// A cold Tauri build compiles the entire native dependency tree. This only
+// bounds the tray's wait; the runner enforces its own build deadline.
+const DESKTOP_REBUILD_TIMEOUT_MS = 35 * 60_000;
 const isMac = navigator.userAgent.includes("Mac");
 
 /**
@@ -74,6 +77,7 @@ let statsBranchItem: MenuItem;
 let statsVersionItem: MenuItem;
 let checkUpdatesItem: MenuItem;
 let applyUpdateItem: MenuItem;
+let rebuildDesktopItem: MenuItem;
 let autoStartItem: CheckMenuItem;
 let loginItem: CheckMenuItem;
 let openIntegratedBrowserItem: MenuItem;
@@ -169,6 +173,10 @@ async function updateMenu(): Promise<void> {
   await statsVersionItem.setText(`Version: ${lastStatus?.version ?? "—"}`);
 
   await checkUpdatesItem.setEnabled(!busyMessage && !externalRunning);
+  // The rebuild compiles from the configured checkout, so it needs one — but
+  // unlike the update items it stays available when a server is running
+  // externally, since it neither stops nor talks to that server.
+  await rebuildDesktopItem.setEnabled(!busyMessage && repoDir !== null);
   if (updateState.available) {
     await applyUpdateItem.setText(`Apply Update (${updateState.commitsBehind} behind)`);
     await applyUpdateItem.setEnabled(!busyMessage && !externalRunning);
@@ -322,15 +330,19 @@ async function refreshDesktopShellState(): Promise<void> {
 
   if (becameStale && !desktopShellNoticeShown) {
     desktopShellNoticeShown = true;
-    await alert(
-      "Lumiverse Desktop rebuild required",
-      "This update changed Lumiverse Desktop itself. The app you are running " +
+    const rebuildNow = await invoke<boolean>("confirm", {
+      title: "Lumiverse Desktop rebuild required",
+      message:
+        "This update changed Lumiverse Desktop itself. The app you are running " +
         "was built before those changes and keeps its previous behaviour " +
         "until it is rebuilt.\n\n" +
-        "To finish updating, quit Lumiverse Desktop and run:\n\n" +
-        `cd ${repoDir}/desktop && bun run tauri build\n\n` +
-        "Then replace the installed app with the new build.",
-    );
+        "Rebuild it now? You can keep using Lumiverse while it compiles. " +
+        "Or later, from the tray menu: Rebuild Desktop App…\n\n" +
+        `Manual equivalent: cd ${repoDir}/desktop && bun run tauri build`,
+      okLabel: "Rebuild now",
+      cancelLabel: "Later",
+    });
+    if (rebuildNow) action(rebuildDesktop)();
   }
 }
 
@@ -341,6 +353,48 @@ async function applyUpdate(): Promise<void> {
   await updateMenu();
   try {
     await client.request("apply-update", undefined, 60_000);
+  } catch (err) {
+    busyMessage = null;
+    await updateMenu();
+    throw err;
+  }
+}
+
+/**
+ * Compile the desktop shell from the configured checkout.
+ *
+ * This produces a bundle; it cannot replace the running app, because a process
+ * cannot overwrite its own bundle. The build therefore ends by pointing the
+ * user at what it made.
+ */
+async function rebuildDesktop(): Promise<void> {
+  await ensureRunner();
+  busyMessage = "Preparing desktop rebuild…";
+  await updateMenu();
+  try {
+    // The runner answers when the compile finishes rather than acking early,
+    // so this waits out the whole build. Progress arrives via onProgress.
+    const result = await client.request<{ bundlePath: string | null }>(
+      "rebuild-desktop",
+      undefined,
+      DESKTOP_REBUILD_TIMEOUT_MS,
+    );
+    busyMessage = null;
+    await updateMenu();
+
+    if (!result?.bundlePath) {
+      await alert("Lumiverse", "The desktop app was rebuilt.");
+      return;
+    }
+    await alert(
+      "Desktop app rebuilt",
+      "The new build is ready. Quit Lumiverse Desktop and replace the " +
+        "installed app with it to finish updating.\n\n" +
+        result.bundlePath,
+    );
+    // Best-effort: a file manager that refuses to open must not turn a
+    // successful build into a reported failure.
+    await revealItemInDir(result.bundlePath).catch(() => {});
   } catch (err) {
     busyMessage = null;
     await updateMenu();
@@ -485,6 +539,11 @@ async function buildTray(): Promise<void> {
     action: action(() => checkForUpdates(true)),
   });
   applyUpdateItem = await MenuItem.new({ text: "Apply Update", enabled: false, action: action(applyUpdate) });
+  rebuildDesktopItem = await MenuItem.new({
+    text: "Rebuild Desktop App…",
+    enabled: false,
+    action: action(rebuildDesktop),
+  });
 
   autoStartItem = await CheckMenuItem.new({
     text: "Start Server at Launch",
@@ -559,6 +618,7 @@ async function buildTray(): Promise<void> {
       await separator(),
       checkUpdatesItem,
       applyUpdateItem,
+      rebuildDesktopItem,
       await separator(),
       autoStartItem,
       loginItem,

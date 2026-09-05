@@ -397,6 +397,33 @@ pub fn alert(app: AppHandle, title: String, message: String, error: bool) {
         .show(move |_| rehide_host_window(&app_for_rehide));
 }
 
+/// Two-button question with no parent window (see `alert`). Resolves to
+/// `true` when the user picks the affirmative button.
+///
+/// `async` so the blocking `recv` runs on Tauri's command pool rather than
+/// the main thread the dialog itself needs — the same shape as `pick_folder`.
+#[tauri::command]
+pub async fn confirm(
+    app: AppHandle,
+    title: String,
+    message: String,
+    ok_label: String,
+    cancel_label: String,
+) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.dialog()
+        .message(message)
+        .title(title)
+        .buttons(MessageDialogButtons::OkCancelCustom(ok_label, cancel_label))
+        .show(move |answer| {
+            let _ = tx.send(answer);
+        });
+    let answer = rx.recv().unwrap_or(false);
+    rehide_host_window(&app);
+    answer
+}
+
 /// Folder picker with no parent window (see `alert`).
 #[tauri::command]
 pub async fn pick_folder(app: AppHandle) -> Option<String> {

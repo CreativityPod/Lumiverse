@@ -35,3 +35,8 @@ export const TIMEOUT_BUN_INSTALL_TERMUX_MS = 30 * 60_000;
 // Windows Vite builds can legitimately take longer than five minutes on cold
 // disks or when an antivirus scanner inspects generated assets.
 export const TIMEOUT_BUN_BUILD_MS = 10 * 60_000;
+// A Tauri build compiles the whole native dependency tree — tauri, wry, and
+// the platform bindings — the first time it runs. That routinely outlasts the
+// frontend build budget on a laptop, and a timeout kill part-way through
+// leaves the user with nothing to show for the wait.
+export const TIMEOUT_DESKTOP_BUILD_MS = 30 * 60_000;

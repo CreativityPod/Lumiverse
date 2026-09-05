@@ -11,6 +11,7 @@ commands.allow = [
   "resolve_bun",
   "quit_app",
   "alert",
+  "confirm",
   "pick_folder",
   "show_frontend",
   "hide_frontend",
