@@ -145,6 +145,7 @@ pub fn run() {
             runner::validate_repo,
             runner::discover_repo,
             runner::resolve_bun,
+            runner::desktop_shell_sha,
             runner::quit_app,
             runner::alert,
             runner::pick_folder,

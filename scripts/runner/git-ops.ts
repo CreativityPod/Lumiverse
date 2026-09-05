@@ -20,6 +20,15 @@ export interface UpdateState {
   latestMessage: string;
 }
 
+export interface DesktopShellState {
+  /** The checkout contains desktop changes the running binary predates. */
+  stale: boolean;
+  /** Commit the running desktop shell was compiled from, if it reported one. */
+  builtSha: string | null;
+  /** Newest commit touching `desktop/` in the checkout. */
+  requiredSha: string | null;
+}
+
 type ProgressReporter = (message: string) => void;
 
 const FRONTEND_BUILD_IGNORED_PATHS = [
@@ -69,6 +78,43 @@ function isFrontendBuildInput(filePath: string): boolean {
 
 function shouldRebuildFrontend(changedFiles: string[] | null): boolean {
   return changedFiles === null || changedFiles.some(isFrontendBuildInput);
+}
+
+/** Newest commit that touched the desktop shell's sources. */
+function getLastDesktopShellCommit(): string | null {
+  const log = runGit("log", "-1", "--format=%H", "--", "desktop");
+  if (!log.ok || !log.out) return null;
+  return log.out;
+}
+
+function commitExists(sha: string): boolean {
+  return runGit("cat-file", "-e", `${sha}^{commit}`).ok;
+}
+
+/**
+ * Decide whether the running desktop shell predates the checkout's desktop
+ * sources.
+ *
+ * The shell is a compiled binary that `applyUpdate` cannot replace, so a pull
+ * carrying `desktop/` changes leaves the user running code the checkout has
+ * already moved past — with no symptom other than the old behaviour
+ * persisting. Equality is the wrong test: the stamped revision is whatever
+ * HEAD was at build time, which normally sits *ahead* of the last commit that
+ * touched `desktop/`. What matters is whether that commit is already reachable
+ * from the build.
+ *
+ * Every branch that cannot answer confidently reports "not stale". A shell
+ * built from an archive, or from a history this checkout does not share, is
+ * unknowable rather than out of date, and a false warning telling someone to
+ * rebuild a current binary is worse than staying quiet.
+ */
+export function evaluateDesktopShell(builtSha: string | null): DesktopShellState {
+  const requiredSha = getLastDesktopShellCommit();
+  if (!builtSha || !requiredSha) return { stale: false, builtSha, requiredSha };
+  if (!commitExists(builtSha)) return { stale: false, builtSha, requiredSha };
+
+  const containsDesktopSources = runGit("merge-base", "--is-ancestor", requiredSha, builtSha).ok;
+  return { stale: !containsDesktopSources, builtSha, requiredSha };
 }
 
 // Termux/proot detection. start.sh exports LUMIVERSE_IS_TERMUX /

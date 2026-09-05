@@ -19,7 +19,13 @@ import { TrayIcon } from "@tauri-apps/api/tray";
 import { listen } from "@tauri-apps/api/event";
 import { disable as disableAutostart, enable as enableAutostart, isEnabled as autostartEnabled } from "@tauri-apps/plugin-autostart";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { RunnerClient, type FullStatus, type ServerState, type UpdateState } from "./runner-client";
+import {
+  RunnerClient,
+  type DesktopShellState,
+  type FullStatus,
+  type ServerState,
+  type UpdateState,
+} from "./runner-client";
 import { loadSettings, saveSetting, type TraySettings } from "./settings";
 import trayMacIcon from "./assets/tray-mac.png";
 import trayWinIcon from "./assets/tray-win.png";
@@ -47,6 +53,12 @@ let busyMessage: string | null = null;
 let port = 7860;
 let lastStatus: FullStatus | null = null;
 let updateState: UpdateState = { available: false, commitsBehind: 0, latestMessage: "" };
+// The tray is a compiled binary the git update flow cannot replace, so a pull
+// carrying desktop changes leaves this process running superseded code.
+let desktopShellStale = false;
+let desktopShellNoticeShown = false;
+let desktopShellChecked = false;
+let updateJustApplied = false;
 let customFrontendUrl: string | null = null;
 let openIntegratedBrowserWhenReady = false;
 
@@ -82,7 +94,19 @@ let desktopWidgetCatalog: DesktopWidgetCatalogEntry[] = [];
 
 function statusText(): string {
   if (busyMessage) return busyMessage;
-  if (externalRunning) return "Lumiverse running (external)";
+  // A dismissed dialog is easy to forget, and the symptom of a stale shell is
+  // simply that the old behaviour persists. Keep the state visible in the
+  // headline for as long as it is true.
+  const suffix = desktopShellStale ? " · desktop rebuild required" : "";
+  if (externalRunning) return `Lumiverse running (external)${suffix}`;
+  if (suffix) {
+    switch (serverState) {
+      case "running":
+        return `Lumiverse running${suffix}`;
+      case "stopped":
+        return `Lumiverse stopped${suffix}`;
+    }
+  }
   switch (serverState) {
     case "running":
       return "Lumiverse running";
@@ -259,6 +283,7 @@ async function checkForUpdates(interactive: boolean): Promise<void> {
   const result = await client.request<UpdateState>("check-updates", undefined, 90_000);
   updateState = result;
   await updateMenu();
+  await refreshDesktopShellState();
   if (interactive) {
     if (result.available) {
       await alert(
@@ -271,8 +296,47 @@ async function checkForUpdates(interactive: boolean): Promise<void> {
   }
 }
 
+/**
+ * Ask the checkout whether it has moved past the desktop sources this binary
+ * was compiled from. Only the checkout can answer — the shell knows just the
+ * revision stamped into it at build time.
+ */
+async function refreshDesktopShellState(): Promise<void> {
+  if (!repoDir || !(await client.alive())) return;
+  let state: DesktopShellState;
+  try {
+    const builtSha = await invoke<string | null>("desktop_shell_sha");
+    state = await client.request<DesktopShellState>("desktop-shell-status", { builtSha }, 15_000);
+  } catch {
+    // An unreachable or older runner cannot answer. Leave the previous
+    // verdict alone rather than clearing a warning we still believe.
+    return;
+  }
+
+  desktopShellChecked = true;
+  const becameStale = state.stale && !desktopShellStale;
+  desktopShellStale = state.stale;
+  // A rebuild clears the condition; let the notice fire again if it recurs.
+  if (!state.stale) desktopShellNoticeShown = false;
+  await updateMenu();
+
+  if (becameStale && !desktopShellNoticeShown) {
+    desktopShellNoticeShown = true;
+    await alert(
+      "Lumiverse Desktop rebuild required",
+      "This update changed Lumiverse Desktop itself. The app you are running " +
+        "was built before those changes and keeps its previous behaviour " +
+        "until it is rebuilt.\n\n" +
+        "To finish updating, quit Lumiverse Desktop and run:\n\n" +
+        `cd ${repoDir}/desktop && bun run tauri build\n\n` +
+        "Then replace the installed app with the new build.",
+    );
+  }
+}
+
 async function applyUpdate(): Promise<void> {
   await ensureRunner();
+  updateJustApplied = true;
   busyMessage = "Applying update…";
   await updateMenu();
   try {
@@ -563,6 +627,12 @@ async function boot(): Promise<void> {
     }
     if (state === "running" || state === "stopped" || state === "crashed") {
       busyMessage = null;
+    }
+    // The check needs a live runner, so the first chance to run it is the
+    // server coming up. Repeat it once an applied update has settled.
+    if (state === "running" && (!desktopShellChecked || updateJustApplied)) {
+      updateJustApplied = false;
+      void refreshDesktopShellState();
     }
     void refreshStatus().then(updateMenu);
   };
