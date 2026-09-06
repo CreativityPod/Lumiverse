@@ -1541,6 +1541,8 @@
     "importingTags": "Importing Tags...",
     "importUrl": "Import URLs",
     "importFromUrlTitle": "Import from URLs",
+    "importExpressionsLabel": "Import expression pack when available",
+    "importExpressionsHint": "Adds roughly 20 MB per character.",
     "importFromUrlHint": "Paste one character URL per line from Chub, JannyAI, BotBooru, or other supported sources.",
     "importUrlPlaceholder": "https://chub.ai/characters/...\nhttps://chub.ai/characters/...",
     "cancel": "Cancel",

@@ -73,6 +73,7 @@ export const DATA_KEYS: ReadonlySet<string> = new Set([
   'sortDirection',
   'filterTab',
   'favoritesBarCollapsed',
+  'importChubExpressions',
   // Persona browser preferences
   'personaViewMode',
   'personaSortField',
@@ -705,6 +706,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
   messageContextMenuEnabled: true,
   suppressContextDropWarnings: false,
   favoritesBarCollapsed: false,
+  importChubExpressions: true,
   globalWorldBooks: [],
   worldInfoSettings: {
     forceCaseSensitive: false,
@@ -785,6 +787,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     if (settings.viewMode) patch.viewMode = settings.viewMode
     if (typeof settings.charactersPerPage === 'number') patch.charactersPerPage = settings.charactersPerPage
     if (typeof settings.favoritesBarCollapsed === 'boolean') patch.favoritesBarCollapsed = settings.favoritesBarCollapsed
+    if (typeof settings.importChubExpressions === 'boolean') patch.importChubExpressions = settings.importChubExpressions
     if ('theme' in settings) patch.theme = normalizeTheme(settings.theme)
     if (typeof settings.landingPageChatsDisplayed === 'number' && Number.isFinite(settings.landingPageChatsDisplayed)) {
       patch.landingPageChatsDisplayed = settings.landingPageChatsDisplayed
