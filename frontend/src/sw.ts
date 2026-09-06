@@ -152,39 +152,30 @@ self.addEventListener('push', (event) => {
     image?: string
   }
 
-  // Backend suppression is user-wide, but keep this device-local check as a
-  // last line of defense in case a push arrives while this client is active.
-  const showNotification = self.clients
-    .matchAll({ type: 'window', includeUncontrolled: true })
-    .then(async (clients) => {
-      const hasFocusedClient = clients.some(
-        (c) => c.visibilityState === 'visible' && c.focused
-      )
-      if (hasFocusedClient) {
-        // Clear badge when user is actively viewing the app
-        if ('setAppBadge' in self.navigator) {
-          (self.navigator as any).clearAppBadge?.()
-        }
-        return
-      }
+  // Suppress on the server before sending. Every received push must display
+  // a notification to honor userVisibleOnly; silently dropping foreground
+  // pushes here causes WebKit to revoke the subscription.
+  // https://webkit.org/blog/12945/meet-web-push/
+  const showNotification = (async () => {
+    await self.registration.showNotification(payload.title, {
+      body: payload.body,
+      icon: payload.icon || '/icon-192.png',
+      badge: '/icon-192.png',
+      tag: payload.tag,
+      image: payload.image,
+      data: payload.data,
+    } as NotificationOptions)
 
-      // Increment badge count on the PWA home screen icon
+    // Badging is best-effort and must never prevent notification delivery.
+    try {
       if ('setAppBadge' in self.navigator) {
-        // Get current notification count to use as badge
         const notifications = await self.registration.getNotifications()
-        const count = notifications.length + 1
-        ;(self.navigator as any).setAppBadge?.(count)
+        await (self.navigator as any).setAppBadge?.(notifications.length)
       }
-
-      return self.registration.showNotification(payload.title, {
-        body: payload.body,
-        icon: payload.icon || '/icon-192.png',
-        badge: '/icon-192.png',
-        tag: payload.tag,
-        image: payload.image,
-        data: payload.data,
-      } as NotificationOptions)
-    })
+    } catch {
+      // Notification permission does not guarantee badging is available.
+    }
+  })()
 
   event.waitUntil(showNotification)
 })

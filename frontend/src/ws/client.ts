@@ -120,6 +120,9 @@ export class WebSocketClient {
         this.reconnectTimer = null
       }
       if (!this.lifecyclePaused) this.startPing()
+      // Tracking starts during CONNECTING, when send() drops frames. Publish
+      // the current state once this transport can actually carry it.
+      this.sendVisibility(this.lifecyclePaused)
       // If the old transport died while the PWA was suspended, this is the
       // first fresh socket of the resume recovery. Prove it explicitly rather
       // than accepting a delayed pong from the pre-suspension socket.
@@ -145,6 +148,9 @@ export class WebSocketClient {
           return
         }
         const eventName = data.event || data.type
+        // The backend registers presence only after async authentication.
+        // Replay on its acknowledgement before application handlers run.
+        if (eventName === EventType.CONNECTED) this.sendVisibility(this.lifecyclePaused)
         if (
           this.spindleInfoLoggingEnabled
           && eventName !== 'CONNECTED'
@@ -455,9 +461,8 @@ export class WebSocketClient {
       this.visibilityCleanup.push(() => target.removeEventListener(type, listener))
     }
 
-    // Send current state immediately on connect, then refresh it from every
-    // lifecycle event that commonly fires during backgrounding/suspension.
-    this.sendVisibility()
+    // Track lifecycle changes even during CONNECTING. onopen and the server's
+    // CONNECTED acknowledgement publish the latest state on the new socket.
     addListener(document, 'visibilitychange', onVisibilityChange)
     addListener(window, 'focus', () => {
       this.recoverConnectionOnForeground('focus')
@@ -612,12 +617,13 @@ export class WebSocketClient {
     // Some standalone WebViews resume timers without dispatching a matching
     // visibility/pageshow event. Treat the clock jump as a wake hint: prove an
     // OPEN socket, or restart a transport that is no longer usable.
-    if (this.ws?.readyState !== WebSocket.OPEN) {
+    if (this.lifecyclePaused || this.ws?.readyState !== WebSocket.OPEN) {
       this.resumeFromBackground()
       return
     }
     this.beginResumeRecovery()
     this.startPing()
+    this.sendVisibility()
     this.sendPingNow(RESUME_PONG_TIMEOUT_MS, true)
   }
 

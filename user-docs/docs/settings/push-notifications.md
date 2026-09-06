@@ -40,7 +40,9 @@ Each event type can be enabled or disabled independently.
 
 ## Visibility Gating
 
-Notifications are **suppressed when you're actively viewing the app**. They only fire when you're in another tab, have the window minimized, or are on a different app. This prevents redundant notifications for events you're already watching.
+Notifications are **suppressed when you're actively viewing the app on any connected device**, including test notifications. For example, keeping Lumiverse visible on your laptop suppresses notifications to your phone. They resume when all connected sessions are hidden or closed.
+
+A notification already sent while you were away may still arrive just after you reopen the app.
 
 ---
 
