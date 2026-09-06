@@ -93,3 +93,47 @@ export function extractChubExpressionAssets(node: unknown): ChubExpressionAsset[
   }
   return assets;
 }
+
+const CHUB_HOSTS = new Set(["chub.ai", "www.chub.ai", "characterhub.org", "www.characterhub.org"]);
+
+/**
+ * Recover the `creator/character` path a card was imported from.
+ *
+ * Mirrors the frontend's readChubFullPath so a backfill resolves the same
+ * source the Identity tab shows. Cards acquired at different times carry it in
+ * different places: the portable `chub.full_path` from the card itself, and the
+ * `_lumiverse_chub_slug` the URL importer stamps.
+ */
+export function readChubFullPath(extensions: unknown): string | null {
+  if (!extensions || typeof extensions !== "object" || Array.isArray(extensions)) return null;
+  const ext = extensions as Record<string, unknown>;
+  const chub = ext.chub && typeof ext.chub === "object" ? (ext.chub as Record<string, unknown>) : null;
+
+  const raw =
+    typeof chub?.full_path === "string" ? chub.full_path
+      : typeof chub?.fullPath === "string" ? chub.fullPath
+        : typeof ext._lumiverse_chub_slug === "string" ? ext._lumiverse_chub_slug
+          : "";
+
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      return null;
+    }
+    if (!CHUB_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    const start = segments[0]?.toLowerCase() === "characters" ? 1 : 0;
+    const creator = segments[start];
+    const character = segments[start + 1];
+    return creator && character ? `${decodeURIComponent(creator)}/${decodeURIComponent(character)}` : null;
+  }
+
+  const cleaned = trimmed.replace(/^\/+|\/+$/g, "");
+  // Guard the path segment count so a stray value cannot widen the API path.
+  return cleaned.split("/").filter(Boolean).length === 2 ? cleaned : null;
+}

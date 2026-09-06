@@ -1,5 +1,8 @@
 import { get, post, put, del, upload, uploadRaw, uploadWithProgress, getBlob, BASE_URL, type RequestOptions } from './client'
 import { triggerBlobDownload } from '@/lib/downloads'
+
+/** Ceiling for calls that may download a full expression pack (~20 MB). */
+const EXPRESSION_FETCH_TIMEOUT_MS = 5 * 60 * 1000
 import type {
   Character,
   CharacterLibraryScope,
@@ -145,7 +148,30 @@ export const charactersApi = {
   },
 
   importUrl(url: string) {
-    return post<ImportResult>('/characters/import-url', { url })
+    // Importing may also pull a gallery and an expression pack, so this shares
+    // the longer ceiling rather than the default 30s.
+    return post<ImportResult>('/characters/import-url', { url }, { timeout: EXPRESSION_FETCH_TIMEOUT_MS })
+  },
+
+  /**
+   * Pull this character's expression pack from the Chub source it came from.
+   *
+   * A pack is tens of images and can take minutes on a slow link, so the
+   * default 30s ceiling would abort a download that was progressing fine.
+   */
+  fetchChubExpressions(id: string) {
+    return post<{ imported: number; skipped: number; available: number; sourceMissing?: boolean }>(
+      `/characters/${id}/chub-expressions`,
+      undefined,
+      { timeout: EXPRESSION_FETCH_TIMEOUT_MS },
+    )
+  },
+
+  /** Characters that trace back to Chub and have no expressions yet. */
+  chubExpressionCandidates() {
+    return get<{ candidates: Array<{ id: string; name: string }>; count: number }>(
+      '/characters/chub-expression-candidates',
+    )
   },
 
   importBulk(files: File[], skipDuplicates = false) {

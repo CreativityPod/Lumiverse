@@ -13,6 +13,7 @@ import {
   extractChubExpressionAssets,
   fetchChubGalleryUrls,
   fetchChubJson,
+  readChubFullPath,
   type ChubExpressionAsset,
 } from "../services/chub-api.service";
 import * as exprSvc from "../services/expressions.service";
@@ -766,6 +767,122 @@ app.post("/:id/replace-card", async (c) => {
     return c.json(updated);
   } catch (err: any) {
     return respondImportError(c, err, "Failed to replace character card data");
+  }
+});
+
+// ─── Chub expression backfill ─────────────────────────────────────────────
+// Registered above `/:id`: Hono matches in order, and `/:id` would otherwise
+// capture "chub-expression-candidates" as a character id.
+
+/**
+ * Record that this card's Chub source has been consulted.
+ *
+ * Without this the library sweep can never finish: a card whose source has no
+ * pack has no expressions, so it stays a candidate forever and the offer
+ * returns on every reload. The stamp is what lets "checked and there was
+ * nothing" differ from "never checked".
+ */
+function markChubExpressionsChecked(userId: string, characterId: string): void {
+  try {
+    const fresh = svc.getCharacter(userId, characterId);
+    if (!fresh) return;
+    svc.updateCharacter(userId, characterId, {
+      extensions: {
+        ...(fresh.extensions || {}),
+        _lumiverse_chub_expressions_checked: Date.now(),
+      },
+    });
+  } catch {
+    // Losing the stamp only means the card is offered again later.
+  }
+}
+
+/** Labels already mapped for this character, so a backfill can skip them. */
+function existingExpressionLabels(userId: string, characterId: string): Set<string> {
+  const config = exprSvc.getExpressionConfig(userId, characterId);
+  return new Set(Object.keys(config?.mappings ?? {}));
+}
+
+async function chubExpressionAssetsFor(slug: string): Promise<ChubExpressionAsset[]> {
+  const data = await fetchChubJson(`characters/${slug}?full=true`);
+  const node = data?.node;
+  if (!node) throw new Error("Invalid Chub API response: missing node");
+  return extractChubExpressionAssets(node);
+}
+
+/**
+ * Which cards could gain expressions, without downloading anything.
+ *
+ * Only reports cards that trace back to Chub and have no expressions yet, so
+ * the count is what a backfill would actually change rather than how many
+ * Chub cards exist.
+ */
+app.get("/chub-expression-candidates", (c) => {
+  const userId = c.get("userId");
+  const candidates = svc
+    .listCharacterExtensions(userId)
+    .filter((row) => readChubFullPath(row.extensions) !== null)
+    .filter((row) => !row.extensions?._lumiverse_chub_expressions_checked)
+    .filter((row) => existingExpressionLabels(userId, row.id).size === 0)
+    .map((row) => ({ id: row.id, name: row.name }));
+  return c.json({ candidates, count: candidates.length });
+});
+
+/**
+ * Pull this character's expression pack from the source it was imported from.
+ *
+ * Expressions only: the card's own fields are never re-read, so local edits
+ * survive a backfill. Labels already mapped are skipped rather than replaced,
+ * so hand-assigned expressions are never clobbered.
+ */
+app.post("/:id/chub-expressions", async (c) => {
+  const userId = c.get("userId");
+  const characterId = c.req.param("id");
+  const character = svc.getCharacter(userId, characterId);
+  if (!character) return c.json({ error: "Not found" }, 404);
+
+  const slug = readChubFullPath(character.extensions);
+  if (!slug) return c.json({ error: "This character was not imported from Chub" }, 400);
+
+  try {
+    let available: ChubExpressionAsset[];
+    try {
+      available = await chubExpressionAssetsFor(slug);
+    } catch (err: any) {
+      // A card whose source has been removed or renamed is a normal outcome,
+      // not a failure to report as an error. Treat it as "nothing to fetch" so
+      // the caller can say so plainly, and stamp it so it stops being offered.
+      if (typeof err?.message === "string" && err.message.includes("404")) {
+        markChubExpressionsChecked(userId, characterId);
+        return c.json({ imported: 0, skipped: 0, available: 0, sourceMissing: true });
+      }
+      throw err;
+    }
+
+    if (available.length === 0) {
+      markChubExpressionsChecked(userId, characterId);
+      return c.json({ imported: 0, skipped: 0, available: 0 });
+    }
+
+    const existing = existingExpressionLabels(userId, characterId);
+    const missing = available.filter((asset) => !existing.has(asset.label));
+    if (missing.length === 0) {
+      markChubExpressionsChecked(userId, characterId);
+      return c.json({ imported: 0, skipped: available.length, available: available.length });
+    }
+
+    await importChubExpressions(userId, characterId, missing);
+    const after = existingExpressionLabels(userId, characterId);
+    const imported = missing.filter((asset) => after.has(asset.label)).length;
+    markChubExpressionsChecked(userId, characterId);
+    return c.json({
+      imported,
+      skipped: available.length - missing.length,
+      available: available.length,
+    });
+  } catch (err: any) {
+    if (err instanceof SSRFError) return c.json({ error: err.message }, 400);
+    return c.json({ error: err.message || "Failed to fetch expressions from Chub" }, 502);
   }
 });
 

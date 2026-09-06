@@ -1443,3 +1443,28 @@
     scroll-padding-bottom: calc(14px + max(env(safe-area-inset-bottom, 0px), var(--app-keyboard-inset-bottom, 0px)));
   }
 }
+
+.chubExpressionsBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.chubExpressionsBtn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chubExpressionsBtn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

@@ -106,6 +106,7 @@ import {
 import {
   parseCharacterSourceInput,
   readCharacterSourceUrl,
+  readChubFullPath,
   setCharacterSource,
 } from '@/lib/characterSource'
 
@@ -887,6 +888,8 @@ export default function CharacterEditorPage() {
     return pendingExtensionsRef.current ?? character?.extensions ?? {}
   }, [extensionsJson, character?.extensions])
   const attributionUrl = useMemo(() => readCharacterSourceUrl(workingExtensions), [workingExtensions])
+  // Only Chub-sourced cards can be backfilled, so the button hides otherwise.
+  const chubSourcePath = useMemo(() => readChubFullPath(workingExtensions), [workingExtensions])
 
   // This report intentionally uses the editor's local draft state rather than
   // the saved card, so it remains useful while the user is still typing.
@@ -1120,6 +1123,7 @@ export default function CharacterEditorPage() {
     setSourceLinkError(null)
     mutateExtensions((ext) => setCharacterSource(ext, source), true)
   }, [mutateExtensions, sourceLinkDraft, t])
+
 
   const handleAvatarSelect = useCallback(
     async (avatarEntryId: string) => {
@@ -2566,7 +2570,7 @@ export default function CharacterEditorPage() {
                   )}
 
                   {activeTab === 'expressions' && character && (
-                    <ExpressionEditorTab characterId={character.id} />
+                    <ExpressionEditorTab characterId={character.id} chubSourcePath={chubSourcePath} />
                   )}
 
                   {activeTab === 'voice' && (

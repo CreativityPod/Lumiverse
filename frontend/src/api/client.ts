@@ -5,6 +5,17 @@ export const BASE_URL = import.meta.env.VITE_API_BASE || '/api/v1'
  *  vector search, etc.). Individual callers can override via `options.timeout`. */
 const DEFAULT_TIMEOUT_MS = 30_000
 
+/**
+ * Render a timeout in the largest unit that still reads naturally, so a
+ * five-minute ceiling does not report itself as 300000ms.
+ */
+function formatTimeout(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  const minutes = ms / 60_000
+  return `${Number.isInteger(minutes) ? minutes : minutes.toFixed(1)}min`
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -21,7 +32,7 @@ export class RequestTimeoutError extends Error {
     public url: string,
     public timeoutMs: number
   ) {
-    super(`Request timed out after ${timeoutMs}ms`)
+    super(`Request timed out after ${formatTimeout(timeoutMs)}`)
     this.name = 'RequestTimeoutError'
   }
 }
