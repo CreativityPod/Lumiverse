@@ -132,6 +132,7 @@ export interface StartupSettings {
   viewMode?: CharacterViewMode
   charactersPerPage?: number
   favoritesBarCollapsed?: boolean
+  importChubExpressions?: boolean
   theme?: ThemeConfig | null
   landingPageChatsDisplayed?: number
   landingPageLayoutMode?: 'cards' | 'compact'
@@ -789,6 +790,8 @@ export interface SettingsSlice {
   /** Suppress toasts when older chat messages are omitted from generation context. */
   suppressContextDropWarnings: boolean
   favoritesBarCollapsed: boolean
+  /** Pull a Chub card's expression pack during URL import. Defaults to on. */
+  importChubExpressions: boolean
   guidedGenerations: GuidedGeneration[]
   quickReplySets: QuickReplySet[]
   wallpaper: WallpaperSettings

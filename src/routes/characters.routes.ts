@@ -9,7 +9,14 @@ import * as tagLibrarySvc from "../services/tag-library-import.service";
 import * as wbSvc from "../services/world-books.service";
 import * as regexSvc from "../services/regex-scripts.service";
 import * as gallerySvc from "../services/character-gallery.service";
-import { fetchChubGalleryUrls, fetchChubJson } from "../services/chub-api.service";
+import {
+  extractChubExpressionAssets,
+  fetchChubGalleryUrls,
+  fetchChubJson,
+  type ChubExpressionAsset,
+} from "../services/chub-api.service";
+import * as exprSvc from "../services/expressions.service";
+import * as settingsSvc from "../services/settings.service";
 import { fetchBotBooruGalleryUrls } from "../services/botbooru-api.service";
 import { parsePagination } from "../services/pagination";
 import { safeFetch, SSRFError, validateHost } from "../utils/safe-fetch";
@@ -253,6 +260,65 @@ async function importGalleryFromUrls(userId: string, characterId: string, urls: 
   }
 }
 
+/**
+ * Opt out of pulling expression packs during a Chub import.
+ *
+ * Defaults to on: a pack is part of what the card advertises, and gallery
+ * images already import unconditionally, so this matches existing behaviour
+ * rather than introducing a new prompt. The key is read here so the preference
+ * is honoured the moment a UI toggle exists.
+ */
+const CHUB_IMPORT_EXPRESSIONS_KEY = "importChubExpressions";
+
+function chubExpressionImportEnabled(userId: string): boolean {
+  try {
+    const setting = settingsSvc.getSetting(userId, CHUB_IMPORT_EXPRESSIONS_KEY);
+    return setting?.value === false ? false : true;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Download a Chub expression pack and register it as the character's
+ * expressions, keyed by the pack's own labels.
+ *
+ * Mirrors importGalleryFromUrls, but the label is the whole point: these
+ * images previously had no route into the expressions surface at all, and any
+ * that reached the gallery arrived as unidentifiable files.
+ */
+async function importChubExpressions(
+  userId: string,
+  characterId: string,
+  assets: ChubExpressionAsset[],
+): Promise<void> {
+  const downloaded = await mapWithConcurrency(
+    assets,
+    6,
+    async (asset): Promise<{ label: string; file: File } | null> => {
+      try {
+        const res = await safeFetch(asset.url, { timeoutMs: 15_000, maxBytes: 50 * 1024 * 1024 });
+        if (!res.ok) return null;
+        const buf = await res.arrayBuffer();
+        const contentType = res.headers.get("content-type") || "image/png";
+        const ext = contentType.includes("webp")
+          ? "webp"
+          : contentType.includes("jpeg") || contentType.includes("jpg")
+            ? "jpg"
+            : "png";
+        // The filename is incidental — importFromAssets keys on the label.
+        return { label: asset.label, file: new File([buf], `${asset.label}.${ext}`, { type: contentType }) };
+      } catch {
+        return null;
+      }
+    },
+  );
+
+  const resolved = downloaded.filter((entry): entry is { label: string; file: File } => entry !== null);
+  if (resolved.length === 0) return;
+  await exprSvc.importFromAssets(userId, characterId, resolved);
+}
+
 async function fetchChubCharacter(chubPath: string, userId: string, libraryScope: CharacterLibraryScope) {
   const data = await fetchChubJson(`characters/${chubPath}?full=true`);
   const node = data?.node;
@@ -342,6 +408,19 @@ async function fetchChubCharacter(chubPath: string, userId: string, libraryScope
   const galleryUrls = await fetchChubGalleryUrls(node.id);
   if (galleryUrls.length > 0) {
     await importGalleryFromUrls(userId, character.id, galleryUrls);
+  }
+
+  // Best-effort, like the gallery above: a card that imported successfully
+  // must not be rolled back because its expression images were unreachable.
+  if (chubExpressionImportEnabled(userId)) {
+    const expressionAssets = extractChubExpressionAssets(node);
+    if (expressionAssets.length > 0) {
+      try {
+        await importChubExpressions(userId, character.id, expressionAssets);
+      } catch (err) {
+        console.warn("[character import] Chub expression import failed:", err);
+      }
+    }
   }
 
   return svc.getCharacter(userId, character.id)!;
