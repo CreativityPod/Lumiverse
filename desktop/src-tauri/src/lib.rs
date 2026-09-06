@@ -81,13 +81,41 @@ fn macos_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     #[cfg(not(debug_assertions))]
     let frontend_menu = Submenu::with_items(app, "Frontend", true, &[&reload, &hide_frontend])?;
 
+    // macOS routes the clipboard shortcuts through the Edit menu's standard
+    // items rather than delivering them to the focused view directly. Without
+    // this submenu, Cmd+C/V/X/A/Z do nothing anywhere in the app — and because
+    // the frontend window is built with decorations(false), there is no native
+    // chrome offering them either. The WebView's own context menu still works,
+    // which is why this reads as "only the keyboard is broken".
+    let undo = PredefinedMenuItem::undo(app, None)?;
+    let redo = PredefinedMenuItem::redo(app, None)?;
+    let edit_separator = PredefinedMenuItem::separator(app)?;
+    let cut = PredefinedMenuItem::cut(app, None)?;
+    let copy = PredefinedMenuItem::copy(app, None)?;
+    let paste = PredefinedMenuItem::paste(app, None)?;
+    let select_all = PredefinedMenuItem::select_all(app, None)?;
+    let edit_menu = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &undo,
+            &redo,
+            &edit_separator,
+            &cut,
+            &copy,
+            &paste,
+            &select_all,
+        ],
+    )?;
+
     let minimize = PredefinedMenuItem::minimize(app, None)?;
     let maximize = PredefinedMenuItem::maximize(app, None)?;
     let fullscreen = PredefinedMenuItem::fullscreen(app, None)?;
     let window_menu =
         Submenu::with_items(app, "Window", true, &[&minimize, &maximize, &fullscreen])?;
 
-    Menu::with_items(app, &[&app_menu, &frontend_menu, &window_menu])
+    Menu::with_items(app, &[&app_menu, &edit_menu, &frontend_menu, &window_menu])
 }
 
 #[cfg(target_os = "macos")]
