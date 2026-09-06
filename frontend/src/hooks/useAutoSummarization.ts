@@ -113,9 +113,7 @@ export function useAutoSummarization() {
         lastTriggerCountRef.current = { chatId, count: capturedMessageCount }
 
         let connectionId: string | undefined
-        if (current.apiSource === 'sidecar') {
-          connectionId = undefined
-        } else if (current.apiSource === 'dedicated' && current.dedicatedConnectionId) {
+        if (current.apiSource === 'dedicated' && current.dedicatedConnectionId) {
           connectionId = current.dedicatedConnectionId
         } else {
           connectionId = snapshot.activeProfileId || undefined

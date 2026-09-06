@@ -368,12 +368,6 @@ function SummarizationConfig() {
         <Section icon={<Cloud size={16} />} title={t('summaryEditor.apiSource')}>
           <div className={styles.radioGroup}>
             <RadioOption
-              name="sum-source" value="sidecar"
-              checked={apiSource === 'sidecar'}
-              onChange={(v) => setSummarization({ apiSource: v as SummaryApiSource })}
-              label={t('summaryEditor.sidecarConnection')}
-            />
-            <RadioOption
               name="sum-source" value="active"
               checked={apiSource === 'active'}
               onChange={(v) => setSummarization({ apiSource: v as SummaryApiSource })}
@@ -387,9 +381,7 @@ function SummarizationConfig() {
             />
           </div>
           <p className={styles.desc}>
-            {apiSource === 'sidecar'
-              ? t('summaryEditor.sidecarHint')
-              : apiSource === 'active'
+            {apiSource === 'active'
                 ? t('summaryEditor.activeConnectionHint')
                 : t('summaryEditor.dedicatedConnectionHint')}
           </p>

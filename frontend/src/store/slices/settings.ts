@@ -482,6 +482,21 @@ export function migrateStoredImageGeneration(storedValue: any): any {
   return storedValue
 }
 
+/** Rewrites the removed 'sidecar' API source to the active connection. */
+export function migrateStoredSummarization(storedValue: any): any {
+  if (isPlainObject(storedValue) && storedValue.apiSource === 'sidecar') {
+    return { ...storedValue, apiSource: 'active' }
+  }
+  return storedValue
+}
+
+function migrateStoredSettingValue(key: string, value: any): any {
+  let migrated = key === 'imageGeneration' ? migrateStoredImageGeneration(value) : value
+  migrated = migrateProductivitySetting(key, migrated)
+  migrated = key === 'summarization' ? migrateStoredSummarization(migrated) : migrated
+  return migrated
+}
+
 /** Immediately flush any pending settings (e.g. on page unload). */
 export function flushSettings() {
   if (flushTimer !== null) {
@@ -1168,9 +1183,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
           // names are present in the account.
           || (canonicalKey !== row.key && rows.some((candidate) => candidate.key === canonicalKey))
         ) continue
-        const storedValue = canonicalKey === 'imageGeneration'
-          ? migrateStoredImageGeneration(row.value)
-          : migrateProductivitySetting(canonicalKey, row.value)
+        const storedValue = migrateStoredSettingValue(canonicalKey, row.value)
         if (canonicalKey === 'quickToolbarSettings' && !pendingValuesMatch(storedValue, row.value)) {
           migratedProductivityKeys.add(canonicalKey)
         }
@@ -1203,9 +1216,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
             !DATA_KEYS.has(k)
             || hasNewerLocalSetting(k, localRevisionAtLoadStart)
           ) continue
-          const pendingValue = k === 'imageGeneration'
-            ? migrateStoredImageGeneration(v)
-            : migrateProductivitySetting(k, v)
+          const pendingValue = migrateStoredSettingValue(k, v)
           if (k === 'quickToolbarSettings' && !pendingValuesMatch(pendingValue, v)) {
             migratedProductivityKeys.add(k)
           }
