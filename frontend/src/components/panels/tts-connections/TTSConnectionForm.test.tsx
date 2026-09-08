@@ -4,6 +4,9 @@ import { act } from 'react'
 import type { Root, createRoot as CreateRoot } from 'react-dom/client'
 import type { CreateTtsConnectionInput, TtsConnectionProfile, TtsProviderInfo } from '@/types/api'
 
+const modelComboboxProps: Array<Record<string, any>> = []
+const voicePreviewInputs: Array<Record<string, any>> = []
+
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' })
 Object.defineProperties(globalThis, {
   window: { configurable: true, value: dom.window },
@@ -40,11 +43,19 @@ mock.module('@/i18n', () => ({
   UI_LANGUAGE_STORAGE_KEY: 'lumiverse-ui-language',
   language: 'en',
 }))
-mock.module('../connection-manager/ModelCombobox', () => ({ default: () => null }))
+mock.module('../connection-manager/ModelCombobox', () => ({
+  default: (props: Record<string, any>) => {
+    modelComboboxProps.push(props)
+    return null
+  },
+}))
 mock.module('@/api/tts-connections', () => ({
   ttsConnectionsApi: {
     previewModels: async () => ({ models: [] }),
-    previewVoices: async () => ({ voices: [] }),
+    previewVoices: async (input: Record<string, any>) => {
+      voicePreviewInputs.push(input)
+      return { voices: [] }
+    },
   },
 }))
 
@@ -64,6 +75,11 @@ const providers: TtsProviderInfo[] = [
     name: 'Google Vertex TTS',
     capabilities: { parameters: {}, apiKeyRequired: true, modelListStyle: 'dynamic', voiceListStyle: 'static', defaultUrl: 'https://aiplatform.googleapis.com', defaultFormat: 'wav', supportsStreaming: false, supportedFormats: ['wav'] },
   },
+  {
+    id: 'openvox_tts',
+    name: 'OpenVox TTS',
+    capabilities: { parameters: {}, apiKeyRequired: false, modelListStyle: 'dynamic', voiceListStyle: 'dynamic', defaultUrl: 'http://127.0.0.1:8000/v1', defaultFormat: 'wav', supportsStreaming: false, supportedFormats: ['wav'] },
+  },
 ]
 
 beforeAll(async () => {
@@ -75,6 +91,8 @@ afterEach(async () => {
   if (root) await act(async () => root!.unmount())
   root = undefined
   container?.remove()
+  modelComboboxProps.length = 0
+  voicePreviewInputs.length = 0
 })
 
 async function render(element: React.ReactNode) {
@@ -207,4 +225,36 @@ test('allows disabling streaming for Google Vertex TTS', async () => {
 
   expect(saved.length).toBe(1)
   expect(saved[0].default_parameters?.use_streaming_endpoint).toBe(false)
+})
+
+test('passes the selected OpenVox model when loading voices', async () => {
+  await render(
+    <Form
+      providers={providers}
+      profile={ttsProfile({
+        id: 'openvox-1',
+        name: 'Local OpenVox',
+        provider: 'openvox_tts',
+        api_url: 'http://127.0.0.1:8000/v1',
+        model: 'kokoro',
+        voice: '',
+        has_api_key: false,
+        metadata: {},
+      })}
+      onSave={() => {}}
+      onCancel={() => {}}
+    />
+  )
+
+  await act(async () => {
+    await Promise.resolve()
+  })
+
+  expect(voicePreviewInputs.some((input) => (
+    input.provider === 'openvox_tts' && input.model === 'kokoro'
+  ))).toBe(true)
+
+  const voiceCombobox = modelComboboxProps.find((props) => props.refreshKey?.endsWith(':kokoro:voices'))
+  expect(voiceCombobox).toBeTruthy()
+  expect(voiceCombobox.disabled).toBe(false)
 })

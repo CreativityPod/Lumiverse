@@ -48,6 +48,7 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
   const selectedProvider = providers.find((p) => p.id === provider)
   const capabilities = selectedProvider?.capabilities
   const isQwen = isQwenTtsProvider(provider)
+  const isOpenVox = provider === 'openvox_tts'
   const qwenLanguage = typeof defaultParameters.language === 'string'
     && QWEN_LANGUAGE_OPTIONS.some((option) => option.value === defaultParameters.language)
     ? defaultParameters.language
@@ -155,6 +156,7 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
         api_url: isVertex ? undefined : (apiUrl.trim() || undefined),
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
         api_key: apiKey.trim() || undefined,
+        model: model.trim() || undefined,
       })
       setVoices(result.voices)
     } catch {
@@ -162,7 +164,32 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     } finally {
       setVoicesLoading(false)
     }
-  }, [apiKey, apiUrl, isVertex, profile?.id, profile?.metadata, provider, vertexRegion])
+  }, [apiKey, apiUrl, isVertex, model, profile?.id, profile?.metadata, provider, vertexRegion])
+
+  const handleModelChange = useCallback((nextModel: string) => {
+    setModel(nextModel)
+    if (isOpenVox && nextModel !== model) {
+      setVoice('')
+      setVoices([])
+      setDefaultParameters((prev) => {
+        const updated = { ...prev }
+        delete updated.language
+        return updated
+      })
+    }
+  }, [isOpenVox, model])
+
+  const handleVoiceChange = useCallback((nextVoice: string) => {
+    setVoice(nextVoice)
+    if (!isOpenVox) return
+
+    const selectedVoice = voiceOptions.find((option) => option.id === nextVoice)
+    if (!selectedVoice?.language) return
+    setDefaultParameters((prev) => ({
+      ...prev,
+      language: selectedVoice.language,
+    }))
+  }, [isOpenVox, voiceOptions])
 
   useEffect(() => {
     if (profile?.id && capabilities?.voiceListStyle === 'dynamic') {
@@ -250,6 +277,10 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     } else {
       delete googleDefaults.use_streaming_endpoint
     }
+    const openVoxDefaults: Record<string, any> = {}
+    if (isOpenVox && typeof defaultParameters.language === 'string' && defaultParameters.language.trim()) {
+      openVoxDefaults.language = defaultParameters.language.trim()
+    }
     onSave({
       name: name.trim(),
       provider,
@@ -258,10 +289,16 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
       model: model.trim() || undefined,
       voice: voice.trim() || undefined,
       is_default: isDefault,
-      default_parameters: isQwen ? qwenDefaults : isGoogle ? (Object.keys(googleDefaults).length > 0 ? googleDefaults : undefined) : undefined,
+      default_parameters: isQwen
+        ? qwenDefaults
+        : isGoogle
+          ? (Object.keys(googleDefaults).length > 0 ? googleDefaults : undefined)
+          : isOpenVox && Object.keys(openVoxDefaults).length > 0
+            ? openVoxDefaults
+            : undefined,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
     })
-  }, [name, provider, apiKey, apiUrl, model, voice, isDefault, isQwen, isGoogle, defaultParameters, onSave, isVertex, vertexRegion, saFileName, profile?.metadata])
+  }, [name, provider, apiKey, apiUrl, model, voice, isDefault, isQwen, isGoogle, isOpenVox, defaultParameters, onSave, isVertex, vertexRegion, saFileName, profile?.metadata])
 
   return (
     <div className={styles.form}>
@@ -339,7 +376,7 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
       <FormField label={t('ttsConnectionForm.model')} hint={capabilities?.modelListStyle === 'dynamic' ? t('ttsConnectionForm.refreshHint') : undefined}>
         <ModelCombobox
           value={model}
-          onChange={setModel}
+          onChange={handleModelChange}
           models={modelIds}
           modelLabels={modelLabels}
           loading={modelsLoading}
@@ -355,13 +392,14 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
       <FormField label={t('ttsConnectionForm.voice')} hint={capabilities?.voiceListStyle === 'dynamic' ? t('ttsConnectionForm.refreshHint') : undefined}>
         <ModelCombobox
           value={voice}
-          onChange={setVoice}
+          onChange={handleVoiceChange}
           models={voiceIds}
           modelLabels={voiceLabels}
           loading={voicesLoading}
           onRefresh={capabilities?.voiceListStyle === 'dynamic' ? fetchVoices : undefined}
           autoRefreshOnFocus={capabilities?.voiceListStyle === 'dynamic'}
-          refreshKey={`${provider}:${profile?.id || ''}:voices`}
+          refreshKey={`${provider}:${profile?.id || ''}:${model}:voices`}
+          disabled={isOpenVox && !model.trim()}
           appearance="standard"
           placeholder={isQwen ? t('ttsConnectionForm.qwenVoicePlaceholder') : t('ttsConnectionForm.voicePlaceholder')}
           emptyMessage={t('ttsConnectionForm.noVoices')}
