@@ -3,6 +3,26 @@ import { OpenVoxTtsProvider } from "./openvox-tts";
 
 const originalFetch = globalThis.fetch;
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function speechRequest(text: string, signal?: AbortSignal) {
+  return {
+    text,
+    model: "kokoro",
+    voice: "af_bella",
+    parameters: {},
+    signal,
+  };
+}
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
 });
@@ -120,5 +140,144 @@ describe("OpenVoxTtsProvider", () => {
       language: "fr",
     });
     expect(result.contentType).toBe("audio/wav");
+  });
+
+  test("runs synthesis requests for the same OpenVox endpoint one at a time in FIFO order", async () => {
+    const started: string[] = [];
+    const responseGates = [deferred<Response>(), deferred<Response>(), deferred<Response>()];
+    const startSignals = [deferred<void>(), deferred<void>(), deferred<void>()];
+    let active = 0;
+    let maxActive = 0;
+
+    globalThis.fetch = async (_input, init) => {
+      const text = String(JSON.parse(String(init?.body)).input);
+      const index = started.length;
+      started.push(text);
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      startSignals[index]!.resolve();
+      const response = await responseGates[index]!.promise;
+      active -= 1;
+      return response;
+    };
+
+    const inputs = [
+      { text: "first", url: "http://localhost:8000/v1/" },
+      { text: "second", url: "http://localhost:8000/v1/audio/speech" },
+      { text: "third", url: "http://localhost:8000/v1" },
+    ];
+    const results = inputs.map(({ text, url }) =>
+      new OpenVoxTtsProvider().synthesize("", url, speechRequest(text))
+    );
+
+    await startSignals[0]!.promise;
+    expect(started).toEqual(["first"]);
+
+    responseGates[0]!.resolve(new Response(new Uint8Array([1]), {
+      headers: { "content-type": "audio/wav" },
+    }));
+    await startSignals[1]!.promise;
+    expect(started).toEqual(["first", "second"]);
+
+    responseGates[1]!.resolve(new Response(new Uint8Array([2]), {
+      headers: { "content-type": "audio/wav" },
+    }));
+    await startSignals[2]!.promise;
+    expect(started).toEqual(["first", "second", "third"]);
+
+    responseGates[2]!.resolve(new Response(new Uint8Array([3]), {
+      headers: { "content-type": "audio/wav" },
+    }));
+    await Promise.all(results);
+    expect(maxActive).toBe(1);
+  });
+
+  test("releases the next queued request when synthesis fails", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = async (_input, init) => {
+      const text = String(JSON.parse(String(init?.body)).input);
+      calls.push(text);
+      if (text === "first") {
+        return new Response(JSON.stringify({ detail: "Busy" }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(new Uint8Array([2]), {
+        headers: { "content-type": "audio/wav" },
+      });
+    };
+
+    const provider = new OpenVoxTtsProvider();
+    const first = provider.synthesize("", "", speechRequest("first"));
+    const second = provider.synthesize("", "", speechRequest("second"));
+
+    await expect(first).rejects.toMatchObject({ status: 429, detail: "Busy" });
+    await expect(second).resolves.toMatchObject({ contentType: "audio/wav" });
+    expect(calls).toEqual(["first", "second"]);
+  });
+
+  test("uses independent queues for different OpenVox endpoints", async () => {
+    const bothStarted = deferred<void>();
+    const responseGate = deferred<Response>();
+    let active = 0;
+    let maxActive = 0;
+
+    globalThis.fetch = async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (active === 2) bothStarted.resolve();
+      const response = await responseGate.promise;
+      active -= 1;
+      return response.clone();
+    };
+
+    const provider = new OpenVoxTtsProvider();
+    const first = provider.synthesize("", "http://openvox-a:8000/v1", speechRequest("first"));
+    const second = provider.synthesize("", "http://openvox-b:8000/v1", speechRequest("second"));
+
+    await bothStarted.promise;
+    expect(maxActive).toBe(2);
+    responseGate.resolve(new Response(new Uint8Array([1]), {
+      headers: { "content-type": "audio/wav" },
+    }));
+    await Promise.all([first, second]);
+  });
+
+  test("removes an aborted waiter without blocking later queued requests", async () => {
+    const firstResponse = deferred<Response>();
+    const thirdResponse = deferred<Response>();
+    const thirdStarted = deferred<void>();
+    const started: string[] = [];
+
+    globalThis.fetch = async (_input, init) => {
+      const text = String(JSON.parse(String(init?.body)).input);
+      started.push(text);
+      if (text === "first") return firstResponse.promise;
+      thirdStarted.resolve();
+      return thirdResponse.promise;
+    };
+
+    const provider = new OpenVoxTtsProvider();
+    const controller = new AbortController();
+    const first = provider.synthesize("", "", speechRequest("first"));
+    const second = provider.synthesize("", "", speechRequest("second", controller.signal));
+    const third = provider.synthesize("", "", speechRequest("third"));
+    const secondResult = second.catch((error) => error);
+
+    controller.abort();
+    expect((await secondResult).name).toBe("AbortError");
+    expect(started).toEqual(["first"]);
+
+    firstResponse.resolve(new Response(new Uint8Array([1]), {
+      headers: { "content-type": "audio/wav" },
+    }));
+    await thirdStarted.promise;
+    expect(started).toEqual(["first", "third"]);
+
+    thirdResponse.resolve(new Response(new Uint8Array([3]), {
+      headers: { "content-type": "audio/wav" },
+    }));
+    await Promise.all([first, third]);
   });
 });
