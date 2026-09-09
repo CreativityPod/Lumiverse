@@ -396,6 +396,9 @@ export interface GenerationEndedPayload {
   messageId?: string
   content?: string
   error?: string
+  finish_reason?: string
+  stop_details?: { type: string; category?: string | null; explanation?: string | null } | null
+  stop_sequence?: string | null
   generationType?: string
   tokenCount?: number
   generationMetrics?: GenerationMetrics

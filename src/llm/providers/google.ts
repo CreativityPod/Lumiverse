@@ -1,7 +1,8 @@
+import { parseGoogleResponse, readGoogleStream } from "./google-response";
 import type { LlmProvider } from "../provider";
 import { COMMON_PARAMS, type ProviderCapabilities } from "../param-schema";
-import { cancelStreamAndCloseConnection, createCooperativeYielder, fetchWithPreflightAbort, readJsonWithAbort, readWithAbort } from "../stream-utils";
-import { getTextContent, type GenerationRequest, type GenerationResponse, type StreamChunk, type ToolCallResult, type LlmMessage, type LlmMessagePart } from "../types";
+import { fetchWithPreflightAbort, readJsonWithAbort } from "../stream-utils";
+import { getTextContent, type GenerationRequest, type GenerationResponse, type StreamChunk, type LlmMessage, type LlmMessagePart } from "../types";
 import { fetchProviderJson, ProviderRequestError, throwProviderResponseError } from "../../utils/provider-errors";
 import {
   appendGoogleSearchTool,
@@ -78,45 +79,7 @@ export class GoogleProvider implements LlmProvider {
     if (!res.ok) await throwProviderResponseError(this.displayName, "generate", res);
 
     const data = await readJsonWithAbort<any>(res, request.signal) as any;
-    const candidate = data.candidates?.[0];
-    const parts = candidate?.content?.parts || [];
-
-    // Separate thinking parts from regular text, and collect function calls
-    let content = "";
-    let reasoning = "";
-    const fnCalls: ToolCallResult[] = [];
-    for (const p of parts) {
-      if (p.thought) {
-        reasoning += p.text || "";
-      } else if (p.functionCall) {
-        fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
-      } else {
-        content += p.text || "";
-      }
-    }
-    const thoughtSignature = this.getNonToolThoughtSignature(
-      parts,
-      request.parameters?._replay_thought_signatures === true,
-    );
-
-    const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
-    const groundingMetadata = candidate?.groundingMetadata ?? data.groundingMetadata;
-
-    return {
-      content,
-      reasoning: reasoning || undefined,
-      finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
-      tool_calls: toolCalls,
-      ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
-      usage: data.usageMetadata
-        ? {
-            prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-            completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-            total_tokens: data.usageMetadata.totalTokenCount || 0,
-            ...(groundingMetadata ? { provider_raw: { groundingMetadata } } : {}),
-          }
-        : undefined,
-    };
+    return parseGoogleResponse(data, this.displayName, request.parameters?._replay_thought_signatures === true);
   }
 
   async *generateStream(
@@ -135,101 +98,7 @@ export class GoogleProvider implements LlmProvider {
 
     if (!res.ok) await throwProviderResponseError(this.displayName, "stream", res);
 
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    const maybeYield = createCooperativeYielder(64, request.signal);
-    // Some Vertex-based providers serialize a completed response as several
-    // SSE messages, including an empty `STOP` envelope before the envelope
-    // containing the response text. A finish reason is a property of the
-    // complete response, not proof that this individual SSE message is final,
-    // so hold it until the stream itself closes.
-    // This also lets us retain the final (and often only accurate) usage data.
-    let terminalFinishReason: string | undefined;
-    let finalUsage: StreamChunk["usage"];
-
-    let streamDoneNaturally = false;
-    try {
-    while (true) {
-      const { done, value } = await readWithAbort(reader, request.signal);
-      if (done) { streamDoneNaturally = !request.signal?.aborted; break; }
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        await maybeYield();
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-
-        try {
-          const data = JSON.parse(trimmed.slice(6));
-          const candidate = data.candidates?.[0];
-          const parts = candidate?.content?.parts || [];
-          const finishReason = candidate?.finishReason;
-
-          // Separate thinking parts (thought: true) from regular text parts, and collect function calls
-          let text = "";
-          let reasoning = "";
-          const fnCalls: ToolCallResult[] = [];
-          for (const p of parts) {
-            if (p.thought) {
-              reasoning += p.text || "";
-            } else if (p.functionCall) {
-              fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
-            } else {
-              text += p.text || "";
-            }
-          }
-          const thoughtSignature = this.getNonToolThoughtSignature(
-            parts,
-            request.parameters?._replay_thought_signatures === true,
-          );
-
-          // Capture usage metadata (Google includes it in the final streaming chunk)
-          const usage = data.usageMetadata
-            ? {
-                prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-                completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-                total_tokens: data.usageMetadata.totalTokenCount || 0,
-                ...((candidate?.groundingMetadata ?? data.groundingMetadata)
-                  ? { provider_raw: { groundingMetadata: candidate?.groundingMetadata ?? data.groundingMetadata } }
-                  : {}),
-              }
-            : undefined;
-
-          const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
-
-          if (toolCalls) {
-            terminalFinishReason = "tool_calls";
-          } else if (finishReason && terminalFinishReason !== "tool_calls") {
-            terminalFinishReason = finishReason === "STOP" ? "stop" : finishReason;
-          }
-          if (usage) finalUsage = usage;
-
-          if (text || reasoning || toolCalls || thoughtSignature) {
-            yield {
-              token: text,
-              reasoning: reasoning || undefined,
-              tool_calls: toolCalls,
-              ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
-              usage,
-            };
-          } else if (usage) {
-            yield { token: "", usage };
-          }
-        } catch {
-          // Skip malformed SSE lines
-        }
-      }
-    }
-    if (terminalFinishReason) {
-      yield { token: "", finish_reason: terminalFinishReason, usage: finalUsage };
-    }
-    } finally {
-      if (!streamDoneNaturally) await cancelStreamAndCloseConnection(reader, res);
-    }
+    yield* readGoogleStream(res, this.displayName, request.parameters?._replay_thought_signatures === true, request.signal);
   }
 
   async validateKey(apiKey: string, apiUrl: string): Promise<boolean> {
@@ -259,17 +128,6 @@ export class GoogleProvider implements LlmProvider {
   }
 
   /** Format message content into Google Gemini parts array, handling multipart (vision/audio) content. */
-  private getNonToolThoughtSignature(parts: any[], enabled: boolean): string | undefined {
-    if (!enabled) return undefined;
-    for (let index = parts.length - 1; index >= 0; index--) {
-      const part = parts[index];
-      if (!part?.functionCall && typeof part?.thoughtSignature === "string") {
-        return part.thoughtSignature;
-      }
-    }
-    return undefined;
-  }
-
   private formatParts(
     m: LlmMessage,
     toolNameById: Map<string, string>,

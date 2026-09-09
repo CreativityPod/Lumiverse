@@ -1,4 +1,5 @@
 import { getProvider } from "../llm/registry";
+import { describeGenerationStop } from "../llm/generation-stop";
 import type { LlmProvider } from "../llm/provider";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
@@ -749,6 +750,8 @@ export interface BatchResultItem {
   success: boolean;
   content?: string;
   finish_reason?: string;
+  stop_details?: GenerationResponse["stop_details"];
+  stop_sequence?: string | null;
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
@@ -3813,6 +3816,14 @@ async function runGeneration(
   let streamUsage:
     | { prompt_tokens: number; completion_tokens: number; total_tokens: number }
     | undefined;
+  let finishReason: string | undefined;
+  let stopDetails: GenerationResponse["stop_details"];
+  let stopSequence: string | null | undefined;
+  const stopMetadata = () => ({
+    ...(finishReason ? { finish_reason: finishReason } : {}),
+    ...(stopDetails !== undefined ? { stop_details: stopDetails } : {}),
+    ...(stopSequence !== undefined ? { stop_sequence: stopSequence } : {}),
+  });
   let reasoningStartedAt = 0;
   let reasoningDurationMs = 0;
   // Keep the provider-native carrier independently from the text shown in the
@@ -3977,7 +3988,7 @@ async function runGeneration(
         skipCouncilCacheInvalidation: true,
       });
       messageId = lifecycle.stagedMessageId;
-    } else if (lifecycle.continueMessageId && closedContent) {
+    } else if (lifecycle.continueMessageId && (closedContent || fullReasoning || carrier)) {
       const combined =
         (lifecycle.continueOriginalContent ?? "") +
         (lifecycle.continuePostfix ?? "") +
@@ -4004,7 +4015,7 @@ async function runGeneration(
     } else if (lifecycle.impersonateDraft) {
       // Impersonate draft: do not persist the partial content as a message.
       // The streamed text is already in the frontend's input box.
-    } else if (closedContent) {
+    } else if (closedContent || fullReasoning || carrier) {
       const isImpersonate = lifecycle.generationType === "impersonate";
       const extra: Record<string, any> = {};
       if (isImpersonate && lifecycle.personaId)
@@ -4033,6 +4044,8 @@ async function runGeneration(
       const savedContent = saved?.swipes[lifecycle.streamingSwipeId ?? saved.swipe_id] ?? closedContent;
       chatsSvc.setSwipeScopedExtra(userId, messageId, lifecycle.streamingSwipeId, {
         promptActivation: makePromptActivationSource(savedContent, lifecycle.presetId, false),
+        generationOutcome: finishReason ? stopMetadata() : null,
+        ...(streamUsage ? { usage: streamUsage } : {}),
       });
     }
     return { messageId, content: closedContent };
@@ -4086,6 +4099,9 @@ async function runGeneration(
     let inlineWebSearchUsed = false;
 
     for (let inlineRound = 0; inlineRound < INLINE_TOOL_MAX_ROUNDS; inlineRound++) {
+      finishReason = undefined;
+      stopDetails = undefined;
+      stopSequence = undefined;
       // fullContent/fullReasoning accumulate across rounds for the final
       // persisted message; capture the start offsets so we can slice out just
       // this round's delta for the continuation we feed back to the provider.
@@ -4123,6 +4139,8 @@ async function runGeneration(
               token: result.content,
               reasoning: result.reasoning,
               finish_reason: result.finish_reason,
+              stop_details: result.stop_details,
+              stop_sequence: result.stop_sequence,
               tool_calls: result.tool_calls,
               thinking_blocks: result.thinking_blocks,
               reasoning_details: result.reasoning_details,
@@ -4267,16 +4285,33 @@ async function runGeneration(
         if (chunk.usage) {
           streamUsage = chunk.usage;
         }
+        if (chunk.stop_details !== undefined) stopDetails = chunk.stop_details;
+        if (chunk.stop_sequence !== undefined) stopSequence = chunk.stop_sequence;
 
         await maybeYieldDuringStream();
 
         if (chunk.finish_reason) {
+          finishReason = chunk.finish_reason;
+          await iter.return?.(undefined);
           break;
         }
       }
 
       if (signal.aborted) {
         break;
+      }
+
+      // A terminal API response can still be incomplete. Route these outcomes
+      // through the existing partial-save/error UI before executing any tools.
+      const stopError = describeGenerationStop(finishReason, stopDetails);
+      if (stopError) {
+        throw new ProviderRequestError({
+          provider: provider.displayName,
+          operation: "generation",
+          code: finishReason,
+          detail: stopError,
+          retryable: false,
+        });
       }
 
       // This round's freshly-streamed deltas (not the cross-round accumulation).
@@ -4581,7 +4616,9 @@ async function runGeneration(
       // breakdown tokenization) is deferred so the frontend can clear its stop
       // button as soon as the message itself is safely stored.
       {
-        const immediateExtra: Record<string, any> = {};
+        const immediateExtra: Record<string, any> = {
+          generationOutcome: finishReason ? stopMetadata() : null,
+        };
         if (lifecycle.generationType !== "impersonate") {
           immediateExtra.promptActivation = makePromptActivationSource(fullContent, lifecycle.presetId, true, activationSource);
         }
@@ -4615,6 +4652,7 @@ async function runGeneration(
           messageId,
           content: fullContent,
           usage: streamUsage,
+          ...stopMetadata(),
           generationType: lifecycle.generationType,
           impersonateDraft: lifecycle.impersonateDraft || undefined,
         },
@@ -4847,6 +4885,11 @@ async function runGeneration(
         const persisted = await persistPartialContent();
         savedMessageId = persisted.messageId;
         savedContent = persisted.content;
+        if (savedMessageId) {
+          chatsSvc.setSwipeScopedExtra(userId, savedMessageId, lifecycle.streamingSwipeId, {
+            generationOutcome: { ...stopMetadata(), error: msg },
+          });
+        }
       } catch {
         /* best-effort; never let save failure shadow the original error */
       }
@@ -4860,6 +4903,8 @@ async function runGeneration(
           messageId: savedMessageId,
           content: savedContent,
           error: msg,
+          ...stopMetadata(),
+          usage: streamUsage,
           generationType: lifecycle.generationType,
         },
         userId,
@@ -5152,6 +5197,8 @@ async function consumeStream(
   let content = "";
   let reasoning = "";
   let finishReason = "stop";
+  let stopDetails: GenerationResponse["stop_details"];
+  let stopSequence: string | null | undefined;
   let toolCalls: import("../llm/types").ToolCallResult[] | undefined;
   let usage: GenerationResponse["usage"];
 
@@ -5163,6 +5210,8 @@ async function consumeStream(
     if (chunk.reasoning) reasoning += chunk.reasoning;
     if (chunk.usage) usage = chunk.usage;
     if (chunk.finish_reason) finishReason = chunk.finish_reason;
+    if (chunk.stop_details !== undefined) stopDetails = chunk.stop_details;
+    if (chunk.stop_sequence !== undefined) stopSequence = chunk.stop_sequence;
     if (chunk.tool_calls) toolCalls = chunk.tool_calls;
   }
 
@@ -5170,6 +5219,8 @@ async function consumeStream(
     content,
     reasoning: reasoning || undefined,
     finish_reason: finishReason,
+    stop_details: stopDetails,
+    stop_sequence: stopSequence,
     tool_calls: toolCalls,
     usage,
   };
@@ -6007,6 +6058,8 @@ export async function batchGenerate(
         success: true,
         content: result.content,
         finish_reason: result.finish_reason,
+        stop_details: result.stop_details,
+        stop_sequence: result.stop_sequence,
         usage: result.usage,
       };
     } catch (err: unknown) {

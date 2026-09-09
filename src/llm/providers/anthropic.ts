@@ -172,10 +172,11 @@ export class AnthropicProvider implements LlmProvider {
     )
       return undefined;
     const next = { ...(outputConfig as Record<string, unknown>) };
+    // Omission can mean implicit adaptive thinking (for example, Fable 5.1).
+    // Only an explicit disabled setting should strip the caller's effort.
     if (
-      !thinking ||
-      typeof thinking !== "object" ||
-      Array.isArray(thinking) ||
+      thinking &&
+      typeof thinking === "object" &&
       (thinking as any).type === "disabled"
     ) {
       delete next.effort;
@@ -302,7 +303,9 @@ export class AnthropicProvider implements LlmProvider {
     return {
       content: textContent,
       reasoning: thinkingContent || undefined,
-      finish_reason: toolCalls ? "tool_calls" : data.stop_reason || "end_turn",
+      finish_reason: data.stop_reason === "tool_use" ? "tool_calls" : data.stop_reason || "end_turn",
+      stop_details: data.stop_details,
+      stop_sequence: data.stop_sequence,
       tool_calls: toolCalls,
       thinking_blocks: thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
       usage: this.buildUsage(data),
@@ -338,11 +341,22 @@ export class AnthropicProvider implements LlmProvider {
       });
     }
 
-    const reader = res.body!.getReader();
+    if (!res.body) {
+      throw new ProviderRequestError({
+        provider: this.displayName,
+        operation: "stream",
+        code: "incomplete_stream",
+        detail: "The provider returned no response stream. Retry the request.",
+        retryable: true,
+      });
+    }
+    const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let streamInputTokens = 0;
     let streamUsageRaw: Record<string, unknown> | undefined;
+    let streamOutputTokens = 0;
+    let terminalChunk: StreamChunk | undefined;
     const maybeYield = createCooperativeYielder(64, request.signal);
 
     // Tool call accumulation — Anthropic streams tool_use as content blocks
@@ -358,167 +372,217 @@ export class AnthropicProvider implements LlmProvider {
     const thinkingBlocks: LlmThinkingBlock[] = [];
     let currentThinkingIdx = -1;
 
-    let streamDoneNaturally = false;
     try {
-      while (true) {
+      readStream: while (true) {
         const { done, value } = await readWithAbort(reader, request.signal);
-        if (done) { streamDoneNaturally = !request.signal?.aborted; break; }
+        if (request.signal?.aborted) return;
 
-        buffer += decoder.decode(value, { stream: true });
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
+        if (done && buffer) {
+          lines.push(buffer);
+          buffer = "";
+        }
 
         for (const line of lines) {
           await maybeYield();
           const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data: ")) continue;
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
 
+          let data: any;
           try {
-            const data = JSON.parse(trimmed.slice(6));
-
-            if (data.type === "message_start" && data.message?.usage) {
-              // Capture input token count from message_start (output tokens arrive in message_delta)
-              const u = data.message.usage;
-              streamUsageRaw = { ...u };
-              streamInputTokens = (u.input_tokens || 0) +
-                                  (u.cache_read_input_tokens || 0) +
-                                  (u.cache_creation_input_tokens || 0);
-            } else if (data.type === "content_block_start") {
-              if (data.content_block?.type === "tool_use") {
-                pendingToolCalls.push({
-                  id: data.content_block.id,
-                  name: data.content_block.name,
-                  inputJson: "",
-                });
-                currentToolIdx = pendingToolCalls.length - 1;
-              } else if (
-                !suppressThinking &&
-                data.content_block?.type === "thinking"
-              ) {
-                thinkingBlocks.push({
-                  type: "thinking",
-                  thinking: data.content_block.thinking || "",
-                  ...(data.content_block.signature
-                    ? { signature: data.content_block.signature }
-                    : {}),
-                });
-                currentThinkingIdx = thinkingBlocks.length - 1;
-              } else if (
-                !suppressThinking &&
-                data.content_block?.type === "redacted_thinking"
-              ) {
-                // redacted_thinking is delivered whole (no deltas).
-                thinkingBlocks.push({
-                  type: "redacted_thinking",
-                  data: data.content_block.data,
-                });
-              }
-            } else if (data.type === "content_block_delta") {
-              if (data.delta?.type === "thinking_delta") {
-                if (suppressThinking) {
-                  yield { token: data.delta.thinking };
-                } else {
-                  if (currentThinkingIdx >= 0) {
-                    thinkingBlocks[currentThinkingIdx].thinking =
-                      (thinkingBlocks[currentThinkingIdx].thinking || "") +
-                      (data.delta.thinking || "");
-                  }
-                  yield { token: "", reasoning: data.delta.thinking };
-                }
-              } else if (
-                data.delta?.type === "signature_delta" &&
-                !suppressThinking
-              ) {
-                // The opaque signature for the current thinking block. Create a
-                // block defensively if none was started (e.g. display:"omitted"
-                // where text deltas may be skipped).
-                if (currentThinkingIdx < 0) {
-                  thinkingBlocks.push({ type: "thinking", thinking: "" });
-                  currentThinkingIdx = thinkingBlocks.length - 1;
-                }
-                thinkingBlocks[currentThinkingIdx].signature =
-                  (thinkingBlocks[currentThinkingIdx].signature || "") +
-                  (data.delta.signature || "");
-              } else if (data.delta?.type === "text_delta") {
-                yield { token: data.delta.text };
-              } else if (
-                data.delta?.type === "input_json_delta" &&
-                currentToolIdx >= 0
-              ) {
-                pendingToolCalls[currentToolIdx].inputJson +=
-                  data.delta.partial_json;
-              }
-            } else if (data.type === "message_delta") {
-              const outputTokens = data.usage?.output_tokens || 0;
-              const usageRaw = data.usage
-                ? { ...(streamUsageRaw || {}), ...data.usage }
-                : streamUsageRaw;
-              const usage = this.buildStreamingUsage(
-                streamInputTokens,
-                outputTokens,
-                usageRaw,
-              );
-
-              const stopReason = data.delta?.stop_reason;
-              if (stopReason) {
-                // Build tool_calls defensively. If the model was cut off
-                // (e.g. stop_reason="max_tokens") mid-input_json, the
-                // accumulated partial_json will not be valid JSON. We MUST
-                // still yield the terminal chunk so the host sees
-                // finish_reason + usage; otherwise worker-host's for-await
-                // exits with finishReasonSeen=false and the generation
-                // silent-vanishes downstream.
-                let toolCalls: ToolCallResult[] | undefined;
-                let toolParseError: string | undefined;
-                if (pendingToolCalls.length > 0) {
-                  toolCalls = pendingToolCalls.map((tc) => {
-                    let parsedArgs: unknown = {};
-                    try {
-                      parsedArgs = JSON.parse(tc.inputJson || "{}");
-                    } catch (e) {
-                      toolParseError = `tool '${tc.name}' (call_id=${tc.id}) had unparseable inputJson (likely truncated by stop_reason=${stopReason}). Raw inputJson length=${tc.inputJson.length}, content=${JSON.stringify(tc.inputJson.slice(0, 200))}. Error: ${(e as Error).message}`;
-                      console.warn(`[lumiverse.anthropic.sse] ${toolParseError}`);
-                      parsedArgs = {
-                        _incomplete: true,
-                        _raw_partial_json: tc.inputJson,
-                        _parse_error: (e as Error).message,
-                      };
-                    }
-                    return {
-                      name: tc.name,
-                      args: parsedArgs as Record<string, unknown>,
-                      call_id: tc.id,
-                    };
-                  });
-                }
-                // When stop_reason=max_tokens with a partially-emitted tool
-                // call, "tool_calls" is misleading because the tool args are
-                // incomplete. Surface the real stop_reason so the agent can
-                // react (e.g. retry with higher max_tokens).
-                const finishReason =
-                  toolCalls && stopReason !== "max_tokens" ? "tool_calls" : stopReason;
-                yield {
-                  token: "",
-                  finish_reason: finishReason,
-                  tool_calls: toolCalls,
-                  thinking_blocks:
-                    thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
-                  usage,
-                };
-              } else if (usage) {
-                yield { token: "", usage };
-              }
-            } else if (data.type === "message_stop") {
-              return;
+            data = JSON.parse(trimmed.slice(5).trimStart());
+            if (!data || typeof data !== "object" || typeof data.type !== "string") {
+              throw new Error("Missing event type");
             }
           } catch {
-            // Skip malformed SSE lines
+            throw new ProviderRequestError({
+              provider: this.displayName,
+              operation: "stream",
+              code: "invalid_stream_event",
+              detail: "The provider sent an invalid streaming event. The response may be incomplete.",
+              retryable: true,
+            });
           }
+
+          if (data.type === "error") {
+            const parsed = parseProviderErrorBody(JSON.stringify(data));
+            throw new ProviderRequestError({
+              provider: this.displayName,
+              operation: "stream",
+              code: parsed.code,
+              detail: parsed.detail,
+              retryable: ["overloaded_error", "api_error", "rate_limit_error"].includes(parsed.code || ""),
+            });
+          }
+
+          if (data.type === "message_start" && data.message?.usage) {
+            // Capture input token count from message_start (output tokens arrive in message_delta)
+            const u = data.message.usage;
+            streamUsageRaw = { ...u };
+            streamOutputTokens = u.output_tokens || 0;
+            streamInputTokens = (u.input_tokens || 0) +
+                                (u.cache_read_input_tokens || 0) +
+                                (u.cache_creation_input_tokens || 0);
+          } else if (data.type === "content_block_start") {
+            if (data.content_block?.type === "tool_use") {
+              pendingToolCalls.push({
+                id: data.content_block.id,
+                name: data.content_block.name,
+                inputJson: "",
+              });
+              currentToolIdx = pendingToolCalls.length - 1;
+            } else if (
+              !suppressThinking &&
+              data.content_block?.type === "thinking"
+            ) {
+              thinkingBlocks.push({
+                type: "thinking",
+                thinking: data.content_block.thinking || "",
+                ...(data.content_block.signature
+                  ? { signature: data.content_block.signature }
+                  : {}),
+              });
+              currentThinkingIdx = thinkingBlocks.length - 1;
+            } else if (
+              !suppressThinking &&
+              data.content_block?.type === "redacted_thinking"
+            ) {
+              // redacted_thinking is delivered whole (no deltas).
+              thinkingBlocks.push({
+                type: "redacted_thinking",
+                data: data.content_block.data,
+              });
+            }
+          } else if (data.type === "content_block_delta") {
+            if (data.delta?.type === "thinking_delta") {
+              if (suppressThinking) {
+                yield { token: data.delta.thinking };
+              } else {
+                if (currentThinkingIdx >= 0) {
+                  thinkingBlocks[currentThinkingIdx].thinking =
+                    (thinkingBlocks[currentThinkingIdx].thinking || "") +
+                    (data.delta.thinking || "");
+                }
+                yield { token: "", reasoning: data.delta.thinking };
+              }
+            } else if (
+              data.delta?.type === "signature_delta" &&
+              !suppressThinking
+            ) {
+              // The opaque signature for the current thinking block. Create a
+              // block defensively if none was started (e.g. display:"omitted"
+              // where text deltas may be skipped).
+              if (currentThinkingIdx < 0) {
+                thinkingBlocks.push({ type: "thinking", thinking: "" });
+                currentThinkingIdx = thinkingBlocks.length - 1;
+              }
+              thinkingBlocks[currentThinkingIdx].signature =
+                (thinkingBlocks[currentThinkingIdx].signature || "") +
+                (data.delta.signature || "");
+            } else if (data.delta?.type === "text_delta") {
+              yield { token: data.delta.text };
+            } else if (
+              data.delta?.type === "input_json_delta" &&
+              currentToolIdx >= 0
+            ) {
+              pendingToolCalls[currentToolIdx].inputJson +=
+                data.delta.partial_json;
+            }
+          } else if (data.type === "message_delta") {
+            streamOutputTokens = data.usage?.output_tokens ?? streamOutputTokens;
+            streamUsageRaw = data.usage
+              ? { ...(streamUsageRaw || {}), ...data.usage }
+              : streamUsageRaw;
+            streamInputTokens =
+              (Number(streamUsageRaw?.input_tokens) || 0) +
+              (Number(streamUsageRaw?.cache_read_input_tokens) || 0) +
+              (Number(streamUsageRaw?.cache_creation_input_tokens) || 0);
+            const usage = this.buildStreamingUsage(
+              streamInputTokens,
+              streamOutputTokens,
+              streamUsageRaw,
+            );
+
+            const stopReason = data.delta?.stop_reason;
+            if (stopReason) {
+              // Truncated tool arguments must not hide the terminal reason or
+              // usage. The caller needs those to distinguish a token limit
+              // from a completed tool call.
+              let toolCalls: ToolCallResult[] | undefined;
+              let toolParseError: string | undefined;
+              if (pendingToolCalls.length > 0) {
+                toolCalls = pendingToolCalls.map((tc) => {
+                  let parsedArgs: unknown = {};
+                  try {
+                    parsedArgs = JSON.parse(tc.inputJson || "{}");
+                  } catch (e) {
+                    toolParseError = `tool '${tc.name}' (call_id=${tc.id}) had unparseable inputJson (likely truncated by stop_reason=${stopReason}). Raw inputJson length=${tc.inputJson.length}, content=${JSON.stringify(tc.inputJson.slice(0, 200))}. Error: ${(e as Error).message}`;
+                    console.warn(`[lumiverse.anthropic.sse] ${toolParseError}`);
+                    parsedArgs = {
+                      _incomplete: true,
+                      _raw_partial_json: tc.inputJson,
+                      _parse_error: (e as Error).message,
+                    };
+                  }
+                  return {
+                    name: tc.name,
+                    args: parsedArgs as Record<string, unknown>,
+                    call_id: tc.id,
+                  };
+                });
+              }
+              // Tool blocks may precede truncation or refusal; only tool_use
+              // means the provider is asking the caller to execute them.
+              const finishReason =
+                stopReason === "tool_use" ? "tool_calls" : stopReason;
+              terminalChunk = {
+                token: "",
+                finish_reason: finishReason,
+                stop_details: data.delta?.stop_details,
+                stop_sequence: data.delta?.stop_sequence,
+                tool_calls: toolCalls,
+                thinking_blocks:
+                  thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
+                usage,
+              };
+            } else if (terminalChunk) {
+              terminalChunk.usage = usage;
+              if (data.delta?.stop_details !== undefined) terminalChunk.stop_details = data.delta.stop_details;
+              if (data.delta?.stop_sequence !== undefined) terminalChunk.stop_sequence = data.delta.stop_sequence;
+            } else if (usage) {
+              yield { token: "", usage };
+            }
+          } else if (data.type === "message_stop") {
+            if (!terminalChunk?.finish_reason) {
+              throw new ProviderRequestError({
+                provider: this.displayName,
+                operation: "stream",
+                code: "incomplete_stream",
+                detail: "The provider ended the stream without a stop reason. The response may be incomplete.",
+                retryable: true,
+              });
+            }
+            break readStream;
+          }
+        }
+        if (done) {
+          throw new ProviderRequestError({
+            provider: this.displayName,
+            operation: "stream",
+            code: "incomplete_stream",
+            detail: "The provider connection closed before the response finished (missing message_stop). Retry the request.",
+            retryable: true,
+          });
         }
       }
     } finally {
-      if (!streamDoneNaturally) await cancelStreamAndCloseConnection(reader, res);
+      await cancelStreamAndCloseConnection(reader, res);
     }
+    // Consumers may stop pulling as soon as they see a finish reason. Validate
+    // message_stop and close the connection before exposing the terminal chunk.
+    if (terminalChunk && !request.signal?.aborted) yield terminalChunk;
   }
 
   async validateKey(apiKey: string, apiUrl: string): Promise<boolean> {

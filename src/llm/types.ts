@@ -230,6 +230,8 @@ export interface GenerationResponse {
   content: string;
   reasoning?: string;
   finish_reason: string;
+  stop_details?: GenerationStopDetails | null;
+  stop_sequence?: string | null;
   /** Present when the LLM requested function calls instead of (or in addition to) generating text. */
   tool_calls?: ToolCallResult[];
   /** Provider-native reasoning blocks captured this turn (Anthropic), to replay
@@ -243,10 +245,19 @@ export interface GenerationResponse {
   usage?: GenerationUsage;
 }
 
+/** Provider explanation for a terminal outcome, such as an Anthropic refusal. */
+export interface GenerationStopDetails {
+  type: string;
+  category?: string | null;
+  explanation?: string | null;
+}
+
 export interface StreamChunk {
   token: string;
   reasoning?: string;
   finish_reason?: string;
+  stop_details?: GenerationStopDetails | null;
+  stop_sequence?: string | null;
   /** Accumulated function calls (set on the final chunk when finish_reason indicates tool use). */
   tool_calls?: ToolCallResult[];
   /** Provider-native reasoning blocks (set on the final chunk alongside

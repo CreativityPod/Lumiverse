@@ -245,6 +245,8 @@ function getEmptyGeneratedSwipeTarget(state: ReturnType<typeof useStore.getState
   if (!chatId || !state.regeneratingMessageId || state.streamingSwipeId == null) return null
   const buffered = state.getStreamBuffers().content || state.streamingContent
   if (buffered.trim().length > 0) return null
+  // Reasoning-only failures still carry useful output and diagnostics.
+  if (state.getStreamBuffers().reasoning || state.streamingReasoning) return null
   return { chatId, messageId: state.regeneratingMessageId, swipeId: state.streamingSwipeId }
 }
 
@@ -905,7 +907,7 @@ export function useWebSocket() {
           }
 
           if (payload.error) {
-            const emptySwipeTarget = getEmptyGeneratedSwipeTarget(state, payload.chatId)
+            const emptySwipeTarget = payload.finish_reason ? null : getEmptyGeneratedSwipeTarget(state, payload.chatId)
             // Remove client-side placeholder if regeneration failed before backend saved a real message
             const regenId = state.regeneratingMessageId
             if (isLocalStreamPlaceholderId(regenId)) {

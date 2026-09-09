@@ -272,6 +272,12 @@ function normalizeStoredMessageExtra(
     normalized.generationMetricsBySwipe,
     safeSwipeCount,
   );
+  const generationOutcomeBySwipe = normalizeObjectEntries(normalized.generationOutcomeBySwipe, safeSwipeCount);
+  if (normalized.generationOutcome === null) generationOutcomeBySwipe[safeLegacySwipeId] = null;
+  else if (isPlainObject(normalized.generationOutcome)) generationOutcomeBySwipe[safeLegacySwipeId] = normalized.generationOutcome;
+  delete normalized.generationOutcome;
+  if (generationOutcomeBySwipe.some((entry) => entry !== null)) normalized.generationOutcomeBySwipe = generationOutcomeBySwipe;
+  else delete normalized.generationOutcomeBySwipe;
   const usageBySwipe = normalizeObjectEntries(
     normalized.usageBySwipe,
     safeSwipeCount,
@@ -383,6 +389,9 @@ function projectActiveSwipeExtra(
   swipeId: number,
 ): Record<string, unknown> {
   const projected: Record<string, unknown> = { ...extra };
+  const outcome = Array.isArray(extra.generationOutcomeBySwipe) ? extra.generationOutcomeBySwipe[swipeId] : null;
+  if (isPlainObject(outcome)) projected.generationOutcome = outcome;
+  else delete projected.generationOutcome;
   const activation = Array.isArray(extra.promptActivationBySwipe) ? extra.promptActivationBySwipe[swipeId] : null;
   if (isPlainObject(activation)) projected.promptActivation = activation;
   else delete projected.promptActivation;
@@ -514,6 +523,13 @@ function removeSwipeScopedExtraEntry(
     }
   }
 
+  if (Array.isArray(normalized.generationOutcomeBySwipe)) {
+    const outcomes = [...normalized.generationOutcomeBySwipe];
+    outcomes.splice(removedSwipeId, 1);
+    if (outcomes.some((entry) => entry !== null)) normalized.generationOutcomeBySwipe = outcomes;
+    else delete normalized.generationOutcomeBySwipe;
+  }
+
   if (Array.isArray(normalized.usageBySwipe)) {
     const usageBySwipe = [
       ...(normalized.usageBySwipe as (Record<string, unknown> | null)[]),
@@ -566,6 +582,7 @@ const SWIPE_SCOPED_EXTRA_ARRAY_KEYS = [
   "reasoningDurationBySwipe",
   "tokenCountBySwipe",
   "generationMetricsBySwipe",
+  "generationOutcomeBySwipe",
   "usageBySwipe",
   "reasoningCarrierBySwipe",
 ] as const;
@@ -2668,6 +2685,7 @@ const SWIPE_SCOPED_EXTRA_KEYS = [
   "reasoningDuration",
   "tokenCount",
   "generationMetrics",
+  "generationOutcome",
   "usage",
   "reasoningCarrier",
 ] as const;

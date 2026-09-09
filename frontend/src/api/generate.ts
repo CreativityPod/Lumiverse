@@ -90,6 +90,8 @@ export interface QuietGenerateResponse {
   content: string
   reasoning?: string
   finish_reason: string
+  stop_details?: { type: string; category?: string | null; explanation?: string | null } | null
+  stop_sequence?: string | null
   usage?: {
     prompt_tokens: number
     completion_tokens: number

@@ -680,6 +680,23 @@ describe("recent chats", () => {
     expect(restoredSecondSwipe.extra.usage).toEqual({ completion_tokens: 33, total_tokens: 44 });
   });
 
+  test("keeps generation outcomes on their originating swipe through navigation and deletion", () => {
+    seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+    const completed = { finish_reason: "end_turn", stop_details: null };
+    seedMessage("msg-1", "chat-1", "first swipe", { generationOutcome: completed });
+    expect(addSwipe("u1", "msg-1", "")!.extra.generationOutcome).toBeUndefined();
+    cycleSwipe("u1", "msg-1", "left");
+    const refused = { finish_reason: "refusal", stop_details: { type: "refusal", category: null, explanation: null }, error: "Declined" };
+    setSwipeScopedExtra("u1", "msg-1", 1, { generationOutcome: refused });
+    expect(getMessage("u1", "msg-1")!.extra.generationOutcome).toEqual(completed);
+    expect(cycleSwipe("u1", "msg-1", "right")!.extra.generationOutcome).toEqual(refused);
+    const remaining = deleteSwipe("u1", "msg-1", 0)!;
+    expect(remaining.extra.generationOutcome).toEqual(refused);
+    expect(remaining.extra.generationOutcomeBySwipe).toEqual([refused]);
+    setSwipeScopedExtra("u1", "msg-1", 0, { generationOutcome: completed });
+    expect(getMessage("u1", "msg-1")!.extra.generationOutcome).toEqual(completed);
+  });
+
   test("converts a solo chat into a new group chat with copied messages", () => {
     seedChat("solo", "c1", "Alpha chat", JSON.stringify({ author_note: "keep me" }), 200);
     seedMessage("msg-1", "solo", "Hello there", { greeting: true }, { index: 0, sendDate: 100 });
