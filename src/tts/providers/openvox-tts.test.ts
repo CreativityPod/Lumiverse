@@ -37,6 +37,7 @@ describe("OpenVoxTtsProvider", () => {
     expect(provider.capabilities.modelListStyle).toBe("dynamic");
     expect(provider.capabilities.voiceListStyle).toBe("dynamic");
     expect(provider.capabilities.defaultUrl).toBe("http://127.0.0.1:8000/v1");
+    expect(provider.capabilities.parameters.language).toBeUndefined();
   });
 
   test("lists every OpenVox model without the generic TTS name filter", async () => {
@@ -75,7 +76,7 @@ describe("OpenVoxTtsProvider", () => {
     ]);
   });
 
-  test("lists and normalizes voices for the selected model", async () => {
+  test("lists and normalizes English voices for the selected model", async () => {
     const calls: string[] = [];
     globalThis.fetch = async (input) => {
       calls.push(String(input));
@@ -94,7 +95,7 @@ describe("OpenVoxTtsProvider", () => {
     );
 
     expect(calls).toEqual([
-      "http://127.0.0.1:8000/v1/models/chatterbox%2Fturbo/voices",
+      "http://127.0.0.1:8000/v1/models/chatterbox%2Fturbo/voices?language=en",
     ]);
     expect(voices).toEqual([
       { id: "am_adam", name: "Adam", language: "en", gender: "male" },
@@ -115,7 +116,7 @@ describe("OpenVoxTtsProvider", () => {
     expect(calls).toBe(0);
   });
 
-  test("adds the selected language to buffered speech requests", async () => {
+  test("limits buffered speech requests to English", async () => {
     let body: Record<string, unknown> = {};
     globalThis.fetch = async (_input, init) => {
       body = JSON.parse(String(init?.body));
@@ -137,7 +138,7 @@ describe("OpenVoxTtsProvider", () => {
       voice: "af_bella",
       response_format: "wav",
       speed: 1.1,
-      language: "fr",
+      language: "en",
     });
     expect(result.contentType).toBe("audio/wav");
   });

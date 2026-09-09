@@ -6,6 +6,11 @@ import { fetchProviderJson } from "../../utils/provider-errors";
 
 type UnknownRecord = Record<string, unknown>;
 
+// Keep this provider integration English-only without adding global TTS UI or
+// connection-schema changes. OpenVox uses the same code for voice filtering
+// and synthesis routing.
+const OPENVOX_LANGUAGE = "en";
+
 interface SynthesisQueueWaiter {
   signal?: AbortSignal;
   resolve: (release: () => void) => void;
@@ -147,12 +152,6 @@ export class OpenVoxTtsProvider extends OpenAICompatibleTtsProvider {
         step: 0.05,
         description: "Playback speed multiplier",
       },
-      language: {
-        type: "string",
-        default: "en",
-        description: "OpenVox language code used for speech synthesis",
-        group: "advanced",
-      },
     },
     apiKeyRequired: false,
     voiceListStyle: "dynamic",
@@ -168,9 +167,7 @@ export class OpenVoxTtsProvider extends OpenAICompatibleTtsProvider {
   protected override buildBody(request: TtsRequest): Record<string, any> {
     return {
       ...super.buildBody(request),
-      language: typeof request.parameters.language === "string" && request.parameters.language.trim()
-        ? request.parameters.language.trim()
-        : "en",
+      language: OPENVOX_LANGUAGE,
     };
   }
 
@@ -222,7 +219,7 @@ export class OpenVoxTtsProvider extends OpenAICompatibleTtsProvider {
     const data = await fetchProviderJson<unknown>(
       this.displayName,
       "voice listing",
-      `${this.baseUrl(apiUrl)}/models/${encodeURIComponent(model)}/voices`,
+      `${this.baseUrl(apiUrl)}/models/${encodeURIComponent(model)}/voices?language=${OPENVOX_LANGUAGE}`,
       { headers: this.headers(apiKey) },
     );
 
