@@ -3,6 +3,13 @@ import { OpenVoxTtsProvider } from "./openvox-tts";
 
 const originalFetch = globalThis.fetch;
 
+type FetchStub = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+function asFetchStub(fn: FetchStub): typeof fetch {
+  const stub = Object.assign(fn.bind(globalThis), { preconnect() {} });
+  return stub as typeof fetch;
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -42,7 +49,7 @@ describe("OpenVoxTtsProvider", () => {
 
   test("lists every OpenVox model without the generic TTS name filter", async () => {
     const calls: string[] = [];
-    globalThis.fetch = async (input) => {
+    globalThis.fetch = asFetchStub(async (input) => {
       calls.push(String(input));
       return new Response(JSON.stringify({
         data: [
@@ -51,7 +58,7 @@ describe("OpenVoxTtsProvider", () => {
           { id: "qwen3-tts", name: "Qwen3 TTS" },
         ],
       }));
-    };
+    });
 
     const models = await new OpenVoxTtsProvider().listModels("", "");
 
@@ -64,9 +71,9 @@ describe("OpenVoxTtsProvider", () => {
   });
 
   test("accepts the OpenVox models collection response shape", async () => {
-    globalThis.fetch = async () => new Response(JSON.stringify({
+    globalThis.fetch = asFetchStub(async () => new Response(JSON.stringify({
       models: ["omnivoice", { model_id: "pocket-tts", display_name: "Pocket TTS" }],
-    }));
+    })));
 
     const models = await new OpenVoxTtsProvider().listModels("", "http://localhost:9000/v1/");
 
@@ -78,7 +85,7 @@ describe("OpenVoxTtsProvider", () => {
 
   test("lists and normalizes English voices for the selected model", async () => {
     const calls: string[] = [];
-    globalThis.fetch = async (input) => {
+    globalThis.fetch = asFetchStub(async (input) => {
       calls.push(String(input));
       return new Response(JSON.stringify({
         voices: [
@@ -86,7 +93,7 @@ describe("OpenVoxTtsProvider", () => {
           { voice_id: "am_adam", display_name: "Adam", language_code: "en", gender: "male" },
         ],
       }));
-    };
+    });
 
     const voices = await new OpenVoxTtsProvider().listVoices(
       "",
@@ -105,10 +112,10 @@ describe("OpenVoxTtsProvider", () => {
 
   test("does not request voices until a model is selected", async () => {
     let calls = 0;
-    globalThis.fetch = async () => {
+    globalThis.fetch = asFetchStub(async () => {
       calls += 1;
       return new Response("{}");
-    };
+    });
 
     const voices = await new OpenVoxTtsProvider().listVoices("", "", {});
 
@@ -118,12 +125,12 @@ describe("OpenVoxTtsProvider", () => {
 
   test("limits buffered speech requests to English", async () => {
     let body: Record<string, unknown> = {};
-    globalThis.fetch = async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (_input, init) => {
       body = JSON.parse(String(init?.body));
       return new Response(new Uint8Array([1, 2, 3]), {
         headers: { "content-type": "audio/wav" },
       });
-    };
+    });
 
     const result = await new OpenVoxTtsProvider().synthesize("", "", {
       text: "Hello",
@@ -150,7 +157,7 @@ describe("OpenVoxTtsProvider", () => {
     let active = 0;
     let maxActive = 0;
 
-    globalThis.fetch = async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (_input, init) => {
       const text = String(JSON.parse(String(init?.body)).input);
       const index = started.length;
       started.push(text);
@@ -160,7 +167,7 @@ describe("OpenVoxTtsProvider", () => {
       const response = await responseGates[index]!.promise;
       active -= 1;
       return response;
-    };
+    });
 
     const inputs = [
       { text: "first", url: "http://localhost:8000/v1/" },
@@ -195,7 +202,7 @@ describe("OpenVoxTtsProvider", () => {
 
   test("releases the next queued request when synthesis fails", async () => {
     const calls: string[] = [];
-    globalThis.fetch = async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (_input, init) => {
       const text = String(JSON.parse(String(init?.body)).input);
       calls.push(text);
       if (text === "first") {
@@ -207,7 +214,7 @@ describe("OpenVoxTtsProvider", () => {
       return new Response(new Uint8Array([2]), {
         headers: { "content-type": "audio/wav" },
       });
-    };
+    });
 
     const provider = new OpenVoxTtsProvider();
     const first = provider.synthesize("", "", speechRequest("first"));
@@ -224,14 +231,14 @@ describe("OpenVoxTtsProvider", () => {
     let active = 0;
     let maxActive = 0;
 
-    globalThis.fetch = async () => {
+    globalThis.fetch = asFetchStub(async () => {
       active += 1;
       maxActive = Math.max(maxActive, active);
       if (active === 2) bothStarted.resolve();
       const response = await responseGate.promise;
       active -= 1;
       return response.clone();
-    };
+    });
 
     const provider = new OpenVoxTtsProvider();
     const first = provider.synthesize("", "http://openvox-a:8000/v1", speechRequest("first"));
@@ -251,13 +258,13 @@ describe("OpenVoxTtsProvider", () => {
     const thirdStarted = deferred<void>();
     const started: string[] = [];
 
-    globalThis.fetch = async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (_input, init) => {
       const text = String(JSON.parse(String(init?.body)).input);
       started.push(text);
       if (text === "first") return firstResponse.promise;
       thirdStarted.resolve();
       return thirdResponse.promise;
-    };
+    });
 
     const provider = new OpenVoxTtsProvider();
     const controller = new AbortController();
