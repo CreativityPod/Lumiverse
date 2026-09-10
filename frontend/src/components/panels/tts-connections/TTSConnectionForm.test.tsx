@@ -6,6 +6,18 @@ import type { CreateTtsConnectionInput, TtsConnectionProfile, TtsProviderInfo } 
 
 const modelComboboxProps: Array<Record<string, any>> = []
 const voicePreviewInputs: Array<Record<string, any>> = []
+const voicePreviewOptions: Array<{ signal?: AbortSignal } | undefined> = []
+let previewVoicesImpl = async (_input: Record<string, any>) => ({ voices: [] })
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' })
 Object.defineProperties(globalThis, {
@@ -52,9 +64,10 @@ mock.module('../connection-manager/ModelCombobox', () => ({
 mock.module('@/api/tts-connections', () => ({
   ttsConnectionsApi: {
     previewModels: async () => ({ models: [] }),
-    previewVoices: async (input: Record<string, any>) => {
+    previewVoices: async (input: Record<string, any>, options?: { signal?: AbortSignal }) => {
       voicePreviewInputs.push(input)
-      return { voices: [] }
+      voicePreviewOptions.push(options)
+      return previewVoicesImpl(input)
     },
   },
 }))
@@ -93,6 +106,8 @@ afterEach(async () => {
   container?.remove()
   modelComboboxProps.length = 0
   voicePreviewInputs.length = 0
+  voicePreviewOptions.length = 0
+  previewVoicesImpl = async () => ({ voices: [] })
 })
 
 async function render(element: React.ReactNode) {
@@ -257,4 +272,74 @@ test('passes the selected OpenVox model when loading voices', async () => {
   const voiceCombobox = modelComboboxProps.find((props) => props.refreshKey?.endsWith(':kokoro:voices'))
   expect(voiceCombobox).toBeTruthy()
   expect(voiceCombobox.disabled).toBe(false)
+})
+
+test('keeps the newest OpenVox voice result when model requests finish out of order', async () => {
+  const requests: Array<{
+    input: Record<string, any>
+    gate: ReturnType<typeof deferred<{ voices: Array<{ id: string; name: string }> }>>
+  }> = []
+  previewVoicesImpl = (input) => {
+    const gate = deferred<{ voices: Array<{ id: string; name: string }> }>()
+    requests.push({ input, gate })
+    return gate.promise
+  }
+
+  await render(
+    <Form
+      providers={providers}
+      profile={ttsProfile({
+        id: 'openvox-race',
+        name: 'Local OpenVox',
+        provider: 'openvox_tts',
+        api_url: 'http://127.0.0.1:8000/v1',
+        model: 'model-a',
+        voice: '',
+        has_api_key: false,
+        metadata: {},
+      })}
+      onSave={() => {}}
+      onCancel={() => {}}
+    />
+  )
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]!.input.model).toBe('model-a')
+
+  const modelCombobox = [...modelComboboxProps]
+    .reverse()
+    .find((props) => props.refreshKey?.endsWith(':models'))
+  expect(modelCombobox).toBeTruthy()
+
+  await act(async () => {
+    modelCombobox!.onChange('model-b')
+    await Promise.resolve()
+  })
+
+  expect(requests).toHaveLength(2)
+  expect(requests[1]!.input.model).toBe('model-b')
+  expect(voicePreviewOptions[0]?.signal?.aborted).toBe(true)
+  expect(voicePreviewOptions[1]?.signal?.aborted).toBe(false)
+
+  await act(async () => {
+    requests[1]!.gate.resolve({ voices: [{ id: 'voice-b', name: 'Voice B' }] })
+    await Promise.resolve()
+  })
+
+  let currentVoiceCombobox = [...modelComboboxProps]
+    .reverse()
+    .find((props) => props.refreshKey?.endsWith(':model-b:voices'))
+  expect(currentVoiceCombobox?.models).toEqual(['voice-b'])
+  expect(currentVoiceCombobox?.loading).toBe(false)
+
+  await act(async () => {
+    requests[0]!.gate.resolve({ voices: [{ id: 'voice-a', name: 'Voice A' }] })
+    await Promise.resolve()
+  })
+
+  currentVoiceCombobox = [...modelComboboxProps]
+    .reverse()
+    .find((props) => props.refreshKey?.endsWith(':model-b:voices'))
+  expect(currentVoiceCombobox?.models).toEqual(['voice-b'])
+  expect(currentVoiceCombobox?.loading).toBe(false)
 })

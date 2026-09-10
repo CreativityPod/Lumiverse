@@ -41,6 +41,7 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
 
   const [voices, setVoices] = useState<TtsVoice[]>([])
   const [voicesLoading, setVoicesLoading] = useState(false)
+  const voicesRequestRef = useRef<{ generation: number; controller?: AbortController }>({ generation: 0 })
   const [models, setModels] = useState<Array<{ id: string; label: string }>>([])
   const [modelsLoading, setModelsLoading] = useState(false)
 
@@ -143,32 +144,53 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     }
   }, [apiKey, apiUrl, isVertex, profile?.id, profile?.metadata, provider, vertexRegion])
 
+  const cancelVoicesRequest = useCallback(() => {
+    const request = voicesRequestRef.current
+    request.controller?.abort()
+    voicesRequestRef.current = { generation: request.generation + 1 }
+  }, [])
+
   const fetchVoices = useCallback(async () => {
+    const previousRequest = voicesRequestRef.current
+    previousRequest.controller?.abort()
+    const controller = new AbortController()
+    const generation = previousRequest.generation + 1
+    voicesRequestRef.current = { generation, controller }
     setVoicesLoading(true)
     try {
       const metadata: Record<string, any> = { ...profile?.metadata }
       if (isVertex) {
         metadata.vertex_region = vertexRegion
       }
-      const result = await ttsConnectionsApi.previewVoices({
-        connection_id: profile?.id,
-        provider,
-        api_url: isVertex ? undefined : (apiUrl.trim() || undefined),
-        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-        api_key: apiKey.trim() || undefined,
-        model: model.trim() || undefined,
-      })
+      const result = await ttsConnectionsApi.previewVoices(
+        {
+          connection_id: profile?.id,
+          provider,
+          api_url: isVertex ? undefined : (apiUrl.trim() || undefined),
+          metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+          api_key: apiKey.trim() || undefined,
+          model: model.trim() || undefined,
+        },
+        { signal: controller.signal },
+      )
+      if (voicesRequestRef.current.generation !== generation) return
       setVoices(result.voices)
     } catch {
+      if (voicesRequestRef.current.generation !== generation) return
       setVoices([])
     } finally {
-      setVoicesLoading(false)
+      if (voicesRequestRef.current.generation === generation) {
+        voicesRequestRef.current = { generation }
+        setVoicesLoading(false)
+      }
     }
   }, [apiKey, apiUrl, isVertex, model, profile?.id, profile?.metadata, provider, vertexRegion])
 
   const handleModelChange = useCallback((nextModel: string) => {
     setModel(nextModel)
     if (isOpenVox && nextModel !== model) {
+      cancelVoicesRequest()
+      setVoicesLoading(false)
       setVoice('')
       setVoices([])
       setDefaultParameters((prev) => {
@@ -177,7 +199,7 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
         return updated
       })
     }
-  }, [isOpenVox, model])
+  }, [cancelVoicesRequest, isOpenVox, model])
 
   const handleVoiceChange = useCallback((nextVoice: string) => {
     setVoice(nextVoice)
@@ -193,9 +215,10 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
 
   useEffect(() => {
     if (profile?.id && capabilities?.voiceListStyle === 'dynamic') {
-      fetchVoices()
+      void fetchVoices()
     }
-  }, [profile?.id, capabilities?.voiceListStyle, fetchVoices])
+    return cancelVoicesRequest
+  }, [profile?.id, capabilities?.voiceListStyle, fetchVoices, cancelVoicesRequest])
 
   useEffect(() => {
     if (profile?.id && capabilities?.modelListStyle === 'dynamic') {

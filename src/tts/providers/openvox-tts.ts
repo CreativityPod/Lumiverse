@@ -2,7 +2,11 @@ import type { TtsProviderCapabilities } from "../param-schema";
 import type { TtsVoiceListOptions } from "../provider";
 import type { TtsRequest, TtsResponse, TtsVoice } from "../types";
 import { OpenAICompatibleTtsProvider } from "./openai-compatible-tts";
-import { fetchProviderJson } from "../../utils/provider-errors";
+import {
+  fetchProviderJson,
+  ProviderRequestError,
+  throwProviderResponseError,
+} from "../../utils/provider-errors";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -11,24 +15,24 @@ type UnknownRecord = Record<string, unknown>;
 // and synthesis routing.
 const OPENVOX_LANGUAGE = "en";
 
-interface SynthesisQueueWaiter {
+interface OpenVoxQueueWaiter {
   signal?: AbortSignal;
   resolve: (release: () => void) => void;
   reject: (reason: unknown) => void;
   onAbort?: () => void;
 }
 
-interface SynthesisQueue {
+interface OpenVoxQueue {
   active: boolean;
-  waiters: SynthesisQueueWaiter[];
+  waiters: OpenVoxQueueWaiter[];
 }
 
 /**
- * OpenVox accepts only one synthesis job at a time. Keep the queues at module
- * scope so separate provider instances targeting the same server serialize
- * against one another too.
+ * OpenVox accepts only one model preload or synthesis job at a time. Keep the
+ * queues at module scope so separate provider instances targeting the same
+ * server serialize against one another too.
  */
-const synthesisQueues = new Map<string, SynthesisQueue>();
+const operationQueues = new Map<string, OpenVoxQueue>();
 
 function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("Aborted", "AbortError");
@@ -45,7 +49,7 @@ function normalizedEndpoint(baseUrl: string): string {
   }
 }
 
-function releaseSynthesisSlot(key: string, queue: SynthesisQueue): void {
+function releaseOpenVoxSlot(key: string, queue: OpenVoxQueue): void {
   while (queue.waiters.length > 0) {
     const next = queue.waiters.shift()!;
     if (next.onAbort) {
@@ -61,29 +65,29 @@ function releaseSynthesisSlot(key: string, queue: SynthesisQueue): void {
   }
 
   queue.active = false;
-  if (synthesisQueues.get(key) === queue) {
-    synthesisQueues.delete(key);
+  if (operationQueues.get(key) === queue) {
+    operationQueues.delete(key);
   }
 }
 
-function createRelease(key: string, queue: SynthesisQueue): () => void {
+function createRelease(key: string, queue: OpenVoxQueue): () => void {
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    releaseSynthesisSlot(key, queue);
+    releaseOpenVoxSlot(key, queue);
   };
 }
 
-function acquireSynthesisSlot(key: string, signal?: AbortSignal): Promise<() => void> {
+function acquireOpenVoxSlot(key: string, signal?: AbortSignal): Promise<() => void> {
   if (signal?.aborted) {
     return Promise.reject(abortReason(signal));
   }
 
-  let queue = synthesisQueues.get(key);
+  let queue = operationQueues.get(key);
   if (!queue) {
     queue = { active: false, waiters: [] };
-    synthesisQueues.set(key, queue);
+    operationQueues.set(key, queue);
   }
 
   if (!queue.active) {
@@ -92,7 +96,7 @@ function acquireSynthesisSlot(key: string, signal?: AbortSignal): Promise<() => 
   }
 
   return new Promise<() => void>((resolve, reject) => {
-    const waiter: SynthesisQueueWaiter = { signal, resolve, reject };
+    const waiter: OpenVoxQueueWaiter = { signal, resolve, reject };
     if (signal) {
       waiter.onAbort = () => {
         const index = queue.waiters.indexOf(waiter);
@@ -104,6 +108,19 @@ function acquireSynthesisSlot(key: string, signal?: AbortSignal): Promise<() => 
     }
     queue.waiters.push(waiter);
   });
+}
+
+async function runOpenVoxOperation<T>(
+  key: string,
+  signal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const release = await acquireOpenVoxSlot(key, signal);
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
 }
 
 function asRecord(value: unknown): UnknownRecord | null {
@@ -171,14 +188,44 @@ export class OpenVoxTtsProvider extends OpenAICompatibleTtsProvider {
     };
   }
 
-  override async synthesize(apiKey: string, apiUrl: string, request: TtsRequest): Promise<TtsResponse> {
-    const queueKey = normalizedEndpoint(this.baseUrl(apiUrl));
-    const release = await acquireSynthesisSlot(queueKey, request.signal);
+  private async loadModel(
+    apiKey: string,
+    baseUrl: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    let response: Response;
     try {
-      return await super.synthesize(apiKey, apiUrl, request);
-    } finally {
-      release();
+      response = await fetch(`${baseUrl}/models/${encodeURIComponent(model)}/load`, {
+        method: "POST",
+        headers: this.headers(apiKey),
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted) throw abortReason(signal);
+      throw new ProviderRequestError({
+        provider: this.displayName,
+        operation: "model loading",
+        detail: error instanceof Error ? error.message : "network request failed",
+        retryable: true,
+      });
     }
+
+    if (!response.ok) {
+      await throwProviderResponseError(this.displayName, "model loading", response);
+    }
+    await response.arrayBuffer();
+  }
+
+  override async synthesize(apiKey: string, apiUrl: string, request: TtsRequest): Promise<TtsResponse> {
+    const model = request.model.trim();
+    if (!model) throw new Error("OpenVox TTS requires a model");
+
+    const baseUrl = this.baseUrl(apiUrl);
+    return runOpenVoxOperation(normalizedEndpoint(baseUrl), request.signal, async () => {
+      await this.loadModel(apiKey, baseUrl, model, request.signal);
+      return super.synthesize(apiKey, baseUrl, { ...request, model });
+    });
   }
 
   override async listModels(apiKey: string, apiUrl: string): Promise<Array<{ id: string; label: string }>> {
@@ -216,12 +263,16 @@ export class OpenVoxTtsProvider extends OpenAICompatibleTtsProvider {
     const model = options?.model?.trim();
     if (!model) return [];
 
-    const data = await fetchProviderJson<unknown>(
-      this.displayName,
-      "voice listing",
-      `${this.baseUrl(apiUrl)}/models/${encodeURIComponent(model)}/voices?language=${OPENVOX_LANGUAGE}`,
-      { headers: this.headers(apiKey) },
-    );
+    const baseUrl = this.baseUrl(apiUrl);
+    const data = await runOpenVoxOperation(normalizedEndpoint(baseUrl), undefined, async () => {
+      await this.loadModel(apiKey, baseUrl, model);
+      return fetchProviderJson<unknown>(
+        this.displayName,
+        "voice listing",
+        `${baseUrl}/models/${encodeURIComponent(model)}/voices?language=${OPENVOX_LANGUAGE}`,
+        { headers: this.headers(apiKey) },
+      );
+    });
 
     const byId = new Map<string, TtsVoice>();
     for (const entry of collection(data, ["data", "voices"])) {

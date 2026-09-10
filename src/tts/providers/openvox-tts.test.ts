@@ -10,6 +10,16 @@ function asFetchStub(fn: FetchStub): typeof fetch {
   return stub as typeof fetch;
 }
 
+function isModelLoadRequest(input: RequestInfo | URL): boolean {
+  return String(input).endsWith("/load");
+}
+
+function successfulModelLoad(): Response {
+  return new Response(JSON.stringify({ status: "loaded" }), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -87,6 +97,7 @@ describe("OpenVoxTtsProvider", () => {
     const calls: string[] = [];
     globalThis.fetch = asFetchStub(async (input) => {
       calls.push(String(input));
+      if (isModelLoadRequest(input)) return successfulModelLoad();
       return new Response(JSON.stringify({
         voices: [
           { id: "af_bella", name: "Bella", language: "en", gender: "female" },
@@ -102,6 +113,7 @@ describe("OpenVoxTtsProvider", () => {
     );
 
     expect(calls).toEqual([
+      "http://127.0.0.1:8000/v1/models/chatterbox%2Fturbo/load",
       "http://127.0.0.1:8000/v1/models/chatterbox%2Fturbo/voices?language=en",
     ]);
     expect(voices).toEqual([
@@ -124,8 +136,11 @@ describe("OpenVoxTtsProvider", () => {
   });
 
   test("limits buffered speech requests to English", async () => {
+    const calls: Array<{ url: string; method: string }> = [];
     let body: Record<string, unknown> = {};
-    globalThis.fetch = asFetchStub(async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (input, init) => {
+      calls.push({ url: String(input), method: init?.method || "GET" });
+      if (isModelLoadRequest(input)) return successfulModelLoad();
       body = JSON.parse(String(init?.body));
       return new Response(new Uint8Array([1, 2, 3]), {
         headers: { "content-type": "audio/wav" },
@@ -139,6 +154,10 @@ describe("OpenVoxTtsProvider", () => {
       parameters: { language: "fr", speed: 1.1 },
     });
 
+    expect(calls).toEqual([
+      { url: "http://127.0.0.1:8000/v1/models/kokoro/load", method: "POST" },
+      { url: "http://127.0.0.1:8000/v1/audio/speech", method: "POST" },
+    ]);
     expect(body).toEqual({
       model: "kokoro",
       input: "Hello",
@@ -152,13 +171,19 @@ describe("OpenVoxTtsProvider", () => {
 
   test("runs synthesis requests for the same OpenVox endpoint one at a time in FIFO order", async () => {
     const started: string[] = [];
+    const operations: string[] = [];
     const responseGates = [deferred<Response>(), deferred<Response>(), deferred<Response>()];
     const startSignals = [deferred<void>(), deferred<void>(), deferred<void>()];
     let active = 0;
     let maxActive = 0;
 
-    globalThis.fetch = asFetchStub(async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (input, init) => {
+      if (isModelLoadRequest(input)) {
+        operations.push("load");
+        return successfulModelLoad();
+      }
       const text = String(JSON.parse(String(init?.body)).input);
+      operations.push(`synthesize:${text}`);
       const index = started.length;
       started.push(text);
       active += 1;
@@ -198,11 +223,17 @@ describe("OpenVoxTtsProvider", () => {
     }));
     await Promise.all(results);
     expect(maxActive).toBe(1);
+    expect(operations).toEqual([
+      "load", "synthesize:first",
+      "load", "synthesize:second",
+      "load", "synthesize:third",
+    ]);
   });
 
   test("releases the next queued request when synthesis fails", async () => {
     const calls: string[] = [];
-    globalThis.fetch = asFetchStub(async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (input, init) => {
+      if (isModelLoadRequest(input)) return successfulModelLoad();
       const text = String(JSON.parse(String(init?.body)).input);
       calls.push(text);
       if (text === "first") {
@@ -231,7 +262,8 @@ describe("OpenVoxTtsProvider", () => {
     let active = 0;
     let maxActive = 0;
 
-    globalThis.fetch = asFetchStub(async () => {
+    globalThis.fetch = asFetchStub(async (input) => {
+      if (isModelLoadRequest(input)) return successfulModelLoad();
       active += 1;
       maxActive = Math.max(maxActive, active);
       if (active === 2) bothStarted.resolve();
@@ -258,7 +290,8 @@ describe("OpenVoxTtsProvider", () => {
     const thirdStarted = deferred<void>();
     const started: string[] = [];
 
-    globalThis.fetch = asFetchStub(async (_input, init) => {
+    globalThis.fetch = asFetchStub(async (input, init) => {
+      if (isModelLoadRequest(input)) return successfulModelLoad();
       const text = String(JSON.parse(String(init?.body)).input);
       started.push(text);
       if (text === "first") return firstResponse.promise;
@@ -287,5 +320,40 @@ describe("OpenVoxTtsProvider", () => {
       headers: { "content-type": "audio/wav" },
     }));
     await Promise.all([first, third]);
+  });
+
+  test("does not synthesize when model loading fails and releases the next queued request", async () => {
+    let loadAttempts = 0;
+    let synthesisCalls = 0;
+    globalThis.fetch = asFetchStub(async (input) => {
+      if (isModelLoadRequest(input)) {
+        loadAttempts += 1;
+        if (loadAttempts === 1) {
+          return new Response(JSON.stringify({ detail: "Busy" }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return successfulModelLoad();
+      }
+
+      synthesisCalls += 1;
+      return new Response(new Uint8Array([1]), {
+        headers: { "content-type": "audio/wav" },
+      });
+    });
+
+    const provider = new OpenVoxTtsProvider();
+    const first = provider.synthesize("", "", speechRequest("first"));
+    const second = provider.synthesize("", "", speechRequest("second"));
+
+    await expect(first).rejects.toMatchObject({
+      operation: "model loading",
+      status: 429,
+      detail: "Busy",
+    });
+    await expect(second).resolves.toMatchObject({ contentType: "audio/wav" });
+    expect(loadAttempts).toBe(2);
+    expect(synthesisCalls).toBe(1);
   });
 });
