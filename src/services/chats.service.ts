@@ -21,6 +21,7 @@ import * as embeddingsSvc from "./embeddings.service";
 import * as audioSvc from "./audio.service";
 import * as memoryCortex from "./memory-cortex";
 import * as regexScriptsSvc from "./regex-scripts.service";
+import * as breakdownSvc from "./breakdown.service";
 import { removePoolEntriesForChat } from "./generation-pool.service";
 import { invalidateChatMemoryCache, scheduleChatMemoryRefresh } from "./chat-memory-cache.service";
 import { enqueueChatPipelineTask } from "./chat-pipeline-coordinator.service";
@@ -1282,7 +1283,12 @@ export function deleteChat(userId: string, id: string): boolean {
     console.warn(`[chats] Failed to scan messages for audio cleanup in chat ${id}:`, err);
   }
 
-  const result = getDb().query("DELETE FROM chats WHERE id = ? AND user_id = ?").run(id, userId);
+  const db = getDb();
+  const result = db.transaction(() => {
+    const deleted = db.query("DELETE FROM chats WHERE id = ? AND user_id = ?").run(id, userId);
+    if (deleted.changes > 0) breakdownSvc.deleteBreakdownsForChat(userId, id);
+    return deleted;
+  })();
   if (result.changes > 0) {
     cleanupAudioAttachments(userId, audioAttachments);
     invalidateChatMemoryCache(id);
@@ -2965,12 +2971,13 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
   if (messageIds.length > 500) throw new Error("Maximum 500 messages per batch");
 
   const db = getDb();
-  const getStmt = db.query("SELECT id, extra FROM messages WHERE id = ? AND chat_id = ?");
+  const getStmt = db.query("SELECT id, extra, index_in_chat FROM messages WHERE id = ? AND chat_id = ?");
   const deleteStmt = db.query("DELETE FROM messages WHERE id = ? AND chat_id = ?");
 
   let deleted = 0;
   const deletedIds: string[] = [];
   const attachmentsToCleanup: any[] = [];
+  let earliestDeletedIndex: number | null = null;
 
   const transaction = db.transaction(() => {
     for (const msgId of messageIds) {
@@ -2978,9 +2985,18 @@ export function bulkDeleteMessages(userId: string, chatId: string, messageIds: s
       if (!row) continue;
 
       attachmentsToCleanup.push(...collectMessageAttachments(row));
-      deleteStmt.run(msgId, chatId);
-      deleted++;
-      deletedIds.push(msgId);
+      const result = deleteStmt.run(msgId, chatId);
+      if (result.changes > 0) {
+        breakdownSvc.deleteBreakdownForMessage(userId, msgId);
+        earliestDeletedIndex = earliestDeletedIndex == null
+          ? row.index_in_chat
+          : Math.min(earliestDeletedIndex, row.index_in_chat);
+        deleted++;
+        deletedIds.push(msgId);
+      }
+    }
+    if (earliestDeletedIndex != null) {
+      breakdownSvc.deleteBreakdownsAfterMessage(userId, chatId, earliestDeletedIndex);
     }
   });
 
@@ -3021,7 +3037,15 @@ export function deleteMessage(userId: string, id: string): boolean {
   const msg = getMessage(userId, id);
   if (!msg) return false;
   const attachmentsToCleanup = collectMessageAttachments(msg);
-  const result = getDb().query("DELETE FROM messages WHERE id = ? AND chat_id = ?").run(id, msg.chat_id);
+  const db = getDb();
+  const result = db.transaction(() => {
+    const deleted = db.query("DELETE FROM messages WHERE id = ? AND chat_id = ?").run(id, msg.chat_id);
+    if (deleted.changes > 0) {
+      breakdownSvc.deleteBreakdownForMessage(userId, id);
+      breakdownSvc.deleteBreakdownsAfterMessage(userId, msg.chat_id, msg.index_in_chat);
+    }
+    return deleted;
+  })();
   if (result.changes > 0) {
     const chat = getChat(userId, msg.chat_id);
     if (chat?.metadata?.context_history_anchor_message_id === id) {

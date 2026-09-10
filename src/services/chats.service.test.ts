@@ -11,7 +11,10 @@ import {
   branchChat,
   convertSoloChatToGroup,
   createChat,
+  deleteChat,
   deleteChats,
+  deleteMessage,
+  bulkDeleteMessages,
   getChat,
   getChatTree,
   cycleSwipe,
@@ -104,6 +107,14 @@ function initChatsTestDb(): void {
     updated_at INTEGER NOT NULL,
     UNIQUE(chat_id, settings_key)
   )`);
+
+  db.run(`CREATE TABLE message_breakdowns (
+    message_id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 1
+  )`);
 }
 
 function seedCharacter(id: string, name: string): void {
@@ -156,6 +167,17 @@ function seedMessage(
       null,
       sendDate,
     );
+}
+
+function seedBreakdown(
+  messageId: string,
+  chatId: string,
+  data: unknown = { marker: messageId },
+  userId = "u1",
+): void {
+  getDb()
+    .query("INSERT INTO message_breakdowns (message_id, chat_id, user_id, data) VALUES (?, ?, ?, ?)")
+    .run(messageId, chatId, userId, JSON.stringify(data));
 }
 
 beforeEach(() => {
@@ -796,6 +818,71 @@ describe("bulk chat deletion", () => {
     expect(getChat("u1", "keep")?.name).toBe("Keep");
     const foreign = getDb().query("SELECT id FROM chats WHERE id = ?").get("foreign") as { id: string } | null;
     expect(foreign?.id).toBe("foreign");
+  });
+});
+
+describe("message breakdown deletion", () => {
+  test("deletes all breakdowns for a deleted chat and preserves other chats", () => {
+    seedChat("delete-chat", "c1", "Delete", "{}", 100);
+    seedMessage("delete-message-1", "delete-chat", "One", {}, { index: 0 });
+    seedMessage("delete-message-2", "delete-chat", "Two", {}, { index: 1 });
+    seedBreakdown("delete-message-1", "delete-chat");
+    seedBreakdown("delete-message-2", "delete-chat");
+
+    seedChat("keep-chat", "c1", "Keep", "{}", 200);
+    seedMessage("keep-message", "keep-chat", "Keep", {});
+    seedBreakdown("keep-message", "keep-chat");
+
+    expect(deleteChat("u1", "delete-chat")).toBe(true);
+
+    const deletedCount = getDb()
+      .query("SELECT COUNT(*) AS count FROM message_breakdowns WHERE chat_id = ?")
+      .get("delete-chat") as { count: number };
+    expect(deletedCount.count).toBe(0);
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("keep-message")).not.toBeNull();
+  });
+
+  test("deletes the selected and later prompt breakdowns while preserving earlier ones", () => {
+    const deletedContentMarker = "deleted-sensitive-prompt-marker";
+    seedChat("message-chat", "c1", "Messages", "{}", 100);
+    seedMessage("keep-earlier", "message-chat", "Earlier", {}, { index: 0 });
+    seedMessage("delete-message", "message-chat", deletedContentMarker, {}, { index: 1 });
+    seedMessage("keep-later", "message-chat", "Later", {}, { index: 2 });
+    seedBreakdown("keep-earlier", "message-chat");
+    seedBreakdown("delete-message", "message-chat");
+    seedBreakdown("keep-later", "message-chat", {
+      messages: [
+        { role: "user", content: deletedContentMarker },
+        { role: "assistant", content: "Later" },
+      ],
+    });
+
+    expect(deleteMessage("u1", "delete-message")).toBe(true);
+
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("delete-message")).toBeNull();
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("keep-later")).toBeNull();
+    expect(getDb().query("SELECT message_id FROM message_breakdowns WHERE message_id = ?").get("keep-earlier")).not.toBeNull();
+    expect(getMessage("u1", "keep-later")).not.toBeNull();
+    const retainedMarkerCount = getDb()
+      .query("SELECT COUNT(*) AS count FROM message_breakdowns WHERE instr(data, ?) > 0")
+      .get(deletedContentMarker) as { count: number };
+    expect(retainedMarkerCount.count).toBe(0);
+  });
+
+  test("deletes breakdowns for bulk-deleted messages and preserves unselected messages", () => {
+    seedChat("bulk-message-chat", "c1", "Bulk", "{}", 100);
+    for (const [index, id] of ["delete-one", "keep", "delete-two"].entries()) {
+      seedMessage(id, "bulk-message-chat", id, {}, { index });
+      seedBreakdown(id, "bulk-message-chat");
+    }
+
+    expect(bulkDeleteMessages("u1", "bulk-message-chat", ["delete-one", "missing", "delete-two"])).toBe(2);
+
+    const remaining = getDb()
+      .query("SELECT message_id FROM message_breakdowns WHERE chat_id = ? ORDER BY message_id")
+      .all("bulk-message-chat") as Array<{ message_id: string }>;
+    expect(remaining).toEqual([]);
+    expect(getMessage("u1", "keep")).not.toBeNull();
   });
 });
 
