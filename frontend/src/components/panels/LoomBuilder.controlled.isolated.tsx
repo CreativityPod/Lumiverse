@@ -497,6 +497,57 @@ describe('controlled Loom editor trust boundary', () => {
     unmountRoot(root)
   })
 
+  test('clears a controlled draft when the selected block is removed', async () => {
+    const drafts: Array<{ blockId: string; updates: Partial<PromptBlock> | null }> = []
+    const selected: Array<string | null> = []
+    const onDraftChange = (blockId: string, updates: Partial<PromptBlock> | null) => {
+      drafts.push({ blockId, updates })
+    }
+    const onSelectedBlockChange = (blockId: string | null) => { selected.push(blockId) }
+    const { container, root } = renderControlled([block()], () => {}, undefined, {
+      selectedBlockId: 'public-block',
+      onDraftChange,
+      onSelectedBlockChange,
+    })
+
+    editRole(container, 'assistant')
+    await act(async () => {})
+    expect(drafts.at(-1)).toMatchObject({ blockId: 'public-block', updates: { role: 'assistant' } })
+
+    flushSync(() => {
+      root.render(createElement(ControlledLoomBlockEditor, {
+        blocks: [],
+        promptVariables,
+        onChange: () => {},
+        onDraftChange,
+        selectedBlockId: 'public-block',
+        onSelectedBlockChange,
+        availableMacros: [],
+        compact: true,
+      }))
+    })
+    await act(async () => {})
+
+    expect(selected).toEqual([null])
+    expect(drafts.at(-1)).toEqual({ blockId: 'public-block', updates: null })
+
+    flushSync(() => {
+      root.render(createElement(ControlledLoomBlockEditor, {
+        blocks: [],
+        promptVariables,
+        onChange: () => {},
+        onDraftChange,
+        selectedBlockId: null,
+        onSelectedBlockChange,
+        availableMacros: [],
+        compact: true,
+      }))
+    })
+    await act(async () => {})
+    expect(drafts.filter(({ updates }) => updates === null)).toHaveLength(1)
+    unmountRoot(root)
+  })
+
   test('defaults BlockEditor trusted host features to deny', () => {
     let saved: Partial<PromptBlock> | undefined
     const { container, root } = renderBlockEditor(undefined, (updates) => {

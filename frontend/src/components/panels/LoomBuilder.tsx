@@ -1123,8 +1123,12 @@ export function ControlledLoomBlockEditor({
   useEffect(() => {
     if (!editingBlockId || blocks.some((block) => block.id === editingBlockId)) return
     setValidationError(null)
+    if (explicitlyClearedDraftBlockIdRef.current !== editingBlockId) {
+      explicitlyClearedDraftBlockIdRef.current = editingBlockId
+      onDraftChange?.(editingBlockId, null)
+    }
     selectBlock(null)
-  }, [blocks, editingBlockId, selectBlock])
+  }, [blocks, editingBlockId, onDraftChange, selectBlock])
 
   if (editingBlock && !readOnly) {
     return (
