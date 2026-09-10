@@ -7,7 +7,7 @@ const ESCAPABLE_LITERAL_CHARS = new Set("\\^$.*+?()[]{}|/")
  * null merely disables the optimization; it must never invent a guard for a
  * pattern whose language does not require the literal.
  */
-export function getRequiredTerminalLiteral(pattern: string): string | null {
+export function getRequiredTerminalLiteral(pattern: string, minLength = 4): string | null {
   let suffix = ""
   let depth = 0
   let inCharacterClass = false
@@ -86,7 +86,7 @@ export function getRequiredTerminalLiteral(pattern: string): string | null {
     suffix += char
   }
 
-  return suffix.length >= 4 ? suffix : null
+  return suffix.length >= minLength ? suffix : null
 }
 
 function escapeRegexLiteral(value: string): string {
@@ -136,8 +136,16 @@ export function replaceWithinRegexSearchWindow(
 ): string {
   const searchEnd = getRegexSearchEnd(input, pattern, flags, replacementTemplate)
   const searchable = searchEnd === input.length ? input : input.slice(0, searchEnd)
-  const replaced = typeof replacement === "string"
-    ? searchable.replace(regex, replacement)
-    : searchable.replace(regex, replacement)
-  return searchEnd === input.length ? replaced : replaced + input.slice(searchEnd)
+  // Cached sticky RegExp instances retain lastIndex after a successful
+  // non-global replacement. Reset around every use so cache hits are
+  // observationally identical to a freshly compiled RegExp.
+  regex.lastIndex = 0
+  try {
+    const replaced = typeof replacement === "string"
+      ? searchable.replace(regex, replacement)
+      : searchable.replace(regex, replacement)
+    return searchEnd === input.length ? replaced : replaced + input.slice(searchEnd)
+  } finally {
+    regex.lastIndex = 0
+  }
 }

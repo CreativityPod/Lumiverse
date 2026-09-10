@@ -3,8 +3,10 @@ import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import {
   worldBookVectorDesiredStatusSql,
+  worldBookVectorSettingsFingerprint,
 } from "./world-book-vector-state";
 import { WORLD_BOOK_VECTOR_SETTINGS_KEY } from "./world-book-vector-constants";
+import { normalizeWorldBookVectorSettings } from "./world-book-vector-settings-model";
 
 export interface Setting {
   key: string;
@@ -32,6 +34,18 @@ function markWorldBookVectorStatesStaleForSettingsChange(userId: string): void {
          vector_index_error = NULL
      WHERE world_book_id IN (SELECT id FROM world_books WHERE user_id = ?)`
   ).run(userId);
+}
+
+function worldBookVectorIndexSettingsChanged(existingJson: string | undefined, nextValue: unknown): boolean {
+  try {
+    const previous = normalizeWorldBookVectorSettings(existingJson === undefined ? null : JSON.parse(existingJson));
+    const next = normalizeWorldBookVectorSettings(nextValue);
+    return worldBookVectorSettingsFingerprint(previous) !== worldBookVectorSettingsFingerprint(next);
+  } catch {
+    // A malformed legacy value should be treated conservatively so the next
+    // valid save cannot leave vectors built with unknown chunking settings.
+    return true;
+  }
 }
 
 function assertValidKey(key: unknown): asserts key is string {
@@ -78,6 +92,38 @@ export function getSetting(userId: string, key: string): Setting | null {
   return { ...row, value: JSON.parse(row.value) };
 }
 
+export function getSettingAcrossUsers(key: string): Array<{ user_id: string; value: any }> {
+  const rows = getDb().query("SELECT user_id, value FROM settings WHERE key = ?").all(key) as any[];
+  return rows.map((r) => ({ user_id: r.user_id, value: JSON.parse(r.value) }));
+}
+
+/**
+ * The `editAndSendAlwaysUseActiveConnection` Productivity setting, read from the
+ * persisted per-user `quickToolbarSettings` blob.
+ *
+ * Lives here rather than in `generate.service` because BOTH ends of the
+ * Edit-and-Send flow need the identical answer and must not be able to drift:
+ * `chats.service.editAndSend` reads it once at COMMIT time to record the
+ * resolved connection on the outbox row, and `generate.service` reads it on the
+ * legacy path for rows committed before that column existed. A duplicated
+ * predicate is exactly how the two would diverge.
+ *
+ * Strict `=== true`: an absent row, an absent key, `null`, `undefined`, a
+ * non-object or array value, an explicit `false`, and the coercible `"true"` /
+ * `0` all mean OFF. No truthiness coercion anywhere, so an explicit `false`
+ * cannot be flipped. Frontend defaults are deliberately NOT merged server-side
+ * (`DEFAULT_QUICK_TOOLBAR_SETTINGS` is a frontend module) — a default merge is
+ * the one way a wrong value could be reintroduced. Only the CANONICAL
+ * `quickToolbarSettings` row is read; the namespaced compatibility mirror
+ * `spindle:lumiverse_suite:quick_toolbar:quickToolbarSettings` is never
+ * authoritative.
+ */
+export function readEditAndSendAlwaysUseActiveConnection(userId: string): boolean {
+  const value = getSetting(userId, "quickToolbarSettings")?.value;
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && (value as Record<string, unknown>).editAndSendAlwaysUseActiveConnection === true;
+}
+
 export function getSettingsByKeys(userId: string, keys: string[]): Map<string, any> {
   if (keys.length === 0) return new Map();
   const placeholders = keys.map(() => "?").join(", ");
@@ -111,7 +157,7 @@ export function putSetting(
     )
     .run(key, json, userId, now);
 
-  if (key === WORLD_BOOK_VECTOR_SETTINGS_KEY && existingRow?.value !== json) {
+  if (key === WORLD_BOOK_VECTOR_SETTINGS_KEY && worldBookVectorIndexSettingsChanged(existingRow?.value, value)) {
     markWorldBookVectorStatesStaleForSettingsChange(userId);
   }
 
@@ -171,7 +217,8 @@ export function putMany(userId: string, settings: Record<string, any>): Setting[
   transaction();
 
   const worldBookVectorSettingsChanged = prepared.some(
-    (entry) => entry.key === WORLD_BOOK_VECTOR_SETTINGS_KEY && existingValues?.get(entry.key) !== entry.json,
+    (entry) => entry.key === WORLD_BOOK_VECTOR_SETTINGS_KEY
+      && worldBookVectorIndexSettingsChanged(existingValues?.get(entry.key), entry.value),
   );
   if (worldBookVectorSettingsChanged) {
     markWorldBookVectorStatesStaleForSettingsChange(userId);

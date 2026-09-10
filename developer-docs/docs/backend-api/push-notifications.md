@@ -5,7 +5,9 @@
 
 Send OS-level push notifications to users' devices. Notifications are delivered even when the Lumiverse app is closed or backgrounded — ideal for alerting users to completed tasks, character activity, or time-sensitive events.
 
-Notifications are automatically **suppressed** when the user is actively viewing the app (the service worker checks for focused clients), so you won't double-notify alongside in-app toasts.
+Notifications are automatically **suppressed** on the server when any of the user's connected sessions reports the app as visible. This applies across devices and to test notifications. Presence is refreshed after each WebSocket connection and authentication, including PWA resume.
+
+Once a push has been sent, the service worker displays it even if the app returns to the foreground before delivery. [WebKit requires every received push to display a notification](https://webkit.org/blog/12945/meet-web-push/); silently discarding it can revoke the subscription.
 
 ## Usage
 

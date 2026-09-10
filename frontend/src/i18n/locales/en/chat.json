@@ -82,7 +82,7 @@
     "switchConnectionActive": "Connection: {{name}}",
     "attachFiles": "Attach files",
     "attachFile": "Attach file",
-    "attachImageOrAudio": "Attach image or audio",
+    "attachImageOrAudio": "Attach image, audio, or video",
     "dropToAttach": "Drop files to attach",
     "removeAttachment": "Remove attachment",
     "message": "Message",
@@ -127,6 +127,8 @@
   "quickMenu": {
     "noGuidedGenerations": "No guided generations configured.",
     "disableAllGuidedGenerations": "Disable all guided generations",
+    "auto": "AUTO",
+    "autoEnabledHint": "Automatically enabled for this context. Change the rule in settings.",
     "manageInSettings": "Manage in settings",
     "noQuickReplySets": "No enabled quick reply sets.",
     "untitledReply": "Untitled reply",
@@ -287,7 +289,8 @@
     "active": "· Active",
     "ariaLabel": "Author's note",
     "placeholder": "Write instructions or context for the AI...",
-    "depth": "Depth",
+    "depth": "Depth from latest message",
+    "depthHint": "0 = after the latest message; 1 = before it. Higher values place the note further back in chat history.",
     "role": "Role",
     "roleAria": "Role"
   },
@@ -398,6 +401,8 @@
     "copyCode": "Copy code",
     "copy": "Copy",
     "copied": "Copied!",
+    "readMore": "Read more",
+    "showLess": "Show less",
     "youtubeVideo": "YouTube video"
   },
   "messageMeta": {
@@ -424,7 +429,11 @@
     "ready": "New swipe ready"
   },
   "portrait": {
-    "setChatBackground": "Set as Chat Background"
+    "setChatBackground": "Set as Chat Background",
+    "copyImageReference": "Copy Image Reference",
+    "imageReferenceCopied": "Image reference copied",
+    "imageReferenceCopyFailed": "Failed to copy image reference",
+    "galleryImage": "Gallery image"
   },
   "attachments": {
     "removeImage": "Remove image",

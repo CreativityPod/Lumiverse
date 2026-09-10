@@ -80,17 +80,19 @@ export const createAuthSlice: StateCreator<AuthSlice> = (set, getState) => ({
       isAuthLoading: false,
       authError: null,
     })
-    await authClient.signOut()
+    await authClient.signOut({})
   },
 
   checkSession: async () => {
     const mutationGeneration = authMutationGeneration
     const requestGeneration = ++sessionCheckGeneration
     const startedDuringLogin = pendingLoginGeneration !== null
+    const hadAuthenticatedSession = getState().isAuthenticated && !!getState().user
     set({ isAuthLoading: true, authError: null })
     let responseMeta: AuthErrorResponseMeta | null = null
     try {
       const { data } = await authClient.getSession({
+        query: {},
         fetchOptions: {
           onError: async (ctx) => {
             responseMeta = await readAuthErrorResponseMeta(ctx)
@@ -133,6 +135,15 @@ export const createAuthSlice: StateCreator<AuthSlice> = (set, getState) => ({
         || mutationGeneration !== authMutationGeneration
         || requestGeneration !== sessionCheckGeneration
       ) return
+      // A periodic/focus revalidation can fail because the backend is briefly
+      // unreachable. That is not evidence that the established session was
+      // revoked, so retain it and let the websocket/next revalidation recover.
+      // A successful get-session response with no data still clears the user
+      // in the branch above.
+      if (hadAuthenticatedSession && getState().isAuthenticated && getState().user) {
+        set({ isAuthLoading: false, authError: null })
+        return
+      }
       resetUserScopedStoreState()
       set({
         user: null,

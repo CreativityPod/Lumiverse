@@ -59,7 +59,7 @@ All commands below assume you have already cloned the repo and are working from 
 
 The launcher will:
 1. Install Bun if not found
-2. Upgrade Bun versions older than 1.3.13 to the latest stable release
+2. Upgrade unsupported Bun versions to the latest stable release (minimum 1.4.0)
 3. Run the **first-time setup wizard** (admin account, port, extension storage, optional SMART disk monitoring)
 4. Install backend dependencies and serve the existing frontend build if one is available
 5. Start the backend with the runner and IPC bridge when launched interactively
@@ -117,7 +117,7 @@ In your Space's **Settings → Persistent storage**, attach a storage bucket and
 In the **Files** tab of your Space, create a file named `Dockerfile` with the following contents:
 
 ```dockerfile
-FROM oven/bun:1-slim
+FROM oven/bun:1.4.0-slim@sha256:e0ee68d16ccb9927bf02aa7dd8fd4bf3369ee6d46da04faa72b05ce8bfd135f6
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -248,7 +248,9 @@ with Lumiverse's integrated browser as its primary interface and a macOS menu
 bar / Windows system tray / Linux StatusNotifier icon for controls. It starts
 and stops a local server, shows serving stats, opens the same address in your
 default browser on request, and applies updates through the runner. See
-[desktop/README.md](desktop/README.md) for build instructions.
+[desktop/README.md](desktop/README.md) for build instructions. There is no
+prebuilt download — run `bun run desktop:doctor` to check whether this machine
+can build it.
 
 ## Configuration
 

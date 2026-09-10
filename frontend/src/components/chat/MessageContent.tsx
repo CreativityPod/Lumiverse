@@ -1,8 +1,10 @@
 import { useMemo, useRef, useLayoutEffect, useState, useEffect, useCallback, useSyncExternalStore, useDeferredValue } from 'react'
 import { useTranslation } from 'react-i18next'
+import { ChevronDown } from 'lucide-react'
 import { marked } from 'marked'
 import { highlightCode } from '@/lib/codeHighlight'
-import { processMarkdownInHtmlIsland } from './htmlIslandMarkdown'
+import { ISLAND_BLANK_LINE_RE, processMarkdownInHtmlIsland } from './htmlIslandMarkdown'
+import { resolveGalleryImageId, resolveGalleryImageSourcesInHtml } from '@/lib/galleryImageReference'
 import { parseOOC } from '@/lib/oocParser'
 import { createEmphasisAwareRenderer } from '@/lib/markedEmphasisRenderer'
 import { createStrictTildeTokenizer } from '@/lib/markedTokenizer'
@@ -28,7 +30,13 @@ import {
 } from '@/lib/message-content-layout'
 import { useStore } from '@/store'
 import i18n from '@/i18n'
-import { useDisplayRegex } from '@/hooks/useDisplayRegex'
+import { useDisplayRegexState } from '@/hooks/useDisplayRegex'
+import {
+  getLongMessageCollapseHeight,
+  isLongMessageCollapseEligible,
+  isLongMessageOverflowing,
+  longMessageExpansionKey,
+} from '@/lib/longMessageCollapse'
 import {
   REGEX_SELECTIONS_CHANGED_EVENT,
   dispatchRegexAction,
@@ -60,7 +68,7 @@ interface MessageContentProps {
   findQuery?: string
 }
 
-// Custom renderer for sheld prose classes
+// Custom renderer for chat prose classes
 const renderer = createEmphasisAwareRenderer({
   emClass: styles.proseItalic,
   strongClass: styles.proseBold,
@@ -872,7 +880,7 @@ function getIslandEndAt(raw: string, start: number, isStreaming: boolean): numbe
   return null
 }
 
-function renderIslandMarkdownText(markdown: string): string {
+function renderIslandMarkdownText(markdown: string, messageProse = false): string {
   const leadingWhitespace = markdown.match(/^\s*/)?.[0] ?? ''
   const trailingWhitespace = markdown.match(/\s*$/)?.[0] ?? ''
   const core = markdown.trim()
@@ -882,8 +890,15 @@ function renderIslandMarkdownText(markdown: string): string {
   let html = marked.parse(core, { async: false }) as string
   html = normalizeQuotesInHTML(html)
 
+  // In message-prose islands, text set apart by a blank line is a paragraph:
+  // keep its <p> so it gets paragraph spacing next to images and panels.
+  // Otherwise a lone <p> is marked wrapping a piece of a tag-split sentence,
+  // so unwrap it to keep the sentence inline.
+  const blockSeparated =
+    messageProse
+    && (ISLAND_BLANK_LINE_RE.test(leadingWhitespace) || ISLAND_BLANK_LINE_RE.test(trailingWhitespace))
   const singleParagraphMatch = html.match(/^<p>([\s\S]*)<\/p>\s*$/)
-  if (singleParagraphMatch && !/<\/p>\s*<p\b/i.test(html)) {
+  if (!blockSeparated && singleParagraphMatch && !/<\/p>\s*<p\b/i.test(html)) {
     html = singleParagraphMatch[1]
   }
 
@@ -965,9 +980,12 @@ function extractHtmlIslands(
   return { content, islands }
 }
 
+const MESSAGE_PROSE_WRAP_RE = /^\s*<div[^>]*\bdata-message-prose\b/i
+
 function processMarkdownInIsland(html: string): string {
+  const messageProse = MESSAGE_PROSE_WRAP_RE.test(html)
   return processMarkdownInHtmlIsland(html, {
-    renderBlockText: renderIslandMarkdownText,
+    renderBlockText: (markdown) => renderIslandMarkdownText(markdown, messageProse),
     renderInlineText: renderIslandInlineMarkdownText,
     normalizeHtml: normalizeLegacyFontTags,
   })
@@ -1152,14 +1170,33 @@ function notifyMessageContentLayout(el: HTMLElement): void {
   dispatchMessageContentLayout(el)
 }
 
-function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
+function replaceHtmlPreservingImages(root: HTMLElement | ShadowRoot, html: string): void {
+  const stableImgs = new Map<string, HTMLImageElement>()
+  for (const img of root.querySelectorAll<HTMLImageElement>('img[src]')) {
+    const src = img.getAttribute('src')
+    if (src && !stableImgs.has(src)) stableImgs.set(src, img)
+  }
+
+  root.innerHTML = html
+
+  for (const newImg of root.querySelectorAll<HTMLImageElement>('img[src]')) {
+    const src = newImg.getAttribute('src')
+    if (!src) continue
+    const preserved = stableImgs.get(src)
+    if (preserved && newImg.parentNode) {
+      newImg.replaceWith(preserved)
+      stableImgs.delete(src)
+    }
+  }
+}
+export function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
 
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: 'open' })
-    shadow.innerHTML = `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`
+    replaceHtmlPreservingImages(shadow, `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`)
     for (const actionEl of shadow.querySelectorAll<HTMLElement>('[data-lumiverse-regex-action]')) {
       actionEl.style.cursor = 'pointer'
     }
@@ -1304,7 +1341,7 @@ function getChatFindHighlightRoots(container: HTMLElement): ChatFindHighlightRoo
  * src across innerHTML replacements, so images don't redo the cache lookup,
  * decode, paint cycle on every chat re-render.
  */
-function ProseHtml({ html, className }: { html: string; className?: string }) {
+export function ProseHtml({ html, className }: { html: string; className?: string }) {
   const ref = useRef<HTMLDivElement>(null)
   const lastHtmlRef = useRef<string | null>(null)
 
@@ -1313,35 +1350,13 @@ function ProseHtml({ html, className }: { html: string; className?: string }) {
     if (!el) return
     if (lastHtmlRef.current === html) return
 
-    const stableImgs = new Map<string, HTMLImageElement>()
-    if (lastHtmlRef.current !== null) {
-      for (const img of el.querySelectorAll<HTMLImageElement>('img[src]')) {
-        const src = img.getAttribute('src')
-        if (src && !stableImgs.has(src)) stableImgs.set(src, img)
-      }
-    }
-
-    el.innerHTML = html
+    replaceHtmlPreservingImages(el, html)
     lastHtmlRef.current = html
-
-    if (stableImgs.size > 0) {
-      for (const newImg of el.querySelectorAll<HTMLImageElement>('img[src]')) {
-        const src = newImg.getAttribute('src')
-        if (!src) continue
-        const preserved = stableImgs.get(src)
-        if (preserved && newImg.parentNode) {
-          newImg.replaceWith(preserved)
-          stableImgs.delete(src)
-        }
-      }
-    }
-
     notifyMessageContentLayout(el)
   }, [html])
 
   return <div ref={ref} className={className} />
 }
-
 function TrustedYouTubeEmbed({ embed }: { embed: TrustedYouTubeEmbed }) {
   return (
     <div className={styles.youtubeEmbedWrap}>
@@ -1376,6 +1391,8 @@ function assetStem(name: string): string {
 
 /** Look up an asset reference in the map — tries exact, then stem. Handles embeded:// URIs. */
 function resolveAssetId(src: string, assetMap: Record<string, string>): string | undefined {
+  const galleryImageId = resolveGalleryImageId(src, assetMap)
+  if (galleryImageId) return galleryImageId
   // Strip Risu embeded:// prefix
   const cleaned = src.startsWith('embeded://') ? src.slice('embeded://'.length) : src
   return assetMap[cleaned] ?? assetMap[assetStem(cleaned)]
@@ -1397,6 +1414,10 @@ function resolveRisuAssetTags(text: string, assetMap: Record<string, string>): s
  *  custom renderer (proseImageWrap, lightbox) as Risu <img="..."> tags.
  *  Already-resolved URLs (absolute paths, http, data:) are left as raw HTML. */
 function resolveImgSrcAssetTags(text: string, assetMap: Record<string, string>): string {
+  // Gallery sources retain their original HTML tag so display-regex styling
+  // and wrapper behavior survive. Other legacy asset references continue to
+  // use the standard Markdown image renderer below.
+  text = resolveGalleryImageSourcesInHtml(text, assetMap)
   IMG_SRC_ASSET_RE.lastIndex = 0
   return text.replace(IMG_SRC_ASSET_RE, (match, before: string, src: string, after: string) => {
     // Skip already-resolved URLs — these are valid img tags that should render as-is
@@ -1506,11 +1527,13 @@ export default function MessageContent({
   const macroCtx = useMemo(() => ({ charName, userName }), [charName, userName])
   const preprocessOpts = useMemo(
     () => (messageId
-      ? { messageId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
+      ? { messageId, chatId, role: (isUser ? 'user' : 'assistant') as 'user' | 'assistant' }
       : undefined),
-    [messageId, isUser],
+    [messageId, chatId, isUser],
   )
-  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts)
+  const { content: regexAppliedContent, pending: displayPending } = useDisplayRegexState(
+    interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts, isStreaming,
+  )
 
   const risuResolvedContent = useMemo(
     () => {
@@ -1533,10 +1556,41 @@ export default function MessageContent({
   const blocks = useMemo(() => parseOOC(renderContent), [renderContent])
   const oocEnabled = useStore((s) => s.oocEnabled)
   const lumiaOOCStyle = useStore((s) => s.lumiaOOCStyle)
+  const longMessageCollapseEnabled = useStore((s) => s.longMessageCollapseEnabled)
+  const longMessageCollapsePreset = useStore((s) => s.longMessageCollapsePreset)
+  const longMessageCollapseCustomHeight = useStore((s) => s.longMessageCollapseCustomHeight)
+  const longMessageCollapseDepth = useStore((s) => s.longMessageCollapseDepth)
+  const expansionKey = chatId && messageId ? longMessageExpansionKey(chatId, messageId) : null
+  const longMessageExpanded = useStore((s) => (
+    expansionKey ? s.expandedLongMessageKeys.includes(expansionKey) : false
+  ))
+  const setLongMessageExpanded = useStore((s) => s.setLongMessageExpanded)
+  const longMessageEligible = isLongMessageCollapseEligible({
+    enabled: longMessageCollapseEnabled,
+    isUser,
+    depth,
+    collapseDepth: longMessageCollapseDepth,
+    chatId,
+    messageId,
+  })
+  const longMessageMaxHeight = getLongMessageCollapseHeight(
+    longMessageCollapsePreset,
+    longMessageCollapseCustomHeight,
+  )
   const containerRef = useRef<HTMLDivElement>(null)
+  const contentBodyRef = useRef<HTMLDivElement>(null)
   const prevTextLenRef = useRef(0)
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null)
   const [regexSelectionVersion, setRegexSelectionVersion] = useState(0)
+  const [longMessageOverflowing, setLongMessageOverflowing] = useState(false)
+
+  const measureLongMessageOverflow = useCallback(() => {
+    const body = contentBodyRef.current
+    const next = longMessageEligible
+      && !!body
+      && isLongMessageOverflowing(Math.max(body.scrollHeight, body.offsetHeight), longMessageMaxHeight)
+    setLongMessageOverflowing((current) => current === next ? current : next)
+  }, [longMessageEligible, longMessageMaxHeight])
 
   useEffect(() => {
     const refresh = () => setRegexSelectionVersion((version) => version + 1)
@@ -1867,6 +1921,7 @@ export default function MessageContent({
       pendingRaf = window.requestAnimationFrame(() => {
         pendingRaf = 0
         if (cancelled) return
+        measureLongMessageOverflow()
         notifyMessageContentLayout(container)
       })
     }
@@ -1885,7 +1940,7 @@ export default function MessageContent({
     let observer: ResizeObserver | null = null
     if (isStreaming) {
       observer = new ResizeObserver(scheduleLayoutNotify)
-      observer.observe(container)
+      observer.observe(contentBodyRef.current ?? container)
 
       mutationObserver = new MutationObserver(scheduleLayoutNotify)
       mutationObserver.observe(container, { childList: true, subtree: true, attributes: true, characterData: true })
@@ -1915,37 +1970,37 @@ export default function MessageContent({
     // layout events already notify MessageList via scheduleLayoutNotify(), so
     // re-creating observers on every renderContent change is unnecessary and
     // causes observer churn during fast streaming.
-  }, [isStreaming])
+  }, [isStreaming, measureLongMessageOverflow])
 
   // While streaming, ratchet the content container's min-height upward so that
   // transient DOM shrinkage (unclosed tags snapping shut, image placeholders
   // collapsing, etc.) cannot make the virtualized row height oscillate. The
   // lock is applied directly to the DOM to avoid React re-render thrash.
   useLayoutEffect(() => {
-    const container = containerRef.current
-    if (!container) return
+    const contentBody = contentBodyRef.current
+    if (!contentBody) return
 
     if (!isStreaming) {
-      container.style.minHeight = ''
+      contentBody.style.minHeight = ''
       return
     }
 
     // offsetHeight is zoom-invariant under Lumiverse's body-level CSS zoom,
     // whereas getBoundingClientRect() would return scaled pixels and the lock
     // would be applied twice.
-    let maxHeight = container.offsetHeight
-    container.style.minHeight = `${maxHeight}px`
+    let maxHeight = contentBody.offsetHeight
+    contentBody.style.minHeight = `${maxHeight}px`
 
     const updateMinHeight = () => {
-      const h = container.offsetHeight
+      const h = contentBody.offsetHeight
       if (h > maxHeight) {
         maxHeight = h
-        container.style.minHeight = `${h}px`
+        contentBody.style.minHeight = `${h}px`
       }
     }
 
     const observer = new ResizeObserver(updateMinHeight)
-    observer.observe(container)
+    observer.observe(contentBody)
 
     return () => observer.disconnect()
   }, [isStreaming])
@@ -2020,6 +2075,23 @@ export default function MessageContent({
 
     return elements
   }, [blocks, oocEnabled, lumiaOOCStyle, isStreaming])
+
+  useLayoutEffect(() => {
+    measureLongMessageOverflow()
+  }, [measureLongMessageOverflow, renderContent, renderedBlocks])
+
+  const handleLongMessageToggle = useCallback(() => {
+    if (!chatId || !messageId) return
+    const container = containerRef.current
+    dispatchCollapsibleToggleLayoutEvent(container)
+    setLongMessageExpanded(chatId, messageId, !longMessageExpanded)
+    window.requestAnimationFrame(() => {
+      const current = containerRef.current
+      if (!current) return
+      measureLongMessageOverflow()
+      dispatchMessageContentLayout(current)
+    })
+  }, [chatId, longMessageExpanded, measureLongMessageOverflow, messageId, setLongMessageExpanded])
 
   // Highlight rendered text nodes instead of rewriting the source Markdown or
   // sanitized HTML. This preserves formatting, display regexes, OOC layouts,
@@ -2102,11 +2174,41 @@ export default function MessageContent({
     <>
       <div
         data-component="MessageContent"
+        data-display-pending={!isStreaming && displayPending || undefined}
         ref={containerRef}
         className={clsx(styles.content, isUser ? styles.contentUser : styles.contentChar)}
       >
-        {renderedBlocks}
-        <SpindleMessageWidgets messageId={messageId} />
+        <div
+          id={longMessageEligible ? `long-message-body-${messageId}` : undefined}
+          className={clsx(
+            styles.longMessageViewport,
+            longMessageEligible && !longMessageExpanded && styles.longMessageViewportConstrained,
+            longMessageEligible && !longMessageExpanded && longMessageOverflowing && styles.longMessageViewportOverflowing,
+          )}
+          style={longMessageEligible && !longMessageExpanded ? { maxHeight: longMessageMaxHeight } : undefined}
+        >
+          <div ref={contentBodyRef} className={styles.longMessageBody}>
+            {renderedBlocks}
+      <SpindleMessageWidgets messageId={messageId} chatId={chatId} />
+          </div>
+        </div>
+        {longMessageEligible && longMessageOverflowing && (
+          <button
+            type="button"
+            className={clsx(styles.longMessageToggle, longMessageExpanded && styles.longMessageToggleExpanded)}
+            onClick={handleLongMessageToggle}
+            aria-expanded={longMessageExpanded}
+            aria-controls={`long-message-body-${messageId}`}
+            data-long-message-toggle="true"
+          >
+            <span className={styles.longMessageTogglePill}>
+              <span>{longMessageExpanded ? t('messageContent.showLess') : t('messageContent.readMore')}</span>
+              <span className={styles.longMessageToggleIconFrame} aria-hidden="true">
+                <ChevronDown className={styles.longMessageToggleIcon} size={13} strokeWidth={2.4} />
+              </span>
+            </span>
+          </button>
+        )}
       </div>
       <ImageLightbox src={lightboxSrc} onClose={handleLightboxClose} />
     </>

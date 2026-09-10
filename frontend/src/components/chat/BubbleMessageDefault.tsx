@@ -65,6 +65,8 @@ export interface BubbleMessageDefaultProps {
   userLeft: boolean
   handleEdit: () => void
   handleSaveEdit: () => void
+  handleEditAndSend: () => void
+  editAndSendPending: boolean
   handleCancelEdit: () => void
   handleDelete: () => void
   handleToggleHidden: () => void
@@ -181,8 +183,8 @@ export default function BubbleMessageDefault({
   isEditing, editContent, setEditContent, editReasoning, setEditReasoning, showReasoningEditor,
   isUser, isActivelyStreaming, displayContent, reasoning, reasoningDuration, reasoningStartedAt,
   tokenCount, generationMetrics, avatarUrl, fullAvatarUrl, displayAvatarUrl, displayName, macroUserName, isHidden, isContextAnchor, userLeft,
-  handleEdit, handleSaveEdit, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
-  handleFork, handlePromptBreakdown,
+  handleEdit, handleSaveEdit, handleEditAndSend, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
+  handleFork, handlePromptBreakdown, editAndSendPending,
 }: BubbleMessageDefaultProps) {
   const { t } = useTranslation('chat')
   const { t: tc } = useTranslation('common')
@@ -190,8 +192,8 @@ export default function BubbleMessageDefault({
   const swipeGesturesEnabled = useStore((s) => s.swipeGesturesEnabled)
   const showMessageTokenCount = useStore((s) => s.showMessageTokenCount ?? true)
   const messageContextMenuEnabled = useStore((s) => s.messageContextMenuEnabled ?? true)
-  // Keep a MessageAudioSlot wrapper mounted on every assistant bubble
-  // when TTS is enabled, OR whenever an audio attachment already exists.
+  // Keep a MessageAudioSlot wrapper mounted on every assistant bubble when
+  // TTS is enabled, and on either side whenever an audio attachment exists.
   // The slot itself is height-zero when no audio is attached (no wasted
   // space, no contribution to row height) and transitions smoothly to
   // its natural height when audio arrives. Always-mounted is required
@@ -209,7 +211,7 @@ export default function BubbleMessageDefault({
       a && a.type === 'audio' && (a.swipe_id === undefined || a.swipe_id === message.swipe_id),
     ) ?? null
   }, [message.extra?.attachments, message.swipe_id])
-  const renderAudioSlot = !isEditing && (ttsEnabled || !!audioAttachment) && !message.is_user
+  const renderAudioSlot = !isEditing && (!!audioAttachment || (ttsEnabled && !message.is_user))
   const isHighlighted = useStore((s) => s.highlightedMessageId === message.id)
   const cardRef = useRef<HTMLDivElement>(null)
 
@@ -240,6 +242,9 @@ export default function BubbleMessageDefault({
     confirmDelete,
     cancelDelete,
   } = useMessagePlayback(message.id, message.content, message.name, message.is_user)
+  // Uploaded user audio owns its own inline player. Do not label the message's
+  // TTS action as "regenerate" or let it replace the uploaded recording.
+  const canUseTtsAction = canPlay && (!isUser || !audioAttachment)
   const canOpenContextMenu = !isEditing && !isSelectMode && messageContextMenuEnabled
 
   const closeContextMenu = useCallback(() => setContextMenuPos(null), [])
@@ -298,7 +303,7 @@ export default function BubbleMessageDefault({
       icon: <Pencil size={14} />,
       onClick: () => contextAction(handleEdit),
     },
-    ...(canPlay ? [{
+    ...(canUseTtsAction ? [{
       key: 'play',
       label: isGenerating
         ? t('messageActions.cancelTtsGeneration')
@@ -345,7 +350,7 @@ export default function BubbleMessageDefault({
       onClick: () => contextAction(handleDelete),
     },
   ], [
-    canPlay, contextAction, handleCopy, handleDelete, handleEdit, handleFork,
+    canUseTtsAction, contextAction, handleCopy, handleDelete, handleEdit, handleFork,
     handlePromptBreakdown, handleToggleHidden, handleToggleContextAnchor, hasSavedAudio, isGenerating, isHidden, isContextAnchor, isPlaying, isUser,
     togglePlayback, t, tc,
   ])
@@ -429,6 +434,7 @@ export default function BubbleMessageDefault({
               />
             </div>
           </div>
+          <span data-spindle-mount="message_header" data-spindle-scope={`message:${message.id}:bubble:header`} style={{ display: 'contents' }} />
         </div>
 
         {reasoning && !isEditing && (
@@ -449,12 +455,16 @@ export default function BubbleMessageDefault({
         )}
 
         <div className={styles.content}>
+          <span data-spindle-mount="message_body_before" data-spindle-scope={`message:${message.id}:bubble:body-before`} style={{ display: 'contents' }} />
           {isEditing ? (
             <MessageEditArea
               editContent={editContent}
               onChangeContent={setEditContent}
               onSave={handleSaveEdit}
               onCancel={handleCancelEdit}
+              onEditAndSend={isUser ? handleEditAndSend : undefined}
+              messageId={message.id}
+              editAndSendDisabled={editAndSendPending}
               editReasoning={showReasoningEditor ? editReasoning : undefined}
               onChangeReasoning={showReasoningEditor ? setEditReasoning : undefined}
             />
@@ -473,6 +483,7 @@ export default function BubbleMessageDefault({
             <StreamingIndicator />
           ) : null}
         </div>
+        <span data-spindle-mount="message_body_after" data-spindle-scope={`message:${message.id}:bubble:body-after`} style={{ display: 'contents' }} />
 
         {isUser && message.extra?.attachments && message.extra.attachments.length > 0 && !isEditing && (
           <div className={styles.content}>
@@ -492,21 +503,24 @@ export default function BubbleMessageDefault({
         {!isUser && !isEditing && message.index_in_chat !== 0 && (
           <SwipeControls message={message} chatId={chatId} variant="bubble" />
         )}
+        <span data-spindle-mount="message_swipe_indicators" data-spindle-scope={`message:${message.id}:bubble:swipe-indicators`} style={{ display: 'contents' }} />
 
         {message.index_in_chat === 0 && !isUser && !isEditing && (
           <GreetingNav message={message} chatId={chatId} variant="bubble" />
         )}
+        <span data-spindle-mount="message_footer" data-spindle-scope={`message:${message.id}:bubble:footer`} style={{ display: 'contents' }} />
       </div>
 
       {!isEditing && !isSelectMode && (
         <BubbleActions
+          messageId={message.id}
           onEdit={handleEdit}
           onDelete={handleDelete}
           onToggleHidden={handleToggleHidden}
           onToggleContextAnchor={handleToggleContextAnchor}
           onFork={handleFork}
           onPromptBreakdown={!isUser ? handlePromptBreakdown : undefined}
-          onPlay={canPlay ? togglePlayback : undefined}
+          onPlay={canUseTtsAction ? togglePlayback : undefined}
           isPlaying={isPlaying}
           isGenerating={isGenerating}
           hasSavedAudio={hasSavedAudio}

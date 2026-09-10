@@ -24,6 +24,7 @@ export interface RegexCollectRequest {
   pattern: string;
   flags: string;
   input: string;
+  maxMatches?: number;
 }
 
 export interface RegexCaptureReplacementsRequest {
@@ -45,7 +46,7 @@ export interface CollectedMatch {
   fullMatch: string;
   index: number;
   groups: (string | undefined)[];
-  namedGroups?: Record<string, string>;
+  namedGroups?: Record<string, string | undefined>;
 }
 
 export interface CaptureReplacement {
@@ -67,7 +68,7 @@ export function substituteRegexCaptures(
   groups: (string | undefined)[],
   offset: number,
   input: string,
-  namedGroups?: Record<string, string>,
+  namedGroups?: Record<string, string | undefined>,
 ): string {
   return substituteRegexCapturesFromArrayLike(
     template,
@@ -87,7 +88,7 @@ function substituteRegexCapturesFromArrayLike(
   groupOffset: number,
   offset: number,
   input: string,
-  namedGroups?: Record<string, string>,
+  namedGroups?: Record<string, string | undefined>,
 ): string {
   const groupCount = groups.length - groupOffset;
   return template.replace(
@@ -102,17 +103,24 @@ function substituteRegexCapturesFromArrayLike(
         if (idx >= 1 && idx <= groupCount) return groups[idx - 1 + groupOffset] ?? "";
         return token;
       }
-      if (name !== undefined && namedGroups) return namedGroups[name] ?? token;
+      if (name !== undefined && namedGroups) {
+        // A name defined by the pattern but absent from this match substitutes
+        // empty (native String#replace semantics). Only a name the pattern does
+        // not define at all is left untouched, so typos still surface.
+        if (Object.prototype.hasOwnProperty.call(namedGroups, name)) return namedGroups[name] ?? "";
+        return token;
+      }
       return token;
     },
   );
 }
 
-function collectMatches(input: string, re: RegExp): CollectedMatch[] {
+function collectMatches(input: string, re: RegExp, maxMatches = Infinity): CollectedMatch[] {
   const matches: CollectedMatch[] = [];
   if (re.global || re.sticky) {
     let match: RegExpExecArray | null;
     while ((match = re.exec(input)) !== null) {
+      if (matches.length >= maxMatches) throw new Error("Regex match limit exceeded");
       matches.push({
         fullMatch: match[0],
         index: match.index,
@@ -200,7 +208,7 @@ export function runRegexRequest(data: RegexRequest): unknown {
   }
 
   if (data.op === "collect") {
-    return collectMatches(input, re);
+    return collectMatches(input, re, data.maxMatches);
   }
 
   if (data.op === "capture-replacements") {

@@ -1,7 +1,7 @@
-import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect, type CSSProperties, type KeyboardEvent } from 'react'
+import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect, Fragment, type CSSProperties, type KeyboardEvent, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router'
-import { Send, RotateCw, CornerDownLeft, Square, FilePlus, Eye, UserCircle, Compass, MessageSquareQuote, Wrench, UsersRound, UserPlus, Settings2, Home, MoreHorizontal, FolderOpen, Paperclip, X, StickyNote, Crown, ScrollText, MessageSquare, BrainCircuit, Drama, Layers, FileText, Braces, Globe, Plus, Mic, Link2, LoaderCircle, Sliders, Search } from 'lucide-react'
+import { Send, RotateCw, CornerDownLeft, Square, FilePlus, Eye, UserCircle, Compass, MessageSquareQuote, Wrench, UsersRound, UserPlus, Settings2, Home, MoreHorizontal, FolderOpen, Paperclip, X, StickyNote, Crown, ScrollText, MessageSquare, BrainCircuit, Drama, Layers, FileText, Braces, Globe, Plus, Mic, Link2, LoaderCircle, Sliders, SlidersHorizontal, Search, ListChecks, Waypoints } from 'lucide-react'
 import { IconPlaylistAdd } from '@tabler/icons-react'
 import { useStore } from '@/store'
 import { sendRoomAction } from '@/ws/relayClient'
@@ -15,11 +15,16 @@ import { expressionsApi } from '@/api/expressions'
 import { personasApi } from '@/api/personas'
 import { globalAddonsApi } from '@/api/global-addons'
 import { imagesApi } from '@/api/images'
+import { audioApi } from '@/api/audio'
 import { getPersonaAvatarThumbUrl, getPersonaAvatarThumbUrlById, getCharacterAvatarThumbUrl } from '@/lib/avatarUrls'
 import { uuidv7 } from '@/lib/uuid'
 import { toast } from '@/lib/toast'
 import { shouldForceLoomRuntimePreset } from '@/lib/loom/runtimeProfile'
 import { unmarshalPreset } from '@/lib/loom/service'
+import {
+  inspectPromptVariablesAvailability,
+  type PromptVariablesAvailability,
+} from '@/lib/loom/prompt-variable-availability'
 import { presetSaveCoordinator, StalePresetHydrationError } from '@/lib/loom/preset-save-coordinator'
 import { resolveAutoPersonaBinding } from '@/store/slices/personas'
 import {
@@ -72,6 +77,22 @@ import {
   subscribePresetProfilePromptVariableChanges,
   updatePresetProfilePromptVariables,
 } from '@/hooks/preset-profile-prompt-variables'
+import { registerChatDockerActionOwners } from './chatDockerActionCatalog'
+import { acknowledgeConnectionProfileSelection } from '@/lib/uiProductivityDefaults'
+import { useSpindleComponentOverride } from '@/lib/spindle/use-spindle-component-override'
+import { readProductivityFeature } from '@/lib/spindle/productivity-feature-toggles'
+import { hasEnabledFrontendExtension } from '@/lib/spindle/frontend-extension-availability'
+import { useQuickToolbarActions } from '@/components/quick-toolbar/useQuickToolbarActions'
+import InputAreaCustomizeModal, {
+  fromComposerExtraId,
+  isComposerActionId,
+  runComposerSelectMessages,
+  useComposerActionBar,
+  type ComposerActionId,
+} from './InputAreaCustomizeModal'
+import { ComposerActionBarLive } from './InputAreaComposerBar'
+import { isExtensionComposerActionId } from './composerActionOwnership'
+import { isGuideActive, isGuideAutoEnabled } from '@/lib/guided-generations'
 
 interface InputAreaProps {
   chatId: string
@@ -246,7 +267,17 @@ function slugifyName(name: string): string {
     .replace(/^-+|-+$/g, '')
 }
 
-export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: InputAreaProps) {
+function deferTouchReleaseAction(action: () => void): void {
+  // Let the compatibility click from this touch finish targeting the send
+  // button before clearing the textarea can move the bottom-anchored action
+  // bar underneath it. Otherwise mobile browsers may retarget that click to
+  // the rightmost (Extras) action when the toolbar is horizontally scrolled.
+  window.setTimeout(action, 0)
+}
+
+export { acknowledgeConnectionProfileSelection }
+
+function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaProps) {
   const { t } = useTranslation('chat')
   const { t: te } = useTranslation('errors')
   const queueModLabel = isMac ? t('input.modCmd') : t('input.modCtrl')
@@ -257,6 +288,13 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const [dryRunning, setDryRunning] = useState(false)
   const [resolvingMacros, setResolvingMacros] = useState(false)
   const [authorsNoteOpen, setAuthorsNoteOpen] = useState(false)
+  const [customizeOpen, setCustomizeOpen] = useState(false)
+  const composerActionBar = useComposerActionBar()
+  const { actionById: qtActionById } = useQuickToolbarActions()
+  const messageSelectMode = useStore((s) => s.messageSelectMode)
+  const enableToolbarIconReorder = useStore((state) => readProductivityFeature(state, 'enableToolbarIconReorder'))
+  const showComposerCustomizeGear = useStore((state) => readProductivityFeature(state, 'showComposerCustomizeGear'))
+  const hasLumiverseSuite = useStore((state) => hasEnabledFrontendExtension(state.extensions, 'lumiverse_suite'))
   const [openPopover, setOpenPopover] = useState<null | 'guides' | 'quick' | 'persona' | 'tools' | 'extras' | 'altFields' | 'addons' | 'databank' | 'groupMember' | 'connections'>(null)
   const openPopoverRef = useRef(openPopover)
   useEffect(() => {
@@ -283,6 +321,8 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   const promptVariablesBindingRef = useRef<PromptVariableProfileTarget | null>(null)
   promptVariablesBindingRef.current = promptVariablesBinding
   const [promptVariablesLoading, setPromptVariablesLoading] = useState(false)
+  const [promptVariablesAvailability, setPromptVariablesAvailability] = useState<PromptVariablesAvailability | null>(null)
+  const [memoryCortexInFlight, setMemoryCortexInFlight] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<(MessageAttachment & { previewUrl?: string })[]>([])
   const [uploading, setUploading] = useState(false)
   const [dragActive, setDragActive] = useState(false)
@@ -335,7 +375,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   )
   const activeCharacterId = useStore((s) => s.activeCharacterId)
   const activeGroupCharacterId = useStore((s) => s.activeGroupCharacterId)
-  const enterToSend = useStore((s) => s.chatSheldEnterToSend)
+  const enterToSend = useStore((s) => s.inputBarEnterToSend)
   const saveDraftInput = useStore((s) => s.saveDraftInput)
   const activeProfileId = useStore((s) => s.activeProfileId)
   const profiles = useStore((s) => s.profiles)
@@ -1063,10 +1103,61 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     }
   }, [text, chatId, saveDraftInput])
 
-  const activeGuides = guidedGenerations.filter((g) => g.enabled)
+  const pinnedConnectionId = typeof activeChatMetadata?.connection_profile_id === 'string'
+    && profiles.some((profile) => profile.id === activeChatMetadata.connection_profile_id)
+    ? activeChatMetadata.connection_profile_id
+    : null
+  const guidedGenerationContext = useMemo(() => ({
+    connectionProfileId: pinnedConnectionId || activeProfileId,
+    chatId,
+    characterId: focusedPreviewCharacterId,
+  }), [activeProfileId, chatId, focusedPreviewCharacterId, pinnedConnectionId])
+  const activeGuides = guidedGenerations.filter((guide) => isGuideActive(guide, guidedGenerationContext))
   const activeGuideCount = activeGuides.length
+  const manuallyActiveGuideCount = guidedGenerations.filter((guide) => guide.enabled).length
   const activeQuickReplySets = quickReplySets.filter((s) => s.enabled)
-  const activeLoomPresetName = activeLoomPresetId ? loomRegistry[activeLoomPresetId]?.name ?? null : null
+  const activeLoomPresetRegistryUpdatedAt = activeLoomPresetId
+    ? loomRegistry[activeLoomPresetId]?.updatedAt ?? null
+    : null
+  const promptVariablesAvailable = !!activeLoomPresetId
+    && promptVariablesAvailability?.presetId === activeLoomPresetId
+    && promptVariablesAvailability.registryUpdatedAt === activeLoomPresetRegistryUpdatedAt
+    && promptVariablesAvailability.hasDefinitions
+
+  useEffect(() => {
+    setPromptVariablesAvailability(null)
+    if (!activeLoomPresetId) return
+
+    let cancelled = false
+    const presetId = activeLoomPresetId
+    const registryUpdatedAt = activeLoomPresetRegistryUpdatedAt
+    const isCurrent = () => {
+      const state = useStore.getState()
+      return !cancelled
+        && state.activeLoomPresetId === presetId
+        && (state.loomRegistry[presetId]?.updatedAt ?? null) === registryUpdatedAt
+    }
+
+    void inspectPromptVariablesAvailability({
+      presetId,
+      registryUpdatedAt,
+      loadBlocks: async () => {
+        const preset = await presetsApi.get(presetId)
+        return unmarshalPreset(preset).blocks
+      },
+      isCurrent,
+    }).then((availability) => {
+      if (!availability) return
+      setPromptVariablesAvailability(availability)
+    }).catch((err) => {
+      if (!isCurrent()) return
+      console.warn('[InputArea] Failed to inspect prompt variable availability:', err)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeLoomPresetId, activeLoomPresetRegistryUpdatedAt])
 
   const openPromptVariablesModal = useCallback(async () => {
     if (!activeLoomPresetId) {
@@ -1181,13 +1272,18 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
   }), [])
 
   const consumeOneshotGuides = useCallback(() => {
-    const next = guidedGenerations.map((g) =>
-      g.mode === 'oneshot' && g.enabled ? { ...g, enabled: false } : g
-    )
-    if (next.some((g, i) => g.enabled !== guidedGenerations[i].enabled)) {
+    const next = guidedGenerations.map((guide) => {
+      if (guide.mode !== 'oneshot' || !isGuideActive(guide, guidedGenerationContext)) return guide
+      return {
+        ...guide,
+        enabled: false,
+        autoEnable: isGuideAutoEnabled(guide, guidedGenerationContext) ? null : guide.autoEnable,
+      }
+    })
+    if (next.some((guide, index) => guide !== guidedGenerations[index])) {
       setSetting('guidedGenerations', next)
     }
-  }, [guidedGenerations, setSetting])
+  }, [guidedGenerations, guidedGenerationContext, setSetting])
 
   useEffect(() => {
     if (openPopover) {
@@ -1466,6 +1562,14 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     '.html', '.htm', '.yaml', '.yml', '.log', '.rst', '.rtf',
   ]), [])
 
+  const AUDIO_EXTENSIONS = useMemo(() => new Set([
+    '.mp3', '.wav', '.aif', '.aiff', '.aac', '.ogg', '.oga', '.flac',
+  ]), [])
+
+  const VIDEO_EXTENSIONS = useMemo(() => new Set([
+    '.mp4', '.mpeg', '.mpg', '.mov', '.m4v', '.avi', '.flv', '.webm', '.wmv', '.3gp',
+  ]), [])
+
   const isDocumentFile = useCallback((file: File) => {
     const ext = file.name.lastIndexOf('.') >= 0 ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase() : ''
     return DOCUMENT_EXTENSIONS.has(ext)
@@ -1476,8 +1580,10 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     setUploading(true)
     try {
       for (const file of Array.from(files)) {
+        const ext = file.name.lastIndexOf('.') >= 0 ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase() : ''
         const isImage = file.type.startsWith('image/')
-        const isAudio = file.type.startsWith('audio/')
+        const isAudio = file.type.startsWith('audio/') || AUDIO_EXTENSIONS.has(ext)
+        const isVideo = file.type.startsWith('video/') || VIDEO_EXTENSIONS.has(ext)
         const isDoc = isDocumentFile(file)
 
         if (isDoc) {
@@ -1493,21 +1599,24 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
           continue
         }
 
-        if (!isImage && !isAudio) {
+        if (!isImage && !isAudio && !isVideo) {
           toast.error(t('toast.unsupportedFileType', { name: file.name }), { title: t('toast.uploadFailed') })
           continue
         }
 
-        // Image/audio → inline attachment as before
-        const image = await imagesApi.upload(file)
+        // Images and videos share the media pipeline (including video metadata
+        // and poster extraction); audio uses its dedicated binary store.
+        const media = isAudio
+          ? await audioApi.upload(file)
+          : await imagesApi.upload(file)
         const att: MessageAttachment & { previewUrl?: string } = {
-          type: isImage ? 'image' : 'audio',
-          image_id: image.id,
-          mime_type: file.type,
+          type: isImage ? 'image' : isAudio ? 'audio' : 'video',
+          image_id: media.id,
+          mime_type: media.mime_type,
           original_filename: file.name,
-          width: image.width ?? undefined,
-          height: image.height ?? undefined,
-          previewUrl: isImage ? imagesApi.smallUrl(image.id) : undefined,
+          width: 'width' in media ? media.width ?? undefined : undefined,
+          height: 'height' in media ? media.height ?? undefined : undefined,
+          previewUrl: isImage ? imagesApi.smallUrl(media.id) : undefined,
         }
         setPendingAttachments((prev) => [...prev, att])
       }
@@ -1518,7 +1627,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       setUploading(false)
       if (fileInputRef.current) fileInputRef.current.value = ''
     }
-  }, [isDocumentFile, chatId, characterName, t])
+  }, [AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, isDocumentFile, chatId, characterName, t])
 
   const removeAttachment = useCallback((imageId: string) => {
     setPendingAttachments((prev) => prev.filter((a) => a.image_id !== imageId))
@@ -2218,6 +2327,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       if (feedback) {
         genOpts.regen_feedback = feedback
         genOpts.regen_feedback_position = regenFeedback.position
+        genOpts.regen_feedback_format = regenFeedback.format
       }
       const res = await generateApi.start(genOpts)
       if (generationNonceRef.current !== nonce) return
@@ -2232,7 +2342,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       setStreamingError(msg)
       toast.error(msg, { title: t('toast.regenerationFailed') })
     }
-  }, [chatId, isGeneratingInChat, messages, isGroupChat, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, regenFeedback.position, retainCouncilForRegens, addMessage, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, t, te])
+  }, [chatId, isGeneratingInChat, messages, isGroupChat, activeProfileId, activeCharacterId, activePersonaId, activeGenerationAddonStates, getActivePresetForGeneration, regenFeedback.position, regenFeedback.format, retainCouncilForRegens, addMessage, beginStreaming, startStreaming, setStreamingError, consumeOneshotGuides, t, te])
 
   const handleRegenerate = useCallback(() => {
     if (isGeneratingInChat) return
@@ -2445,6 +2555,78 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
     }
   }, [chatId, activeCharacterId, isGroupChat, navigate, openModal, t])
 
+  const openChatSettings = useCallback(() => {
+    void (async () => {
+      try {
+        const chat = await chatsApi.get(chatId, { messages: false })
+        openModal('chatSettings', {
+          chatId,
+          chatName: chat.name || '',
+          metadata: chat.metadata || {},
+          onSaved: (updatedChat: import('@/types/api').Chat) => {
+            const value = updatedChat.metadata?.impersonation_preset_id
+            setImpersonationPresetId(typeof value === 'string' && value ? value : null)
+            const mode = updatedChat.metadata?.group_scenario_override?.mode
+            setGroupScenarioMode(mode === 'member' || mode === 'custom' ? mode : 'individual')
+          },
+        })
+      } catch (err) {
+        console.error('[InputArea] Failed to load chat settings:', err)
+      }
+    })()
+  }, [chatId, openModal])
+
+  const openGroupChatCreator = useCallback(() => {
+    openModal('groupChatCreator')
+  }, [openModal])
+
+  const warmMemories = useCallback(async (targetChatId: string) => {
+    setMemoryCortexInFlight(true)
+    try {
+      toast.info(t('toast.recompilingMemories'))
+      const res = await memoryCortexApi.warm(targetChatId, { force: true })
+      if (res.cortex.status === 'started') {
+        toast.success(t('toast.memoryRebuildStarted'))
+      } else if (res.chatMemory.status === 'complete') {
+        toast.success(t('toast.memoryRebuilt'))
+      } else if (res.reason === 'chat_vectorization_disabled') {
+        toast.error(t('toast.memoryVectorizationDisabled'))
+      } else {
+        toast.info(t('toast.noMemoryRebuildNeeded'))
+      }
+    } catch (err: any) {
+      toast.error(err?.message || t('toast.failedRecompileMemories'))
+    } finally {
+      setMemoryCortexInFlight(false)
+    }
+  }, [t])
+
+  useEffect(() => {
+    return registerChatDockerActionOwners({
+      createNewChat: handleNewChat,
+      openPromptVariablesModal,
+      handleConvertToGroup,
+      setAuthorsNoteOpen,
+      openChatSettings,
+      openGroupChatCreator,
+      warmMemories,
+      openComposerCustomize: () => setCustomizeOpen(true),
+      promptVariablesLoading,
+      memoryCortexAvailable: true,
+      memoryCortexInFlight,
+      groupChatCreatorRegistered: true,
+    })
+  }, [
+    handleNewChat,
+    openPromptVariablesModal,
+    handleConvertToGroup,
+    openChatSettings,
+    openGroupChatCreator,
+    warmMemories,
+    promptVariablesLoading,
+    memoryCortexInFlight,
+  ])
+
   const handleDryRun = useCallback(async () => {
     if (dryRunning || isGeneratingInChat) return
     const presetId = getActivePresetForGeneration()
@@ -2652,8 +2834,10 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       unlockTTSAudio()
       suppressFollowupClick()
       setMobileQueueHoldVisualState('queueing')
-      void handleQueueMessage().finally(() => {
-        setMobileQueueHoldVisualState('idle')
+      deferTouchReleaseAction(() => {
+        void handleQueueMessage().finally(() => {
+          setMobileQueueHoldVisualState('idle')
+        })
       })
       return
     }
@@ -2664,7 +2848,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       unlockTTSAudio()
       suppressFollowupClick()
       setMobileQueueHoldVisualState('idle')
-      void handleSend()
+      deferTouchReleaseAction(() => {
+        void handleSend()
+      })
       return
     }
     if (mobileQueueHoldStateRef.current === 'idle' && !hasDraftContent) {
@@ -2673,7 +2859,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
       unlockNotificationAudio()
       unlockTTSAudio()
       suppressFollowupClick()
-      void handleSend()
+      deferTouchReleaseAction(() => {
+        void handleSend()
+      })
       return
     }
     if (mobileQueueHoldStateRef.current !== 'queueing') {
@@ -3028,97 +3216,126 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
         />
       )}
 
-      <span data-spindle-mount="chat_composer_above" style={{ display: 'contents' }} />
+      <span data-spindle-mount="chat_composer_above" data-spindle-scope={`chat:${chatId}:composer-above`} style={{ display: 'contents' }} />
 
-      {/* Action bar */}
-      <div data-spindle-mount="chat_toolbar">
-        <div className={styles.actionBar}>
-          <button type="button" className={styles.actionBtn} onClick={onNavigateHome ?? (() => navigate('/'))} title={t('input.backHome')}>
-            <Home size={14} />
-          </button>
-          <span className={styles.actionDivider} />
-          {!isGeneratingInChat && (
-            <>
-              <button type="button" className={styles.actionBtn} onClick={handleRegenerate} title={t('input.regenerate')}>
-                <RotateCw size={14} />
-              </button>
-              <button type="button" className={styles.actionBtn} onClick={handleContinue} title={t('input.continue')}>
-                <CornerDownLeft size={14} />
-              </button>
-            </>
-          )}
-          <button
-            type="button"
-            className={styles.actionBtn}
-            onClick={() => handleImpersonate('oneliner')}
-            title={`${t('quickMenu.oneLiner')}: ${t('quickMenu.oneLinerDesc')}`}
-            aria-label={t('quickMenu.oneLiner')}
-            disabled={isGeneratingInChat}
-            style={isGeneratingInChat ? { opacity: 0.5 } : undefined}
-          >
-            <MessageSquare size={14} />
-          </button>
-          <button
-            type="button"
-            className={clsx(
-              styles.actionBtn,
-              openPopover === 'persona' && styles.actionBtnActive,
-              persistedChatPersonaId && styles.actionBtnHasSelection,
-            )}
-            onClick={() => setOpenPopover((p) => (p === 'persona' ? null : 'persona'))}
-            title={t('input.sendAsPersona')}
-          >
-            <UserCircle size={14} />
-            {persistedChatPersonaId && <span className={styles.badge}>1</span>}
-          </button>
-          <button
-            type="button"
-            className={clsx(styles.actionBtn, openPopover === 'connections' && styles.actionBtnActive)}
-            onClick={() => setOpenPopover((p) => (p === 'connections' ? null : 'connections'))}
-            title={activeProfile ? t('input.switchConnectionActive', { name: activeProfile.name }) : t('input.switchConnection')}
-          >
-            <Link2 size={14} />
-          </button>
-          <span data-spindle-mount="chat_actions" style={{ display: 'contents' }} />
-          {hasAltFields && (() => {
-            const selectionCount = activeAltSelectionCount
-            const hasSelection = selectionCount > 0
-            const titleParts: string[] = []
-            if (isGroupChat) {
-              for (const { char, altFields } of groupMembersWithAltFields) {
-                const selections = groupAltFieldSelections[char.id] || {}
-                const labels = Object.entries(selections)
-                  .map(([field, variantId]) => altFields[field]?.find((v) => v.id === variantId)?.label)
-                  .filter(Boolean)
-                if (labels.length > 0) titleParts.push(`${char.name}: ${labels.join(', ')}`)
-              }
-            } else {
-              for (const [field, variantId] of Object.entries(altFieldSelections)) {
-                const variant = altFieldsData[field]?.find((v) => v.id === variantId)
-                if (variant) titleParts.push(`${field}: ${variant.label}`)
-              }
+      {/* Native action bar, then chat_toolbar (follows spindle contract). */}
+      {(() => {
+        const altFieldsButton = (() => {
+          if (!hasAltFields) return null
+          const selectionCount = activeAltSelectionCount
+          const hasSelection = selectionCount > 0
+          const titleParts: string[] = []
+          if (isGroupChat) {
+            for (const { char, altFields } of groupMembersWithAltFields) {
+              const selections = groupAltFieldSelections[char.id] || {}
+              const labels = Object.entries(selections)
+                .map(([field, variantId]) => altFields[field]?.find((v) => v.id === variantId)?.label)
+                .filter(Boolean)
+              if (labels.length > 0) titleParts.push(`${char.name}: ${labels.join(', ')}`)
             }
-            const title = hasSelection
-              ? t('input.alternateFieldsActive', { details: titleParts.join(', ') })
-              : isGroupChat ? t('input.groupAlternateFields') : t('input.alternateFields')
+          } else {
+            for (const [field, variantId] of Object.entries(altFieldSelections)) {
+              const variant = altFieldsData[field]?.find((v) => v.id === variantId)
+              if (variant) titleParts.push(`${field}: ${variant.label}`)
+            }
+          }
+          const title = hasSelection
+            ? t('input.alternateFieldsActive', { details: titleParts.join(', ') })
+            : isGroupChat ? t('input.groupAlternateFields') : t('input.alternateFields')
+          return (
+            <button
+              type="button"
+              className={clsx(
+                styles.actionBtn,
+                openPopover === 'altFields' && styles.actionBtnActive,
+                hasSelection && styles.actionBtnHasSelection,
+              )}
+              onClick={() => setOpenPopover((p) => (p === 'altFields' ? null : 'altFields'))}
+              title={title}
+              aria-label={title}
+            >
+              <Layers size={14} />
+              {hasSelection && <span className={styles.badge}>{selectionCount}</span>}
+            </button>
+          )
+        })()
+        const composerActions: Record<ComposerActionId, ReactNode> = {
+          home: (
+            <>
+              <button type="button" className={styles.actionBtn} onClick={onNavigateHome ?? (() => navigate('/'))} title={t('input.backHome')}>
+                <Home size={14} />
+              </button>
+              <span className={styles.actionDivider} />
+            </>
+          ),
+          regen: !isGeneratingInChat ? (
+            <button type="button" className={styles.actionBtn} onClick={handleRegenerate} title={t('input.regenerate')}>
+              <RotateCw size={14} />
+            </button>
+          ) : null,
+          continue: !isGeneratingInChat ? (
+            <button type="button" className={styles.actionBtn} onClick={handleContinue} title={t('input.continue')}>
+              <CornerDownLeft size={14} />
+            </button>
+          ) : null,
+          oneliner: (
+            <button
+              type="button"
+              className={styles.actionBtn}
+              onClick={() => handleImpersonate('oneliner')}
+              title={`${t('quickMenu.oneLiner')}: ${t('quickMenu.oneLinerDesc')}`}
+              aria-label={t('quickMenu.oneLiner')}
+              disabled={isGeneratingInChat}
+              style={isGeneratingInChat ? { opacity: 0.5 } : undefined}
+            >
+              <MessageSquare size={14} />
+            </button>
+          ),
+          persona: (
+            <button
+              type="button"
+              className={clsx(
+                styles.actionBtn,
+                openPopover === 'persona' && styles.actionBtnActive,
+                persistedChatPersonaId && styles.actionBtnHasSelection,
+              )}
+              onClick={() => setOpenPopover((p) => (p === 'persona' ? null : 'persona'))}
+              title={t('input.sendAsPersona')}
+            >
+              <UserCircle size={14} />
+              {persistedChatPersonaId && <span className={styles.badge}>1</span>}
+            </button>
+          ),
+          connections: (
+            <button
+              type="button"
+              className={clsx(styles.actionBtn, openPopover === 'connections' && styles.actionBtnActive)}
+              onClick={() => setOpenPopover((p) => (p === 'connections' ? null : 'connections'))}
+              title={activeProfile ? t('input.switchConnectionActive', { name: activeProfile.name }) : t('input.switchConnection')}
+            >
+              <Link2 size={14} />
+            </button>
+          ),
+          connectionsPicker: hasLumiverseSuite ? (() => {
+            const picker = qtActionById.get('lumiverse_suite.connections_picker.open')
             return (
               <button
                 type="button"
-                className={clsx(
-                  styles.actionBtn,
-                  openPopover === 'altFields' && styles.actionBtnActive,
-                  hasSelection && styles.actionBtnHasSelection,
-                )}
-                onClick={() => setOpenPopover((p) => (p === 'altFields' ? null : 'altFields'))}
-                title={title}
-                aria-label={title}
+                className={clsx(styles.actionBtn, picker?.active && styles.actionBtnActive)}
+                data-lumiverse-connections-launcher="true"
+                onClick={() => {
+                  if (picker && !picker.disabled) picker.run()
+                }}
+                title="Connections Picker"
+                aria-label="Connections Picker"
+                disabled={picker?.disabled}
               >
-                <Layers size={14} />
-                {hasSelection && <span className={styles.badge}>{selectionCount}</span>}
+                <Waypoints size={14} />
               </button>
             )
-          })()}
-          {activePersonaId && (
+          })() : null,
+          altFields: altFieldsButton,
+          addons: activePersonaId ? (
             <button
               type="button"
               className={clsx(
@@ -3132,46 +3349,144 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
               <IconPlaylistAdd size={14} />
               {chatAddonOverrideCount > 0 && <span className={styles.badge}>{chatAddonOverrideCount}</span>}
             </button>
-          )}
-          <button
-            type="button"
-            className={clsx(
-              styles.actionBtn,
-              openPopover === 'guides' && styles.actionBtnActive,
-              activeGuideCount > 0 && styles.actionBtnHasSelection,
-            )}
-            onClick={() => setOpenPopover((p) => (p === 'guides' ? null : 'guides'))}
-            title={t('input.guidedGenerations')}
-          >
-            <Compass size={14} />
-            {activeGuideCount > 0 && <span className={styles.badge}>{activeGuideCount}</span>}
-          </button>
-          <button
-            type="button"
-            className={clsx(styles.actionBtn, openPopover === 'quick' && styles.actionBtnActive)}
-            onClick={() => setOpenPopover((p) => (p === 'quick' ? null : 'quick'))}
-            title={t('input.quickReplies')}
-          >
-            <MessageSquareQuote size={14} />
-          </button>
-          <button
-            type="button"
-            className={clsx(styles.actionBtn, openPopover === 'tools' && styles.actionBtnActive)}
-            onClick={() => setOpenPopover((p) => (p === 'tools' ? null : 'tools'))}
-            title={t('input.tools')}
-          >
-            <Wrench size={14} />
-          </button>
-          <button
-            type="button"
-            className={clsx(styles.actionBtn, openPopover === 'extras' && styles.actionBtnActive)}
-            onClick={() => setOpenPopover((p) => (p === 'extras' ? null : 'extras'))}
-            title={t('input.extras')}
-          >
-            <MoreHorizontal size={14} />
-          </button>
-        </div>
-      </div>
+          ) : null,
+          promptVariables: promptVariablesAvailable ? (
+            <button
+              type="button"
+              className={styles.actionBtn}
+              onClick={() => void openPromptVariablesModal()}
+              disabled={promptVariablesLoading}
+              title={t('quickMenu.promptVariables')}
+              aria-label={t('quickMenu.promptVariables')}
+            >
+              <Sliders size={14} />
+            </button>
+          ) : null,
+          guides: (
+            <button
+              type="button"
+              className={clsx(
+                styles.actionBtn,
+                openPopover === 'guides' && styles.actionBtnActive,
+                activeGuideCount > 0 && styles.actionBtnHasSelection,
+              )}
+              onClick={() => setOpenPopover((p) => (p === 'guides' ? null : 'guides'))}
+              title={t('input.guidedGenerations')}
+            >
+              <Compass size={14} />
+              {activeGuideCount > 0 && <span className={styles.badge}>{activeGuideCount}</span>}
+            </button>
+          ),
+          quickReplies: (
+            <button
+              type="button"
+              className={clsx(styles.actionBtn, openPopover === 'quick' && styles.actionBtnActive)}
+              onClick={() => setOpenPopover((p) => (p === 'quick' ? null : 'quick'))}
+              title={t('input.quickReplies')}
+            >
+              <MessageSquareQuote size={14} />
+            </button>
+          ),
+          tools: (
+            <button
+              type="button"
+              className={clsx(styles.actionBtn, openPopover === 'tools' && styles.actionBtnActive)}
+              onClick={() => setOpenPopover((p) => (p === 'tools' ? null : 'tools'))}
+              title={t('input.tools')}
+            >
+              <Wrench size={14} />
+            </button>
+          ),
+          extras: (
+            <button
+              type="button"
+              className={clsx(styles.actionBtn, openPopover === 'extras' && styles.actionBtnActive)}
+              onClick={() => setOpenPopover((p) => (p === 'extras' ? null : 'extras'))}
+              title={t('input.extras')}
+            >
+              <MoreHorizontal size={14} />
+            </button>
+          ),
+          selectMessages: (
+            <button
+              type="button"
+              className={clsx(styles.actionBtn, messageSelectMode && styles.actionBtnActive)}
+              onClick={runComposerSelectMessages}
+              title={messageSelectMode ? t('chatView.exitSelectionMode') : t('chatView.selectMessages')}
+              aria-label={messageSelectMode ? t('chatView.exitSelectionMode') : t('chatView.selectMessages')}
+              aria-pressed={messageSelectMode}
+            >
+              <ListChecks size={14} />
+            </button>
+          ),
+        }
+        return (
+          <>
+            <ComposerActionBarLive
+              order={composerActionBar.order}
+              isVisible={composerActionBar.isVisible}
+              reorder={composerActionBar.reorder}
+              enableReorder={hasLumiverseSuite && enableToolbarIconReorder}
+              renderUnit={(id) => {
+                if (isComposerActionId(id)) {
+                  if (!hasLumiverseSuite && isExtensionComposerActionId(id)) return null
+                  return composerActions[id]
+                }
+                const extraId = fromComposerExtraId(id)
+                if (!hasLumiverseSuite && isExtensionComposerActionId(extraId)) return null
+                if (extraId === 'lumiverse_suite.connections_picker.open') return composerActions.connectionsPicker
+                const action = qtActionById.get(extraId)
+                if (!action || action.hidden) return null
+                const Icon = action.icon
+                return (
+                  <button
+                    type="button"
+                    className={clsx(styles.actionBtn, action.active && styles.actionBtnActive)}
+                    onClick={() => action.run()}
+                    title={action.label}
+                    aria-label={action.label}
+                    aria-pressed={typeof action.active === 'boolean' ? action.active : undefined}
+                    disabled={action.disabled}
+                  >
+                    <Icon size={14} />
+                  </button>
+                )
+              }}
+            >
+              <span data-spindle-mount="chat_actions" data-spindle-scope={`chat:${chatId}:actions`} style={{ display: 'contents' }} />
+              {hasLumiverseSuite && showComposerCustomizeGear && (
+                <button
+                  type="button"
+                  className={clsx(styles.actionBtn, styles.composerCustomizeGear, customizeOpen && styles.actionBtnActive)}
+                  onClick={() => setCustomizeOpen(true)}
+                  title="Customize composer"
+                  aria-label="Customize composer"
+                  aria-expanded={customizeOpen}
+                  data-composer-pinned="customize"
+                >
+                  <SlidersHorizontal size={14} />
+                </button>
+              )}
+            </ComposerActionBarLive>
+            <div
+              data-spindle-mount="chat_toolbar"
+              data-spindle-scope={`chat:${chatId}:toolbar`}
+              className={styles.extensionToolbar}
+            />
+          </>
+        )
+      })()}
+
+      {hasLumiverseSuite && customizeOpen && (
+        <InputAreaCustomizeModal
+          onClose={() => setCustomizeOpen(false)}
+          order={composerActionBar.order}
+          hidden={composerActionBar.hidden}
+          onToggle={composerActionBar.toggle}
+          onReorder={composerActionBar.reorder}
+          onReset={composerActionBar.reset}
+        />
+      )}
 
       <div className={clsx(styles.popoverSlot, openPopover && styles.popoverSlotOpen)}>
         <div className={styles.popoverSlotInner}>
@@ -3184,7 +3499,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
                     type="button"
                     className={styles.popRowBtn}
                     onClick={disableAllGuides}
-                    disabled={activeGuideCount === 0}
+                    disabled={manuallyActiveGuideCount === 0}
                   >
                     <span>{t('quickMenu.disableAllGuidedGenerations')}</span>
                     <span className={styles.popMeta}>{t('quickMenu.activeCount', { count: activeGuideCount })}</span>
@@ -3192,12 +3507,29 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
                   <div className={styles.popDivider} />
                 </>
               )}
-              {guidedGenerations.map((g) => (
-                <button key={g.id} type="button" className={styles.popRowBtn} onClick={() => toggleGuide(g.id)}>
-                  <span>{g.name}</span>
-                  <span className={styles.popMeta}>{g.enabled ? t('on') : t('off')} • {g.mode}</span>
-                </button>
-              ))}
+              {guidedGenerations.map((g) => {
+                const autoEnabled = isGuideAutoEnabled(g, guidedGenerationContext)
+                const active = g.enabled || autoEnabled
+                return (
+                  <button
+                    key={g.id}
+                    type="button"
+                    className={clsx(styles.popRowBtn, active && styles.popRowBtnActive)}
+                    onClick={() => toggleGuide(g.id)}
+                    aria-pressed={active}
+                    disabled={autoEnabled && !g.enabled}
+                    title={autoEnabled && !g.enabled ? t('quickMenu.autoEnabledHint') : undefined}
+                  >
+                    <span className={styles.personaMain}>
+                      <span className={clsx(styles.popState, active && styles.popStateActive)}>
+                        {autoEnabled && !g.enabled ? t('quickMenu.auto') : active ? t('on') : t('off')}
+                      </span>
+                      <span>{g.name}</span>
+                    </span>
+                    <span className={styles.popMeta}>{g.mode}</span>
+                  </button>
+                )
+              })}
               <button type="button" className={styles.popLink} onClick={() => {
                 setOpenPopover(null)
                 useStore.getState().openSettings('guided')
@@ -3331,8 +3663,11 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
                   type="button"
                   className={clsx(styles.popRowBtn, activeProfileId === p.id && styles.popRowBtnActive)}
                   onClick={() => {
-                    setActiveProfile(p.id)
-                    setOpenPopover(null)
+                    void acknowledgeConnectionProfileSelection({
+                      profileId: p.id,
+                      setActiveProfile,
+                      closePopover: () => setOpenPopover(null),
+                    })
                   }}
                 >
                   <span className={styles.personaMain}>
@@ -3387,51 +3722,14 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
               <button
                 type="button"
                 className={styles.popRowBtn}
-                onClick={async () => {
+                onClick={() => {
                   setOpenPopover(null)
-                  try {
-                    const chat = await chatsApi.get(chatId, { messages: false })
-                    openModal('chatSettings', {
-                      chatId,
-                      chatName: chat.name || '',
-                      metadata: chat.metadata || {},
-                      onSaved: (updatedChat: import('@/types/api').Chat) => {
-                        const value = updatedChat.metadata?.impersonation_preset_id
-                        setImpersonationPresetId(typeof value === 'string' && value ? value : null)
-                        const mode = updatedChat.metadata?.group_scenario_override?.mode
-                        setGroupScenarioMode(mode === 'member' || mode === 'custom' ? mode : 'individual')
-                      },
-                    })
-                  } catch (err) {
-                    console.error('[InputArea] Failed to load chat settings:', err)
-                  }
+                  openChatSettings()
                 }}
               >
                 <span className={styles.personaMain}>
                   <Settings2 size={14} />
                   <span>{isGroupChat ? t('quickMenu.groupSettings') : t('quickMenu.chatSettings')}</span>
-                </span>
-              </button>
-              <button
-                type="button"
-                className={styles.popRowBtn}
-                onClick={() => void openPromptVariablesModal()}
-                disabled={!activeLoomPresetId || promptVariablesLoading}
-                style={!activeLoomPresetId || promptVariablesLoading ? { opacity: 0.5 } : undefined}
-                title={!activeLoomPresetId ? t('quickMenu.promptVariablesSelectPreset') : undefined}
-              >
-                <span className={styles.personaMain}>
-                  <Sliders size={14} />
-                  <span className={styles.personaNameGroup}>
-                    <span>{t('quickMenu.promptVariables')}</span>
-                    <span className={styles.personaTitle}>
-                      {promptVariablesLoading
-                        ? t('quickMenu.loadingPromptVariables')
-                        : activeLoomPresetName
-                          ? t('quickMenu.promptVariablesFor', { name: activeLoomPresetName })
-                          : t('quickMenu.promptVariablesActivePreset')}
-                    </span>
-                  </span>
                 </span>
               </button>
               {!isGroupChat && activeCharacterId && (
@@ -3454,7 +3752,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
                 className={styles.popRowBtn}
                 onClick={() => {
                   setOpenPopover(null)
-                  openModal('groupChatCreator')
+                  openGroupChatCreator()
                 }}
               >
                 <span className={styles.personaMain}>
@@ -3478,23 +3776,9 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
               <button
                 type="button"
                 className={styles.popRowBtn}
-                onClick={async () => {
+                onClick={() => {
                   setOpenPopover(null)
-                  try {
-                    toast.info(t('toast.recompilingMemories'))
-                    const res = await memoryCortexApi.warm(chatId, { force: true })
-                    if (res.cortex.status === 'started') {
-                      toast.success(t('toast.memoryRebuildStarted'))
-                    } else if (res.chatMemory.status === 'complete') {
-                      toast.success(t('toast.memoryRebuilt'))
-                    } else if (res.reason === 'chat_vectorization_disabled') {
-                      toast.error(t('toast.memoryVectorizationDisabled'))
-                    } else {
-                      toast.info(t('toast.noMemoryRebuildNeeded'))
-                    }
-                  } catch (err: any) {
-                    toast.error(err?.message || t('toast.failedRecompileMemories'))
-                  }
+                  void warmMemories(chatId)
                 }}
               >
                 <span className={styles.personaMain}>
@@ -4029,7 +4313,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
         aria-label={t('input.attachFiles')}
         aria-hidden="true"
         tabIndex={-1}
-        accept="image/*,audio/*,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm,.yaml,.yml,.log,.rst,.rtf"
+        accept="image/*,audio/wav,audio/mpeg,audio/mp3,audio/aiff,audio/aac,audio/ogg,audio/flac,video/mp4,video/mpeg,video/quicktime,video/avi,video/x-msvideo,video/x-flv,video/webm,video/x-ms-wmv,video/3gpp,.mp3,.wav,.aif,.aiff,.aac,.ogg,.oga,.flac,.mp4,.mpeg,.mpg,.mov,.m4v,.avi,.flv,.webm,.wmv,.3gp,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm,.yaml,.yml,.log,.rst,.rtf"
         multiple
         style={{ display: 'none' }}
         onChange={(e) => handleAttachFiles(e.target.files)}
@@ -4084,6 +4368,7 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
         </button>
       ) : (
         <div className={styles.inputRow}>
+          <span data-spindle-mount="chat_input_tools_left" data-spindle-scope={`chat:${chatId}:input-tools-left`} className={styles.inputToolsSlot} />
           <button
             type="button"
             className={styles.attachBtn}
@@ -4194,8 +4479,14 @@ export default function InputArea({ chatId, onNavigateHome, onOpenChatFind }: In
               </button>
             </div>
           )}
+          <span data-spindle-mount="chat_input_tools_right" data-spindle-scope={`chat:${chatId}:input-tools-right`} className={styles.inputToolsSlot} />
         </div>
       )}
+      <span data-spindle-mount="chat_composer_below" data-spindle-scope={`chat:${chatId}:composer-below`} style={{ display: 'contents' }} />
     </div>
   )
+}
+
+export default function InputArea(props: InputAreaProps) {
+  return useSpindleComponentOverride('InputArea', InputAreaNative, props)
 }

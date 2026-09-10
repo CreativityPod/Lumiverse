@@ -2,11 +2,18 @@ export interface PresetSelectionAdapter {
   getActivePresetId(): string | null
   setActivePresetId(presetId: string | null): void
   flushPreset(presetId: string): Promise<void>
+  /** Resolve malformed targets to a usable preset before exposing them to editors or bound profiles. */
+  resolvePresetId?(presetId: string, currentPresetId: string | null, isCurrent: () => boolean): Promise<{
+    presetId: string
+    recoverFromPresetId?: string
+  } | null>
 }
 
 
 export interface PresetSelectionTransitionOptions {
   signal?: AbortSignal
+  /** A failed hydration cannot safely flush this source; retain its recovery data untouched. */
+  recoverFromPresetId?: string
 }
 
 export interface PresetSelectionRequest {
@@ -61,17 +68,27 @@ export function createPresetSelectionCoordinator(adapter: PresetSelectionAdapter
         }
         const transition = chain.catch(() => {}).then(async (): Promise<boolean> => {
           if (isStale()) return false
+          let targetPresetId = presetId
+          let recoverFromPresetId = options.recoverFromPresetId
+          if (presetId && adapter.resolvePresetId) {
+            const source = adapter.getActivePresetId()
+            const resolved = await adapter.resolvePresetId(presetId, source, () => !isStale() && adapter.getActivePresetId() === source)
+            if (!resolved) return false
+            targetPresetId = resolved.presetId
+            recoverFromPresetId = resolved.recoverFromPresetId ?? recoverFromPresetId
+          }
+          if (isStale()) return false
           while (true) {
             const currentPresetId = adapter.getActivePresetId()
-            if (currentPresetId === presetId) return true
-            if (currentPresetId) await adapter.flushPreset(currentPresetId)
+            if (currentPresetId === targetPresetId) return targetPresetId === presetId
+            if (currentPresetId && currentPresetId !== recoverFromPresetId) await adapter.flushPreset(currentPresetId)
             if (isStale()) return false
 
             // An external lifecycle transition changed the source while this
             // transition was flushing. Rebase that source before continuing.
             if (adapter.getActivePresetId() !== currentPresetId) continue
-            adapter.setActivePresetId(presetId)
-            return true
+            adapter.setActivePresetId(targetPresetId)
+            return targetPresetId === presetId
           }
         }).finally(() => {
           closed = true

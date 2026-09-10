@@ -54,6 +54,43 @@ afterEach(() => {
 })
 
 describe('auth request ordering', () => {
+  test('keeps an established session during a transient revalidation failure', async () => {
+    const store = createStore()
+    Object.assign(store, {
+      user: { id: 'user-a', name: 'User A', role: 'user' },
+      session: { id: 'session-a', userId: 'user-a', token: 'token-a', expiresAt: new Date().toISOString() },
+      isAuthenticated: true,
+      isAuthLoading: false,
+    })
+    authClientMock.getSession = async () => {
+      throw new TypeError('Failed to fetch')
+    }
+
+    await store.checkSession()
+
+    expect(store.isAuthenticated).toBe(true)
+    expect(store.user?.id).toBe('user-a')
+    expect(store.isAuthLoading).toBe(false)
+    expect(store.authError).toBeNull()
+  })
+
+  test('clears an established session when the backend authoritatively rejects it', async () => {
+    const store = createStore()
+    Object.assign(store, {
+      user: { id: 'user-a', name: 'User A', role: 'user' },
+      session: { id: 'session-a', userId: 'user-a', token: 'token-a', expiresAt: new Date().toISOString() },
+      isAuthenticated: true,
+      isAuthLoading: false,
+    })
+    authClientMock.getSession = async () => ({ data: null })
+
+    await store.checkSession()
+
+    expect(store.isAuthenticated).toBe(false)
+    expect(store.user).toBeNull()
+    expect(store.session).toBeNull()
+  })
+
   test('ignores an earlier unauthenticated session response after login succeeds', async () => {
     const store = createStore()
     const staleSession = createDeferred<{ data: null }>()

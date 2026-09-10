@@ -22,7 +22,6 @@ import type {
   CustomBody,
   AuthorsNote,
   AdvancedSettings,
-  PromptVariableDef,
   PromptVariableValue,
   PromptVariableValues,
 } from "../types/preset";
@@ -36,6 +35,10 @@ import type { Message, MessageAttachment } from "../types/message";
 import type { Preset } from "../types/preset";
 import type { ConnectionProfile } from "../types/connection-profile";
 import {
+  normalizeGuidedGenerations,
+  type GuidedGeneration,
+} from "./guided-generations";
+import {
   evaluate,
   buildEnv,
   cloneEnv,
@@ -45,6 +48,8 @@ import {
   withPromptBlockContext,
 } from "../macros";
 import type { MacroEnv } from "../macros";
+import { coercePromptVariable } from "../utils/prompt-variable-values";
+import { createActivationInputSnapshot } from "../utils/regex-activation-inputs";
 import {
   activateWorldInfo,
   applyWorldInfoGroupLogic,
@@ -106,6 +111,7 @@ import {
 } from "./vector-store-config.service";
 import { isWorldBookEntryVectorSearchReady } from "./world-book-vector-state";
 import * as imagesSvc from "./images.service";
+import * as audioSvc from "./audio.service";
 import * as presetProfilesSvc from "./preset-profiles.service";
 import * as councilProfilesSvc from "./council/council-profiles.service";
 import { readCachedChatMemory } from "./chat-memory-cache.service";
@@ -121,6 +127,7 @@ import { getCharacterDatabankIds } from "../utils/character-databanks";
 import { getSidecarSettings } from "./sidecar-settings.service";
 import { getChatBackgroundSignal, trackChatBackgroundTask } from "./chat-background.service";
 import * as regexScriptsSvc from "./regex-scripts.service";
+import { applyPromptActivations } from "./prompt-activation.service";
 import { createPromptAssemblyProfiler } from "./prompt-assembly-profiler";
 import { rankVectorWorldInfoCandidatesInWorker } from "./world-info-vector-ranking-worker-host";
 import {
@@ -254,7 +261,7 @@ export { getSourceMessageMetadata };
  */
 function getStoredReasoningCarrier(message: Message): Pick<
   LlmMessage,
-  "reasoning_content" | "thinking_blocks" | "reasoning_details"
+  "reasoning_content" | "thinking_blocks" | "reasoning_details" | "thought_signature"
 > {
   if (message.is_user) return {};
   const carrier = message.extra?.reasoningCarrier;
@@ -286,19 +293,27 @@ function getStoredReasoningCarrier(message: Message): Pick<
   ) {
     return { reasoning_content: value.content };
   }
+  if (
+    value.type === "gemini_thought_signature" &&
+    typeof value.signature === "string" &&
+    value.signature.length > 0
+  ) {
+    return { thought_signature: value.signature };
+  }
   return {};
 }
 
 function hasNativeReasoningCarrier(message: LlmMessage): boolean {
   return Boolean(
-    message.reasoning_content ||
+      message.reasoning_content ||
       message.thinking_blocks?.length ||
-      message.reasoning_details?.length,
+      message.reasoning_details?.length ||
+      message.thought_signature,
   );
 }
 
 function omitNativeReasoningCarrier(message: LlmMessage): LlmMessage {
-  const { reasoning_content, thinking_blocks, reasoning_details, ...withoutCarrier } =
+  const { reasoning_content, thinking_blocks, reasoning_details, thought_signature, ...withoutCarrier } =
     message;
   return withoutCarrier;
 }
@@ -878,9 +893,11 @@ function isDecorativeNewChatSeparator(text: string): boolean {
 
 async function resolveAttachmentBase64(
   userId: string,
-  imageId: string,
+  attachment: Pick<MessageAttachment, "type" | "image_id">,
 ): Promise<string | null> {
-  const filePath = await imagesSvc.getImageFilePath(userId, imageId);
+  const filePath = attachment.type === "audio"
+    ? audioSvc.getAudioFilePath(userId, attachment.image_id)
+    : await imagesSvc.getImageFilePath(userId, attachment.image_id);
   if (!filePath) return null;
   try {
     const buffer = await Bun.file(filePath).arrayBuffer();
@@ -888,6 +905,10 @@ async function resolveAttachmentBase64(
   } catch {
     return null;
   }
+}
+
+function attachmentCacheKey(attachment: Pick<MessageAttachment, "type" | "image_id">): string {
+  return `${attachment.type}:${attachment.image_id}`;
 }
 
 interface GeneratedImageContextPolicy {
@@ -929,8 +950,13 @@ function attachmentsForContext(msg: Message, policy: GeneratedImageContextPolicy
   const attachments = Array.isArray(msg.extra?.attachments)
     ? (msg.extra.attachments as MessageAttachment[])
     : [];
-  if (!msg.extra?.image_gen) return attachments;
-  return attachments.filter(
+  // Saved TTS is attached to assistant messages for playback, but it is not
+  // model input. User-uploaded audio belongs on user messages and is included.
+  const contextualAttachments = attachments.filter(
+    (att) => att?.type !== "audio" || msg.is_user,
+  );
+  if (!msg.extra?.image_gen) return contextualAttachments;
+  return contextualAttachments.filter(
     (att) => att?.type !== "image" || policy.allowedGeneratedImageIds.has(att.image_id),
   );
 }
@@ -1186,15 +1212,6 @@ const SAMPLER_DEFAULTS: Record<string, number> = {
   temperature: 1.0,
 };
 
-interface GuidedGeneration {
-  id: string;
-  name: string;
-  content: string;
-  position: "system" | "user_prefix" | "user_suffix";
-  mode: "persistent" | "oneshot";
-  enabled: boolean;
-}
-
 function isAppendRole(role: string): boolean {
   return role === "user_append" || role === "assistant_append";
 }
@@ -1314,6 +1331,33 @@ async function evaluateHostPromptSource(
     sourceHint,
     sourceOwner: "host",
   })).text;
+}
+
+export const DEFAULT_REGEN_FEEDBACK_FORMAT = "[OOC: {{$regenInput}}]";
+const REGEN_INPUT_PLACEHOLDER = "{{$regenInput}}";
+
+/**
+ * Resolve macros in a freeform regen-feedback template without treating the
+ * submitted feedback itself as macro source. The placeholder is masked for
+ * the full evaluation and restored only after macro expansion completes.
+ */
+export async function resolveRegenFeedbackPrompt(
+  format: string | undefined,
+  regenInput: string,
+  macroEnv: MacroEnv,
+): Promise<string> {
+  const template = format ?? DEFAULT_REGEN_FEEDBACK_FORMAT;
+  let guard = "\u0000LUMIVERSE_REGEN_INPUT\u0000";
+  while (template.includes(guard) || regenInput.includes(guard)) guard += "_";
+
+  const guardedTemplate = template.split(REGEN_INPUT_PLACEHOLDER).join(guard);
+  const resolved = (
+    await evaluate(guardedTemplate, macroEnv, registry, {
+      phase: "prompt",
+      sourceHint: "prompt_source:regen_feedback",
+    })
+  ).text;
+  return resolved.split(guard).join(regenInput);
 }
 
 async function evaluatePromptBlockContent(
@@ -1442,91 +1486,7 @@ export function resolvePromptVariables(
   }
 }
 
-interface CoercedPromptVar {
-  /** What {{var::name}} resolves to (or its stringified form). */
-  rendered: string | number;
-  /** Currently selected option ids — only meaningful for multiselect/select; empty otherwise. */
-  selectedIds: string[];
-}
-
-export function coercePromptVariable(
-  def: PromptVariableDef,
-  raw: unknown,
-): CoercedPromptVar {
-  switch (def.type) {
-    case "text":
-    case "textarea": {
-      if (raw === undefined || raw === null) return { rendered: def.defaultValue ?? "", selectedIds: [] };
-      return { rendered: String(raw), selectedIds: [] };
-    }
-    case "number": {
-      const fallback =
-        typeof def.defaultValue === "number" ? def.defaultValue : 0;
-      const n = raw === undefined || raw === null ? fallback : Number(raw);
-      const v = Number.isFinite(n) ? n : fallback;
-      return { rendered: clampNumber(v, def.min, def.max), selectedIds: [] };
-    }
-    case "slider": {
-      const fallback = def.defaultValue;
-      const n = raw === undefined || raw === null ? fallback : Number(raw);
-      const v = Number.isFinite(n) ? n : fallback;
-      return { rendered: clampNumber(v, def.min, def.max), selectedIds: [] };
-    }
-    case "select": {
-      const options = def.options ?? [];
-      const validIds = new Set(options.map((o) => o.id));
-      const fallback = validIds.has(def.defaultValue)
-        ? def.defaultValue
-        : options[0]?.id ?? "";
-      const candidate =
-        raw === undefined || raw === null ? fallback : String(raw);
-      const selectedId = validIds.has(candidate) ? candidate : fallback;
-      const match = options.find((o) => o.id === selectedId);
-      return {
-        rendered: match?.value ?? "",
-        selectedIds: selectedId ? [selectedId] : [],
-      };
-    }
-    case "switch": {
-      const fallback: 0 | 1 = def.defaultValue === 1 ? 1 : 0;
-      if (raw === undefined || raw === null) {
-        return { rendered: fallback, selectedIds: [] };
-      }
-      // Accept booleans, "0"/"1", "true"/"false", and numeric 0/1.
-      let on = false;
-      if (typeof raw === "boolean") on = raw;
-      else if (typeof raw === "number") on = raw === 1;
-      else {
-        const s = String(raw).trim().toLowerCase();
-        on = s === "1" || s === "true" || s === "on" || s === "yes";
-      }
-      return { rendered: on ? 1 : 0, selectedIds: [] };
-    }
-    case "multiselect": {
-      const options = def.options ?? [];
-      const validIds = new Set(options.map((o) => o.id));
-      let rawIds: string[];
-      if (Array.isArray(raw)) {
-        rawIds = raw.map((v) => String(v));
-      } else if (raw === undefined || raw === null) {
-        rawIds = Array.isArray(def.defaultValue) ? def.defaultValue.slice() : [];
-      } else if (typeof raw === "string" && raw.length > 0) {
-        rawIds = raw.split(",").map((s) => s.trim()).filter(Boolean);
-      } else {
-        rawIds = [];
-      }
-      // Preserve option-declaration order so the joined output is stable
-      // regardless of the order the end user clicked the checkboxes in.
-      const selectedSet = new Set(rawIds.filter((id) => validIds.has(id)));
-      const orderedSelected = options.filter((o) => selectedSet.has(o.id));
-      const separator = typeof def.separator === "string" ? def.separator : "\n\n";
-      return {
-        rendered: orderedSelected.map((o) => o.value).join(separator),
-        selectedIds: orderedSelected.map((o) => o.id),
-      };
-    }
-  }
-}
+export { coercePromptVariable } from "../utils/prompt-variable-values";
 
 const PROMPT_BLOCK_ROLES = new Set<PromptBlock["role"]>([
   "system",
@@ -1605,17 +1565,6 @@ export function resolvePromptBlockPlacements(
       depth: Math.floor(placement.depth),
     };
   });
-}
-
-function clampNumber(
-  value: number,
-  min: number | undefined,
-  max: number | undefined,
-): number {
-  let v = value;
-  if (typeof min === "number" && v < min) v = min;
-  if (typeof max === "number" && v > max) v = max;
-  return v;
 }
 
 interface PendingAppend {
@@ -1837,6 +1786,26 @@ export async function assemblePrompt(
   if (resolvedProfile.binding && blocks.length) {
     presetProfilesSvc.applyProfileToBlocks(blocks, resolvedProfile.binding);
   }
+  const activationScripts = preset && blocks.length
+    ? regexScriptsSvc.getPresetActivationScripts(ctx.userId, preset.id, { chatId: chat.id, characterId }) : [];
+  const activationInputs = createActivationInputSnapshot({
+    characterName: getEffectiveCharacterName(character),
+    userName: persona?.name || "User",
+    chatVariables: chat.metadata?.chat_variables,
+    preset,
+    profileValues: resolvedProfile.binding?.prompt_variables,
+    patterns: activationScripts.map((script) => script.find_regex),
+  });
+  const promptActivation = preset && blocks.length
+    ? await applyPromptActivations(
+        blocks,
+        activationScripts,
+        messages,
+        preset.id,
+        ctx.signal,
+        activationInputs,
+      )
+    : { states: [], errors: [] };
   presetProfilesSvc.normalizeCategoryBlockStates(blocks);
 
   profiler.addPhase("load-core-data", performance.now() - phaseStartedAt);
@@ -2522,6 +2491,8 @@ export async function assemblePrompt(
     macroEnv.extra.presetId = preset.id;
     macroEnv.extra.presetMetadata = preset.metadata || {};
   }
+  macroEnv.extra.promptActivation = promptActivation;
+  macroEnv.extra.activationInputSnapshots = new Map(preset ? [[preset.id, activationInputs]] : []);
 
   // Prompt variables — resolve creator-defined schemas + end-user overrides and
   // surface them on env.extra so {{var::name}} / {{hasVar::name}} / {{varDefault::name}}
@@ -3032,6 +3003,13 @@ export async function assemblePrompt(
     if (!promptBlockMatchesCharacterTags(block.characterTagTrigger, focusedCharacter.tags)) {
       continue;
     }
+    // Structural world-info slots are unique. Presets can acquire duplicate
+    // markers during import/merge, while their independent display names can
+    // hide the collision (for example, a second marker named "Databank").
+    // Skip duplicates before marker-pinned entries are handled as those would
+    // otherwise be repeated too.
+    if (block.marker === "world_info_before" && hasWiBefore) continue;
+    if (block.marker === "world_info_after" && hasWiAfter) continue;
     // Marker-pinned WI: emit this block's "before" entries ahead of its own
     // output, and queue its "after" entries for the next-iteration flush.
     const pin = block.marker ? pinnedByMarker.get(block.marker) : undefined;
@@ -3158,23 +3136,23 @@ export async function assemblePrompt(
       // (excludeMessageId is already filtered out at the top of assemblePrompt)
       // Pre-resolve all attachment files in parallel so the per-message loop
       // doesn't pay sequential file I/O costs per attachment.
-      const attachmentImageIds = new Set<string>();
+      const attachmentSources = new Map<string, MessageAttachment>();
       for (const msg of effectiveMessages) {
         if (msg.extra?.hidden === true) continue;
         const atts = attachmentsForContext(msg, generatedImageContextPolicy);
         for (const att of atts) {
-          if (att.image_id) attachmentImageIds.add(att.image_id);
+          if (att.image_id) attachmentSources.set(attachmentCacheKey(att), att);
         }
       }
       const attachmentCache = new Map<string, string | null>();
-      if (attachmentImageIds.size > 0) {
+      if (attachmentSources.size > 0) {
         const entries = await Promise.all(
-          [...attachmentImageIds].map(
-            async (id) =>
-              [id, await resolveAttachmentBase64(ctx.userId, id)] as const,
+          [...attachmentSources].map(
+            async ([key, attachment]) =>
+              [key, await resolveAttachmentBase64(ctx.userId, attachment)] as const,
           ),
         );
-        for (const [id, b64] of entries) attachmentCache.set(id, b64);
+        for (const [key, b64] of entries) attachmentCache.set(key, b64);
       }
 
       let historyCount = 0;
@@ -3233,7 +3211,7 @@ export async function assemblePrompt(
             parts.push({ type: "text", text: contentForPrompt });
           }
           for (const att of attachments) {
-            const b64 = attachmentCache.get(att.image_id) ?? null;
+            const b64 = attachmentCache.get(attachmentCacheKey(att)) ?? null;
             if (!b64) continue;
             if (att.type === "image") {
               parts.push({
@@ -3244,6 +3222,12 @@ export async function assemblePrompt(
             } else if (att.type === "audio") {
               parts.push({
                 type: "audio",
+                data: b64,
+                mime_type: att.mime_type,
+              });
+            } else if (att.type === "video") {
+              parts.push({
+                type: "video",
                 data: b64,
                 mime_type: att.mime_type,
               });
@@ -3433,15 +3417,26 @@ export async function assemblePrompt(
       );
       if (resolved) {
         const role = (block.role || "system") as LlmMessage["role"];
-        result.push({ role, content: resolved });
-        breakdown.push({
-          type: "block",
-          name: block.name,
-          role: block.role,
-          content: resolved,
-          blockId: block.id,
-          marker: block.marker,
-        });
+        if (block.position === "in_history") {
+          pendingDepthBlocks.push({
+            role,
+            depth: Math.max(0, block.depth || 0),
+            content: resolved,
+            blockName: block.name,
+            blockId: block.id,
+            marker: block.marker,
+          });
+        } else {
+          result.push({ role, content: resolved });
+          breakdown.push({
+            type: "block",
+            name: block.name,
+            role: block.role,
+            content: resolved,
+            blockId: block.id,
+            marker: block.marker,
+          });
+        }
       }
       continue;
     }
@@ -3711,7 +3706,12 @@ export async function assemblePrompt(
     const resolvedAN = (await evaluate(authorsNote.content, macroEnv, registry))
       .text;
     if (resolvedAN) {
-      const insertAt = Math.max(0, result.length - (authorsNote.depth || 4));
+      // Count backward from the latest chat message, ignoring other prompt
+      // content. Depth 0 belongs immediately after the latest chat message.
+      const insertAt = resolveChatHistoryInsertionIndex(
+        result,
+        authorsNote.depth ?? 4,
+      );
       result.splice(insertAt, 0, {
         role: authorsNote.role || "system",
         content: resolvedAN,
@@ -3751,22 +3751,31 @@ export async function assemblePrompt(
   // Guided generations (from batch-loaded settings)
   const guided = normalizeGuidedGenerations(
     settingsMap.get("guidedGenerations"),
+    {
+      connectionProfileId: connection?.id ?? null,
+      chatId: chat.id,
+      characterId,
+    },
   );
   if (guided.length > 0) {
     await applyGuidedGenerations(result, guided, macroEnv, breakdown);
   }
 
-  // Regen feedback injection (user-provided OOC guidance for regeneration)
+  // Regen feedback injection (user-provided guidance for regeneration)
   if (ctx.regenFeedback) {
-    const oocContent = `[OOC: ${ctx.regenFeedback}]`;
+    const feedbackContent = await resolveRegenFeedbackPrompt(
+      ctx.regenFeedbackFormat,
+      ctx.regenFeedback,
+      macroEnv,
+    );
     if (ctx.regenFeedbackPosition === "system") {
       // Append as a system message at the end
-      result.push({ role: "system", content: oocContent });
+      result.push({ role: "system", content: feedbackContent });
       breakdown.push({
         type: "utility",
         name: "Regen Feedback",
         role: "system",
-        content: oocContent,
+        content: feedbackContent,
       });
     } else {
       // Append to the last real chat-history user message so preset-added
@@ -3777,7 +3786,7 @@ export async function assemblePrompt(
           if (typeof result[i].content === "string") {
             result[i] = {
               ...result[i],
-              content: result[i].content + "\n" + oocContent,
+              content: result[i].content + "\n" + feedbackContent,
             };
           } else {
             const parts = [
@@ -3788,10 +3797,10 @@ export async function assemblePrompt(
               const tp = parts[textIdx] as import("../llm/types").LlmTextPart;
               parts[textIdx] = {
                 type: "text",
-                text: tp.text + "\n" + oocContent,
+                text: tp.text + "\n" + feedbackContent,
               };
             } else {
-              parts.unshift({ type: "text", text: oocContent });
+              parts.unshift({ type: "text", text: feedbackContent });
             }
             result[i] = { ...result[i], content: parts };
           }
@@ -3800,19 +3809,19 @@ export async function assemblePrompt(
             type: "utility",
             name: "Regen Feedback",
             role: "user",
-            content: oocContent,
+            content: feedbackContent,
           });
           break;
         }
       }
       // Fallback: if no user message found, add as a user message
       if (!injected) {
-        result.push({ role: "user", content: oocContent });
+        result.push({ role: "user", content: feedbackContent });
         breakdown.push({
           type: "utility",
           name: "Regen Feedback",
           role: "user",
-          content: oocContent,
+          content: feedbackContent,
         });
       }
     }
@@ -3984,13 +3993,13 @@ export async function assemblePrompt(
     if (resolvedPrefill) prefillParts.push(resolvedPrefill);
   }
 
-  // Moonshot/Kimi Partial Mode can continue an explicitly supplied reasoning
-  // prefix via the assistant message's `reasoning_content`. Keep it separate
-  // from the visible assistant prefix: Kimi does not include this text in
-  // `content`, and the generation service displays it in the reasoning pane.
+  // Moonshot/Kimi Partial Mode and DeepSeek Chat Prefix Completion can continue
+  // an explicitly supplied reasoning prefix via the assistant message's
+  // `reasoning_content`. Keep it separate from the visible assistant prefix;
+  // the generation service displays it in the reasoning pane.
   if (
     ctx.generationType !== "continue" &&
-    connection?.provider === "moonshot" &&
+    (connection?.provider === "moonshot" || connection?.provider === "deepseek") &&
     completionSettings.reasoningPrefill
   ) {
     const resolvedReasoningPrefill = await evaluateHostPromptSource(
@@ -4286,33 +4295,6 @@ export async function assemblePrompt(
     resolveCortexGate?.();
     profiler.finish();
   }
-}
-
-function normalizeGuidedGenerations(input: unknown): GuidedGeneration[] {
-  if (!Array.isArray(input)) return [];
-  const out: GuidedGeneration[] = [];
-  for (const item of input) {
-    if (!item || typeof item !== "object") continue;
-    const g = item as Partial<GuidedGeneration>;
-    if (!g.enabled) continue;
-    if (typeof g.content !== "string" || !g.content.trim()) continue;
-    const position =
-      g.position === "user_prefix" || g.position === "user_suffix"
-        ? g.position
-        : "system";
-    out.push({
-      id: typeof g.id === "string" ? g.id : "",
-      name:
-        typeof g.name === "string" && g.name.trim()
-          ? g.name
-          : "Guided Generation",
-      content: g.content,
-      position,
-      mode: g.mode === "oneshot" ? "oneshot" : "persistent",
-      enabled: true,
-    });
-  }
-  return out;
 }
 
 async function applyGuidedGenerations(
@@ -5352,10 +5334,15 @@ function setCachedVectorWiResult(
 
 export const __vectorWiCacheTest = {
   buildFingerprint: buildVectorWiCacheFingerprint,
-  clear: () => vectorWiCache.clear(),
+  clear: clearVectorWorldInfoCache,
   get: getCachedVectorWiResult,
   set: setCachedVectorWiResult,
 };
+
+/** Drop reconstructable vector world-info results under host memory pressure. */
+export function clearVectorWorldInfoCache(): void {
+  vectorWiCache.clear();
+}
 
 export const __vectorWiRetrievalTest = {
   getSearchableWorldBookIds: getVectorSearchableWorldBookIds,
@@ -6017,12 +6004,23 @@ function formatCortexForAssembly(
   };
 
   if (cortexConfig.useChatMemoryFormatting) {
-    const memResult = memoryCortex.cortexToMemoryResult(cortexResult, chatMemorySettings);
+    // Preserve the user's Long-Term Memory templates for raw retrieved chunks.
+    // Cortex-owned scene consolidations, entities, relationships, and arcs
+    // still use the selected Cortex formatter mode.
+    const rawMemoryResult = {
+      ...cortexResult,
+      memories: cortexResult.memories.filter((memory) => memory.source === "chunk"),
+    };
+    const consolidationMemories = cortexResult.memories.filter(
+      (memory) => memory.source === "consolidation",
+    );
+    const memResult = memoryCortex.cortexToMemoryResult(rawMemoryResult, chatMemorySettings);
 
-    // Append entity/relationship/arc context so the LLM still benefits from
-    // cortex scoring signals even when memory chunks use chat memory templates.
+    // Append Cortex-owned context so the LLM still benefits from consolidation
+    // and graph signals even when raw memories use chat-memory templates.
     const contextBudget = Math.floor(cortexConfig.contextTokenBudget * 0.55);
-    const contextText = memoryCortex.formatContextSections(
+    const contextText = memoryCortex.formatShadowPrompt(
+      consolidationMemories,
       cortexResult.entityContext,
       cortexResult.activeRelationships,
       cortexResult.arcContext,
@@ -6031,7 +6029,7 @@ function formatCortexForAssembly(
         tokenBudget: contextBudget,
         currentSpeakerName: character?.name,
       },
-    );
+    ).text;
     if (contextText) {
       memResult.formatted = memResult.formatted
         ? memResult.formatted + "\n\n" + contextText
@@ -7219,6 +7217,10 @@ type ReasoningParameterSettings = {
   reasoningEffort?: string;
   keepInHistory?: number;
   thinkingDisplay?: string;
+  /** Z.AI-only. When set, forwards to `thinking.clear_thinking`. */
+  clearThinking?: boolean;
+  /** Google Gemini / Vertex only. Replays optional non-tool thought signatures. */
+  replayThoughtSignatures?: boolean;
   /** When present, supersedes the legacy preset-level custom body. */
   customBody?: CustomBody;
 };
@@ -7347,7 +7349,14 @@ export function buildParameters(
         effort,
         modelName || undefined,
         reasoningSettings.thinkingDisplay,
+        reasoningSettings.clearThinking,
       );
+    }
+    if (
+      reasoningSettings.replayThoughtSignatures === true &&
+      (providerName === "google" || providerName === "google_vertex")
+    ) {
+      params._replay_thought_signatures = true;
     }
   }
 
@@ -7399,9 +7408,12 @@ export function buildParameters(
  *                "max" at present). K2.7-code uses thinking: { type: "enabled",
  *                keep: "all" } (or omit, since thinking is always on). K2.6/K2.5
  *                use thinking: { type: "enabled" }.
- * - Z.AI:        thinking: { type: "enabled" } plus reasoning_effort for GLM-5.x
- *                models (max/xhigh/high/medium/low/minimal/none). GLM-4.x only
- *                receives the thinking toggle.
+ * - Z.AI:        thinking: { type: "enabled" } plus an optional user-selected
+ *                `clear_thinking` value and reasoning_effort for GLM-5.x models.
+ *                GLM-5.3 accepts low/high/max; older GLM-5 models retain their
+ *                compatibility values. GLM-4.5+ supports
+ *                the same user-selected clear-thinking behaviour without
+ *                reasoning_effort.
  * - Others:      reasoning: { effort } (generic OpenAI-compatible passthrough)
  */
 export function injectReasoningParams(
@@ -7410,6 +7422,7 @@ export function injectReasoningParams(
   effort: string,
   model?: string,
   thinkingDisplay?: string,
+  clearThinking?: boolean,
 ): void {
   if (providerName === "anthropic") {
     if (!params.thinking) {
@@ -7557,23 +7570,26 @@ export function injectReasoningParams(
   } else if (providerName === "zai") {
     // Z.AI (Zhipu GLM): thinking.type controls CoT; GLM-5.x additionally
     // supports reasoning_effort (GLM-5.2+ officially, GLM-5/5.1 support max/high
-    // per the GLM-5 repo). Send both so GLM-5.x models use the requested effort.
+    // per the GLM-5 repo). `clear_thinking` is intentionally only sent when
+    // the user configures it on the connection's Reasoning tab; omitting it
+    // leaves Z.AI's model/API default in control.
     if (!params.thinking) {
-      params.thinking = { type: "enabled" };
+      params.thinking = {
+        type: "enabled",
+        ...(typeof clearThinking === "boolean"
+          ? { clear_thinking: clearThinking }
+          : {}),
+      };
     }
 
     const isGlm5 = model ? /^glm-5/i.test(model) : false;
     if (isGlm5 && params.reasoning_effort === undefined) {
-      const validEfforts = new Set([
-        "max",
-        "xhigh",
-        "high",
-        "medium",
-        "low",
-        "minimal",
-        "none",
-      ]);
-      // "auto" maps to the documented default deep-reasoning level.
+      const isGlm53 = /^glm-5\.3(?:$|[\[.:@-])/i.test(model || "");
+      const validEfforts = isGlm53
+        ? new Set(["low", "high", "max"])
+        : new Set(["max", "xhigh", "high", "medium", "low", "minimal", "none"]);
+      // "auto" maps to the documented default deep-reasoning level. Values
+      // outside GLM-5.3's low/high/max contract also fall back to max.
       params.reasoning_effort =
         effort === "auto" ? "max" : validEfforts.has(effort) ? effort : "max";
     }
@@ -7649,6 +7665,14 @@ export function applyProviderReasoningOffSwitch(
   }
 
   if (providerName === "zai") {
+    if (/^glm-5\.3(?:$|[\[.:@-])/i.test(modelName || "")) {
+      // GLM-5.3 and GLM-5.3-Flash use forced thinking. Keep the request valid
+      // and map the user's "off" preference to the lightest supported effort.
+      params.thinking = { type: "enabled" };
+      params.reasoning_effort = "low";
+      return;
+    }
+
     params.thinking = { type: "disabled" };
     return;
   }
@@ -7785,7 +7809,10 @@ async function onelinerImpersonation(
     }
   }
 
-  if (connection?.provider === "moonshot" && completionSettings.reasoningPrefill) {
+  if (
+    (connection?.provider === "moonshot" || connection?.provider === "deepseek") &&
+    completionSettings.reasoningPrefill
+  ) {
     const resolvedReasoningPrefill = await evaluateHostPromptSource(
       completionSettings.reasoningPrefill,
       macroEnv,
@@ -8048,22 +8075,22 @@ async function legacyAssembly(
     userId ? settingsSvc.getSetting(userId, "imageGeneration")?.value : null,
     messages,
   );
-  const legacyAttachmentIds = new Set<string>();
+  const legacyAttachmentSources = new Map<string, MessageAttachment>();
   for (const m of messages) {
     if (m.extra?.hidden === true) continue;
     const atts = attachmentsForContext(m, legacyGeneratedImageContextPolicy);
     for (const att of atts) {
-      if (att.image_id) legacyAttachmentIds.add(att.image_id as string);
+      if (att.image_id) legacyAttachmentSources.set(attachmentCacheKey(att), att);
     }
   }
   const legacyAttachmentCache = new Map<string, string | null>();
-  if (legacyAttachmentIds.size > 0 && userId) {
+  if (legacyAttachmentSources.size > 0 && userId) {
     const entries = await Promise.all(
-      [...legacyAttachmentIds].map(
-        async (id) => [id, await resolveAttachmentBase64(userId, id)] as const,
+      [...legacyAttachmentSources].map(
+        async ([key, attachment]) => [key, await resolveAttachmentBase64(userId, attachment)] as const,
       ),
     );
-    for (const [id, b64] of entries) legacyAttachmentCache.set(id, b64);
+    for (const [key, b64] of entries) legacyAttachmentCache.set(key, b64);
   }
 
   const legacyFirstChatIdx = llmMessages.length;
@@ -8090,12 +8117,14 @@ async function legacyAssembly(
       }
       for (const att of attachments) {
         if (!att.image_id || !userId) continue;
-        const b64 = legacyAttachmentCache.get(att.image_id as string) ?? null;
+        const b64 = legacyAttachmentCache.get(attachmentCacheKey(att)) ?? null;
         if (!b64) continue;
         if (att.type === "image") {
           parts.push({ type: "image", data: b64, mime_type: att.mime_type });
         } else if (att.type === "audio") {
           parts.push({ type: "audio", data: b64, mime_type: att.mime_type });
+        } else if (att.type === "video") {
+          parts.push({ type: "video", data: b64, mime_type: att.mime_type });
         }
       }
       llmMessages.push(

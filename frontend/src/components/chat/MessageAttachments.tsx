@@ -149,15 +149,30 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
   // component as a sibling of MessageAttachments — keeping it out of the
   // flex-wrap row here means the slot can collapse to 0 height (without
   // dragging this wrapper's padding along) when there's no audio.
-  const images = attachments.filter((a) => a.type === 'image')
+  const visualMedia = attachments.filter((a) => a.type === 'image' || a.type === 'video')
 
-  if (images.length === 0) return null
+  if (visualMedia.length === 0) return null
 
   return (
     <>
       <div className={clsx(styles.attachments, isUser && styles.attachmentsUser)}>
-        {images.map((att) =>
-          isUser ? (
+        {visualMedia.map((att) =>
+          att.type === 'video' ? (
+            <video
+              key={att.image_id}
+              src={getLocalImageUrl(att)}
+              className={styles.videoAttachment}
+              controls
+              preload="metadata"
+              playsInline
+              title={att.original_filename}
+              onLoadedMetadata={(event) => dispatchMessageContentLayout(event.currentTarget)}
+              onContextMenu={onImageContextMenu(att.image_id)}
+              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id) : undefined}
+              onTouchMove={canActOnImage ? longPress.onTouchMove : undefined}
+              onTouchEnd={canActOnImage ? longPress.onTouchEnd : undefined}
+            />
+          ) : isUser ? (
             <button
               key={att.image_id}
               type="button"

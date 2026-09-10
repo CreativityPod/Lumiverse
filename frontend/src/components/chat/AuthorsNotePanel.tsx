@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useId } from 'react'
 import { useTranslation } from 'react-i18next'
 import { CloseButton } from '@/components/shared/CloseButton'
 import { ExpandableTextarea } from '@/components/shared/ExpandedTextEditor'
@@ -20,6 +20,7 @@ interface AuthorsNotePanelProps {
 
 export default function AuthorsNotePanel({ chatId, isOpen, onClose }: AuthorsNotePanelProps) {
   const { t } = useTranslation('chat')
+  const depthId = useId()
   const [noteText, setNoteText] = useState('')
   const [depth, setDepth] = useState(4)
   const [role, setRole] = useState<'system' | 'user' | 'assistant'>('system')
@@ -125,8 +126,11 @@ export default function AuthorsNotePanel({ chatId, isOpen, onClose }: AuthorsNot
 
         <div className={styles.row}>
           <div className={styles.field}>
-            <label className={styles.label}>{t('authorsNote.depth')}</label>
+            <label className={styles.label} htmlFor={depthId}>{t('authorsNote.depth')}</label>
             <NumericInput
+              id={depthId}
+              name="authors-note-depth"
+              aria-describedby={`${depthId}-hint`}
               className={styles.input}
               min={0}
               max={9999}
@@ -134,6 +138,7 @@ export default function AuthorsNotePanel({ chatId, isOpen, onClose }: AuthorsNot
               integer
               onChange={handleDepthChange}
             />
+            <span id={`${depthId}-hint`} className={styles.helper}>{t('authorsNote.depthHint')}</span>
           </div>
           <div className={styles.field}>
             <label className={styles.label}>{t('authorsNote.role')}</label>

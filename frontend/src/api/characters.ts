@@ -1,5 +1,8 @@
-import { get, post, put, del, upload, uploadWithProgress, getBlob, BASE_URL, type RequestOptions } from './client'
+import { get, post, put, del, upload, uploadRaw, uploadWithProgress, getBlob, BASE_URL, type RequestOptions } from './client'
 import { triggerBlobDownload } from '@/lib/downloads'
+
+/** Ceiling for calls that may download a full expression pack (~20 MB). */
+const EXPRESSION_FETCH_TIMEOUT_MS = 5 * 60 * 1000
 import type {
   Character,
   CharacterLibraryScope,
@@ -12,6 +15,7 @@ import type {
   PaginatedResult,
   ImportResult,
   BulkImportResult,
+  CharacterImportJob,
   BatchDeleteResult,
   BulkTagResult,
   TagLibraryImportResult,
@@ -144,7 +148,30 @@ export const charactersApi = {
   },
 
   importUrl(url: string) {
-    return post<ImportResult>('/characters/import-url', { url })
+    // Importing may also pull a gallery and an expression pack, so this shares
+    // the longer ceiling rather than the default 30s.
+    return post<ImportResult>('/characters/import-url', { url }, { timeout: EXPRESSION_FETCH_TIMEOUT_MS })
+  },
+
+  /**
+   * Pull this character's expression pack from the Chub source it came from.
+   *
+   * A pack is tens of images and can take minutes on a slow link, so the
+   * default 30s ceiling would abort a download that was progressing fine.
+   */
+  fetchChubExpressions(id: string) {
+    return post<{ imported: number; skipped: number; available: number; sourceMissing?: boolean }>(
+      `/characters/${id}/chub-expressions`,
+      undefined,
+      { timeout: EXPRESSION_FETCH_TIMEOUT_MS },
+    )
+  },
+
+  /** Characters that trace back to Chub and have no expressions yet. */
+  chubExpressionCandidates() {
+    return get<{ candidates: Array<{ id: string; name: string }>; count: number }>(
+      '/characters/chub-expression-candidates',
+    )
   },
 
   importBulk(files: File[], skipDuplicates = false) {
@@ -156,6 +183,35 @@ export const charactersApi = {
       form.append('skip_duplicates', 'true')
     }
     return upload<BulkImportResult>('/characters/import-bulk', form, { timeout: 0 })
+  },
+
+  createImportJob(total: number, skipDuplicates = false) {
+    return post<CharacterImportJob>('/characters/import-jobs', {
+      total,
+      skip_duplicates: skipDuplicates,
+    })
+  },
+
+  uploadImportJobFile(jobId: string, index: number, file: File, signal?: AbortSignal) {
+    const filename = encodeURIComponent(file.name || `character-${index + 1}`)
+    return uploadRaw<CharacterImportJob>(
+      `/characters/import-jobs/${encodeURIComponent(jobId)}/files/${index}?filename=${filename}`,
+      file,
+      { timeout: 0, signal, contentType: file.type || 'application/octet-stream' },
+    )
+  },
+
+  startImportJob(jobId: string) {
+    return post<CharacterImportJob>(`/characters/import-jobs/${encodeURIComponent(jobId)}/start`)
+  },
+
+  getImportJob(jobId: string, signal?: AbortSignal) {
+    const options: RequestOptions | undefined = signal === undefined ? undefined : { signal }
+    return get<CharacterImportJob>(`/characters/import-jobs/${encodeURIComponent(jobId)}/status`, undefined, options)
+  },
+
+  cancelImportJob(jobId: string) {
+    return post<CharacterImportJob>(`/characters/import-jobs/${encodeURIComponent(jobId)}/cancel`)
   },
 
   importTagLibrary(file: File) {

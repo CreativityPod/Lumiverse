@@ -1,7 +1,35 @@
 import { unzipSync } from "fflate";
-import { getCharacter, updateCharacter } from "./characters.service";
-import { uploadImage } from "./images.service";
+import { getCharacter, updateCharacter, type UpdateCharacterOptions } from "./characters.service";
+import { uploadImage, uploadImages } from "./images.service";
 import type { Character } from "../types/character";
+
+// Cap on the total bytes produced by expression ZIP decompression. fflate's
+// unzipSync has no built-in output cap, so a small compressed file with a
+// multi-GB decompressed payload would otherwise OOM the process (zip bomb).
+// Mirrors the guard in character-card.service.ts; expression images are tiny,
+// so a 100 MB budget is far above legitimate use.
+const MAX_EXPRESSIONS_DECOMPRESSED_SIZE = 100 * 1024 * 1024;
+
+/**
+ * unzipSync filter that aborts extraction once the archive's declared
+ * decompressed size crosses the cap. Throws inside the filter so fflate stops
+ * before allocating the bomb's output buffer.
+ */
+function makeDecompressionCapFilter(): NonNullable<Parameters<typeof unzipSync>[1]>["filter"] {
+  let plannedBytes = 0;
+  return (entry) => {
+    const ext = entry.name.lastIndexOf(".");
+    const wanted = ext >= 0 && IMAGE_EXTENSIONS.has(entry.name.slice(ext).toLowerCase());
+    if (!wanted) return false;
+    plannedBytes += entry.originalSize ?? 0;
+    if (plannedBytes > MAX_EXPRESSIONS_DECOMPRESSED_SIZE) {
+      throw new Error(
+        `Expression ZIP decompresses to more than ${MAX_EXPRESSIONS_DECOMPRESSED_SIZE / 1024 / 1024} MB`,
+      );
+    }
+    return true;
+  };
+}
 
 export interface ExpressionConfig {
   enabled: boolean;
@@ -31,11 +59,16 @@ export function getExpressionConfig(userId: string, characterId: string): Expres
   };
 }
 
-function saveConfig(userId: string, characterId: string, config: ExpressionConfig): ExpressionConfig {
+function saveConfig(
+  userId: string,
+  characterId: string,
+  config: ExpressionConfig,
+  options: UpdateCharacterOptions = {},
+): ExpressionConfig {
   const character = getCharacter(userId, characterId);
   if (!character) throw new Error("Character not found");
   const extensions = { ...getExtensions(character), expressions: config };
-  updateCharacter(userId, characterId, { extensions });
+  updateCharacter(userId, characterId, { extensions }, options);
   return config;
 }
 
@@ -68,10 +101,7 @@ export async function importFromZip(
   zipBuffer: Buffer
 ): Promise<ExpressionConfig> {
   const unzipped = unzipSync(new Uint8Array(zipBuffer), {
-    filter: (entry) => {
-      const ext = getFileExtension(entry.name);
-      return IMAGE_EXTENSIONS.has(ext);
-    },
+    filter: makeDecompressionCapFilter(),
   });
 
   const existing = getExpressionConfig(userId, characterId) ?? { ...EMPTY_CONFIG };
@@ -158,13 +188,90 @@ export async function importFromAssets(
 
   const config: ExpressionConfig = {
     enabled: Object.keys(newMappings).length > 0,
-    defaultExpression: existing.defaultExpression || "default" in newMappings
-      ? "default"
-      : Object.keys(newMappings)[0] || "",
+    defaultExpression: existing.defaultExpression
+      || ("default" in newMappings ? "default" : Object.keys(newMappings)[0] || ""),
     mappings: newMappings,
   };
 
   return saveConfig(userId, characterId, config);
+}
+
+export interface ExpressionImageData {
+  label: string;
+  data: Uint8Array;
+  filename: string;
+  mimeType: string;
+}
+
+export interface ExpressionImageDataImportResult {
+  config: ExpressionConfig;
+  importedLabels: string[];
+  failed: number;
+}
+
+/**
+ * Persist one bounded batch of already-downloaded expression images.
+ *
+ * `uploadImages` writes the originals in a batch and puts every eligible image
+ * on the standard deferred metadata/thumbnail queue. In particular, this must
+ * not call Sharp directly: remote expression packs can contain hundreds of
+ * images, and request-local thumbnail fan-out can exhaust small hosts.
+ */
+export async function importFromImageData(
+  userId: string,
+  characterId: string,
+  assets: readonly ExpressionImageData[],
+  options: UpdateCharacterOptions = {},
+): Promise<ExpressionImageDataImportResult> {
+  const existing = getExpressionConfig(userId, characterId) ?? { ...EMPTY_CONFIG };
+  if (assets.length === 0) {
+    return { config: existing, importedLabels: [], failed: 0 };
+  }
+
+  const results = await uploadImages(
+    userId,
+    assets.map((asset) => ({
+      data: asset.data,
+      filename: asset.filename,
+      mime_type: asset.mimeType,
+      owner_character_id: characterId,
+    })),
+    {
+      // Disk writes are cheap, but keeping this below the download batch size
+      // avoids multiplying live references to large remote response buffers.
+      concurrency: 2,
+      deferProcessing: true,
+    },
+  );
+
+  const newMappings: Record<string, string> = { ...existing.mappings };
+  const importedLabels: string[] = [];
+  let failed = 0;
+  for (let i = 0; i < assets.length; i++) {
+    const image = results[i]?.image;
+    if (!image) {
+      failed++;
+      continue;
+    }
+    newMappings[assets[i]!.label] = image.id;
+    importedLabels.push(assets[i]!.label);
+  }
+
+  if (importedLabels.length === 0) {
+    return { config: existing, importedLabels, failed };
+  }
+
+  const config: ExpressionConfig = {
+    enabled: existing.enabled || Object.keys(newMappings).length > 0,
+    defaultExpression: existing.defaultExpression
+      || ("default" in newMappings ? "default" : Object.keys(newMappings)[0] || ""),
+    mappings: newMappings,
+  };
+  return {
+    config: saveConfig(userId, characterId, config, options),
+    importedLabels,
+    failed,
+  };
 }
 
 export function getExpressionLabels(userId: string, characterId: string): string[] {
@@ -267,12 +374,8 @@ export async function importGroupFromZip(
   const group = existing[groupName];
   if (!group) throw new Error("Group not found");
 
-  const { unzipSync } = await import("fflate");
   const unzipped = unzipSync(new Uint8Array(zipBuffer), {
-    filter: (entry) => {
-      const ext = entry.name.lastIndexOf(".");
-      return ext >= 0 && IMAGE_EXTENSIONS.has(entry.name.slice(ext).toLowerCase());
-    },
+    filter: makeDecompressionCapFilter(),
   });
 
   const newMappings: Record<string, string> = { ...group };

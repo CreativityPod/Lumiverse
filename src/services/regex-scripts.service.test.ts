@@ -9,8 +9,16 @@ import {
   getCharacterBoundScripts,
   getRegexScript,
   getRegexScriptByScriptId,
+  getRegexScriptsByPresetId,
+  getPresetActivationScripts,
+  duplicateRegexScript,
+  getSpindleExtensionRegexFolderVersion,
   importRegexScripts,
   importCharacterBoundRegexScripts,
+  installLumiHubPresetRegexScripts,
+  importPresetBoundRegexScripts,
+  resolveLumiHubPresetRegexInstallFolder,
+  retireLumiHubPresetRegexScriptsForUpdate,
   reportRegexScriptPerformance,
   switchPresetBoundRegexScripts,
   toggleRegexScript,
@@ -19,6 +27,7 @@ import {
   updateRegexScript,
 } from "./regex-scripts.service";
 import { initMacros } from "../macros";
+import { createActivationInputSnapshot } from "../utils/regex-activation-inputs";
 import type { RegexScript } from "../types/regex-script";
 
 const USER_ID = "u1";
@@ -76,6 +85,7 @@ beforeAll(() => {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (key, user_id)
   )`);
+  db.run("CREATE TABLE presets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, prompt_order TEXT NOT NULL)");
 
   db.run(`CREATE TABLE regex_scripts (
     id TEXT PRIMARY KEY,
@@ -117,9 +127,150 @@ beforeEach(() => {
   const db = getDb();
   db.query("DELETE FROM regex_scripts").run();
   db.query("DELETE FROM settings").run();
+  db.query("DELETE FROM presets").run();
+});
+
+describe("preset prompt activation mappings", () => {
+  const activation = { source: "user_input", lifetime: "latest", mappings: [
+    { capture: "0", value: "combat", block_ids: ["rules"], enabled: true },
+  ] };
+  function seedPreset(id = "preset-a", user = USER_ID) {
+    getDb().query("INSERT INTO presets VALUES (?, ?, ?)").run(id, user, JSON.stringify([{ id: "rules" }]));
+  }
+  function create(preset_id: string | null = "preset-a", metadata = { prompt_activation: activation }) {
+    return createRegexScript(USER_ID, { name: "Activation", find_regex: "combat", preset_id, metadata }, { activePresetId: "preset-a" });
+  }
+  test("requires an owned preset and targets belonging to it", () => {
+    expect(create(null)).toBe("Prompt activation requires a linked preset");
+    seedPreset("private", "someone-else");
+    expect(create("private")).toBe("Linked prompt activation preset not found");
+    seedPreset();
+    expect(create("preset-a", { prompt_activation: { ...activation, mappings: [{ ...activation.mappings[0], block_ids: ["foreign"] }] } }))
+      .toBe("Prompt activation targets must belong to the linked preset");
+    expect(typeof create()).toBe("object");
+  });
+  test("rejects malformed mappings and unsupported macro patterns", () => {
+    seedPreset();
+    expect(create("preset-a", { prompt_activation: { ...activation, mappings: [] } })).toContain("mappings");
+    expect(createRegexScript(USER_ID, { name: "Bad", find_regex: "{{getvar::pattern}}", preset_id: "preset-a", metadata: { prompt_activation: activation } })).toContain("Unsupported activation input");
+    expect(typeof createRegexScript(USER_ID, { name: "Bounded", find_regex: "{{getchatvar::mode}}", flags: "u", preset_id: "preset-a", metadata: { prompt_activation: activation } })).toBe("object");
+    expect(createRegexScript(USER_ID, { name: "Unknown", find_regex: "{{presetvar::rules::missing}}", preset_id: "preset-a", metadata: { prompt_activation: activation } })).toContain("Unknown linked preset variable");
+  });
+  test("unlinking and standalone duplication remove the preset-only capability", () => {
+    seedPreset();
+    const original = create() as RegexScript;
+    expect(duplicateRegexScript(USER_ID, original.id)?.metadata.prompt_activation).toBeUndefined();
+    const unlinked = updateRegexScript(USER_ID, original.id, { preset_id: null }) as RegexScript;
+    expect(unlinked.metadata.prompt_activation).toBeUndefined();
+    expect(updateRegexScript(USER_ID, unlinked.id, { metadata: { prompt_activation: activation } })).toContain("linked preset");
+  });
+  test("uses per-preset enablement across tab switches and respects script scope", () => {
+    seedPreset();
+    const original = create() as RegexScript;
+    const scoped = createRegexScript(USER_ID, { name: "Chat", find_regex: "combat", preset_id: "preset-a", scope: "chat", scope_id: "chat-1", metadata: { prompt_activation: activation } }, { activePresetId: "preset-a" }) as RegexScript;
+    switchPresetBoundRegexScripts(USER_ID, { previousPresetId: "preset-a", presetId: "other" });
+    expect(mustGetScript(original.id).disabled).toBe(true);
+    expect(getPresetActivationScripts(USER_ID, "preset-a", { chatId: "chat-1" }).map((s) => s.id)).toEqual([original.id, scoped.id]);
+    expect(getPresetActivationScripts(USER_ID, "preset-a", { chatId: "chat-2" }).map((s) => s.id)).toEqual([original.id]);
+    expect(getPresetActivationScripts(USER_ID, "other", { chatId: "chat-1" })).toEqual([]);
+    expect(mustGetScript(original.id).disabled).toBe(true);
+  });
+  test("preset exports round-trip mappings into the new preset", () => {
+    seedPreset();
+    seedPreset("preset-b");
+    create();
+    const exported = exportRegexScripts(USER_ID, { presetId: "preset-a" });
+    expect(exported.scripts[0].metadata.prompt_activation).toEqual(activation);
+    const imported = importPresetBoundRegexScripts(USER_ID, "preset-b", "Imported", exported.scripts);
+    expect(imported.imported).toBe(1);
+    expect(getPresetActivationScripts(USER_ID, "preset-b", { chatId: "chat" })[0].metadata.prompt_activation).toEqual(activation);
+  });
+  test("persists multi-value edits and preserves them through preset export/import", () => {
+    seedPreset();
+    seedPreset("preset-b");
+    const original = create() as RegexScript;
+    const next = { ...activation, mappings: [{ ...activation.mappings[0], value: ["combat", "fight", "hello, world"] }] };
+    expect(typeof updateRegexScript(USER_ID, original.id, { metadata: { prompt_activation: next } })).toBe("object");
+    expect(mustGetScript(original.id).metadata.prompt_activation).toEqual(next);
+    const exported = exportRegexScripts(USER_ID, { presetId: "preset-a" });
+    expect(importPresetBoundRegexScripts(USER_ID, "preset-b", "Imported", exported.scripts).imported).toBe(1);
+    expect(getPresetActivationScripts(USER_ID, "preset-b", { chatId: "chat" })[0].metadata.prompt_activation).toEqual(next);
+  });
 });
 
 describe("extension regex ownership", () => {
+  test("attributes an explicitly versioned Spindle folder without affecting unversioned scripts", () => {
+    const versioned = createRegexScript(USER_ID, {
+      name: "Versioned",
+      find_regex: "versioned",
+      folder: "Extension scripts",
+      metadata: { author_note: "preserved", _lumiverse_spindle_extension: { identifier: "spoof", version: "9" } },
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "2.4.0" }) as RegexScript;
+    const unversioned = createRegexScript(USER_ID, {
+      name: "Unversioned",
+      find_regex: "unversioned",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a" }) as RegexScript;
+    const unfiled = createRegexScript(USER_ID, {
+      name: "Unfiled",
+      find_regex: "unfiled",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "2.4.0" }) as RegexScript;
+
+    expect(versioned.metadata).toEqual({
+      author_note: "preserved",
+      _lumiverse_spindle_extension: { identifier: "extension.a", version: "2.4.0" },
+    });
+    expect(getSpindleExtensionRegexFolderVersion(versioned)).toBe("2.4.0");
+    expect(getSpindleExtensionRegexFolderVersion(unversioned)).toBeNull();
+    expect(getSpindleExtensionRegexFolderVersion(unfiled)).toBeNull();
+  });
+
+  test("preserves, replaces, and clears protected Spindle folder attribution on update", () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Versioned",
+      find_regex: "versioned",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "1.0.0" }) as RegexScript;
+
+    const preserved = updateRegexScript(USER_ID, created.id, {
+      metadata: { extension_value: true },
+    }, { extensionIdentifier: "extension.a" }) as RegexScript;
+    expect(preserved.metadata).toEqual({
+      extension_value: true,
+      _lumiverse_spindle_extension: { identifier: "extension.a", version: "1.0.0" },
+    });
+
+    const replaced = updateRegexScript(USER_ID, created.id, {}, {
+      extensionIdentifier: "extension.a",
+      extensionFolderVersion: "2.0.0",
+    }) as RegexScript;
+    expect(getSpindleExtensionRegexFolderVersion(replaced)).toBe("2.0.0");
+
+    const cleared = updateRegexScript(USER_ID, created.id, {}, {
+      extensionIdentifier: "extension.a",
+      extensionFolderVersion: null,
+    }) as RegexScript;
+    expect(getSpindleExtensionRegexFolderVersion(cleared)).toBeNull();
+    expect(cleared.metadata._lumiverse_spindle_extension).toBeUndefined();
+  });
+
+  test("rejects invalid Spindle folder-version values", () => {
+    expect(createRegexScript(USER_ID, {
+      name: "Invalid version",
+      find_regex: "invalid",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: 2 })).toBe(
+      "folder_version must be a string or null",
+    );
+    expect(createRegexScript(USER_ID, {
+      name: "Long version",
+      find_regex: "long",
+      folder: "Extension scripts",
+    }, { extensionIdentifier: "extension.a", extensionFolderVersion: "v".repeat(101) })).toBe(
+      "folder_version exceeds maximum length (100 characters)",
+    );
+  });
+
   test("stamps extension-created scripts and strips host-owned bindings", () => {
     const created = createRegexScript(USER_ID, {
       name: "Owned",
@@ -168,6 +319,38 @@ describe("extension regex ownership", () => {
       [mustGetScript(legacy.id)],
       "ai_output",
     )).toBe("");
+  });
+
+  test("allows explicitly-authorized editors to mutate protected scripts without taking ownership", () => {
+    const legacy = createRegexScript(USER_ID, { name: "Legacy", find_regex: "legacy" }) as RegexScript;
+    const foreign = createRegexScript(USER_ID, {
+      name: "Foreign",
+      find_regex: "foreign",
+      folder: "Foreign extension",
+    }, {
+      extensionIdentifier: "extension.b",
+      extensionFolderVersion: "2.4.0",
+    }) as RegexScript;
+    const bound = createRegexScript(USER_ID, { name: "Bound", find_regex: "bound" }) as RegexScript;
+    updateRegexScript(USER_ID, bound.id, { preset_id: "preset-1" });
+
+    const context = { extensionIdentifier: "editor.extension", allowUnownedMutation: true };
+    const updatedLegacy = updateRegexScript(USER_ID, legacy.id, { name: "Edited legacy" }, context) as RegexScript;
+    expect(updatedLegacy.name).toBe("Edited legacy");
+    expect(updatedLegacy.owner_extension_identifier).toBeNull();
+
+    const updatedForeign = updateRegexScript(USER_ID, foreign.id, {
+      name: "Edited foreign",
+      metadata: { editor_note: "preserved" },
+    }, context) as RegexScript;
+    expect(updatedForeign.owner_extension_identifier).toBe("extension.b");
+    expect(updatedForeign.metadata.editor_note).toBe("preserved");
+    expect(getSpindleExtensionRegexFolderVersion(updatedForeign)).toBe("2.4.0");
+
+    expect((updateRegexScript(USER_ID, bound.id, { name: "Edited bound" }, context) as RegexScript).name)
+      .toBe("Edited bound");
+    expect(deleteRegexScript(USER_ID, foreign.id, context)).toBe(true);
+    expect(getRegexScript(USER_ID, foreign.id)).toBeNull();
   });
 });
 
@@ -799,6 +982,259 @@ describe("regex JSON overwrite imports", () => {
     toggleRegexScript(USER_ID, updated.id, false, { activePresetId: "new-preset" });
     expect(mustGetScript(updated.id).disabled).toBe(false);
   });
+
+  test("isolates LumiHub preset script IDs and stamps version attribution", () => {
+    const global = createRegexScript(USER_ID, {
+      name: "User global",
+      script_id: "shared_preset_import",
+      find_regex: "global",
+    });
+    expect(typeof global).not.toBe("string");
+
+    const result = importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-historical",
+      "Historical preset",
+      [{
+        name: "Bundled preset regex",
+        script_id: "shared_preset_import",
+        find_regex: "bundled",
+        disabled: false,
+      }],
+      {
+        source: "lumihub",
+        hubPresetId: "hub-preset-1",
+        presetVersion: "1.4.0",
+      },
+    );
+
+    expect(result).toEqual({ imported: 1, skipped: 0 });
+    expect(mustGetScript((global as RegexScript).id)).toMatchObject({
+      find_regex: "global",
+      preset_id: null,
+      script_id: "shared_preset_import",
+    });
+
+    const [bundled] = getRegexScriptsByPresetId(USER_ID, "preset-historical");
+    expect(bundled).toMatchObject({
+      folder: "Historical preset · LumiHub",
+      script_id: "",
+      metadata: {
+        imported_script_id: "shared_preset_import",
+        _lumiverse_lumihub_preset: {
+          id: "hub-preset-1",
+          version: "1.4.0",
+          folderName: "Historical preset",
+        },
+      },
+    });
+    expect(getRegexScriptByScriptId(USER_ID, "shared_preset_import", { presetId: "preset-historical" })?.id)
+      .toBe(bundled.id);
+  });
+
+  test("archives only attributed older preset regexes and never a same-named local folder", () => {
+    const local = createRegexScript(USER_ID, {
+      name: "Local folder peer",
+      find_regex: "local",
+      folder: "Historical preset",
+      disabled: false,
+    }) as RegexScript;
+
+    importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-historical",
+      "Historical preset",
+      [{ name: "Bundled v1", find_regex: "v1", disabled: false }],
+      { source: "lumihub", hubPresetId: "hub-preset-1", presetVersion: "1.0.0" },
+    );
+    const v1 = getRegexScriptsByPresetId(USER_ID, "preset-historical")[0];
+
+    const retired = retireLumiHubPresetRegexScriptsForUpdate(USER_ID, {
+      presetId: "preset-historical",
+      hubPresetId: "hub-preset-1",
+      previousHubPresetId: "hub-preset-1",
+      previousVersion: "1.0.0",
+      incomingVersion: "2.0.0",
+      presetName: "Historical preset",
+    });
+
+    expect(retired).toEqual({ archivedIds: [v1.id], replacedIds: [] });
+    expect(mustGetScript(v1.id)).toMatchObject({
+      disabled: true,
+      folder: "Historical preset · v1.0.0",
+      metadata: { _lumiverse_lumihub_preset: { id: "hub-preset-1", version: "1.0.0" } },
+    });
+    expect(mustGetScript(local.id)).toMatchObject({
+      disabled: false,
+      folder: "Historical preset",
+      metadata: {},
+    });
+
+    const currentFolder = resolveLumiHubPresetRegexInstallFolder(
+      USER_ID,
+      "preset-historical",
+      "hub-preset-1",
+      "Historical preset",
+    );
+    expect(currentFolder).toBe("Historical preset · LumiHub");
+
+    importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-historical",
+      "Historical preset",
+      [{ name: "Bundled v2", find_regex: "v2", disabled: false }],
+      {
+        source: "lumihub",
+        hubPresetId: "hub-preset-1",
+        presetVersion: "2.0.0",
+        folderName: currentFolder,
+      },
+    );
+    const v2 = getRegexScriptsByPresetId(USER_ID, "preset-historical")
+      .find((script) => script.metadata._lumiverse_lumihub_preset?.version === "2.0.0")!;
+
+    activatePresetBoundRegexScripts(USER_ID, "preset-historical");
+    expect(mustGetScript(v1.id).disabled).toBe(true);
+    expect(mustGetScript(v2.id)).toMatchObject({ disabled: false, folder: "Historical preset · LumiHub" });
+    expect(mustGetScript(local.id).disabled).toBe(false);
+  });
+
+  test("moves a legacy unqualified LumiHub folder into the reserved namespace on update", () => {
+    importPresetBoundRegexScripts(
+      USER_ID,
+      "preset-legacy-folder",
+      "Legacy folder preset",
+      [{ name: "Bundled v1", find_regex: "v1", disabled: false }],
+      { source: "lumihub", hubPresetId: "hub-legacy-folder", presetVersion: "1.0.0" },
+    );
+
+    expect(resolveLumiHubPresetRegexInstallFolder(
+      USER_ID,
+      "preset-legacy-folder",
+      "hub-legacy-folder",
+      "Legacy folder preset",
+    )).toBe("Legacy folder preset · LumiHub");
+
+    installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-legacy-folder",
+      presetName: "Legacy folder preset",
+      hubPresetId: "hub-legacy-folder",
+      presetVersion: "2.0.0",
+      previous: {
+        hubPresetId: "hub-legacy-folder",
+        version: "1.0.0",
+        presetName: "Legacy folder preset",
+      },
+      // Real LumiHub exports preserve the author's original folder on every
+      // script. It must not override the host's dedicated LumiHub folder.
+      scripts: [{
+        name: "Bundled v2",
+        find_regex: "v2",
+        folder: "Legacy folder preset",
+        disabled: false,
+      }],
+    });
+
+    const bundled = getRegexScriptsByPresetId(USER_ID, "preset-legacy-folder");
+    expect(bundled.find((script) => script.metadata._lumiverse_lumihub_preset?.version === "1.0.0"))
+      .toMatchObject({ disabled: true, folder: "Legacy folder preset · v1.0.0" });
+    expect(bundled.find((script) => script.metadata._lumiverse_lumihub_preset?.version === "2.0.0"))
+      .toMatchObject({ folder: "Legacy folder preset · LumiHub" });
+  });
+
+  test("preserves every payload folder through a LumiHub update", () => {
+    const install = (version: string) => installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-multiple-folders",
+      presetName: "ThreadBare",
+      hubPresetId: "hub-multiple-folders",
+      presetVersion: version,
+      previous: version === "1.0.0" ? undefined : {
+        hubPresetId: "hub-multiple-folders",
+        version: "1.0.0",
+        presetName: "ThreadBare",
+      },
+      scripts: [
+        { name: `Stella ${version}`, find_regex: `stella-${version}`, folder: "Stella Interactive Cards", disabled: false },
+        { name: `Rules ${version}`, find_regex: `rules-${version}`, folder: "Thread Rules", disabled: false },
+      ],
+    });
+
+    install("1.0.0");
+    expect(getRegexScriptsByPresetId(USER_ID, "preset-multiple-folders").map((script) => script.folder).sort())
+      .toEqual(["Stella Interactive Cards · LumiHub", "Thread Rules · LumiHub"]);
+
+    install("2.0.0");
+    const folders = getRegexScriptsByPresetId(USER_ID, "preset-multiple-folders")
+      .map((script) => script.folder)
+      .sort();
+    expect(folders).toEqual([
+      "Stella Interactive Cards · LumiHub",
+      "Stella Interactive Cards · v1.0.0",
+      "Thread Rules · LumiHub",
+      "Thread Rules · v1.0.0",
+    ]);
+  });
+
+  test("retroactively attributes legacy preset-owned regexes before archiving them", () => {
+    const legacy = createRegexScript(USER_ID, {
+      name: "Legacy bundled regex",
+      find_regex: "legacy",
+      folder: "Legacy preset",
+      preset_id: "preset-legacy",
+    }) as RegexScript;
+
+    const retired = retireLumiHubPresetRegexScriptsForUpdate(USER_ID, {
+      presetId: "preset-legacy",
+      hubPresetId: "hub-new-id",
+      previousHubPresetId: "hub-old-id",
+      previousVersion: "0.9.0",
+      incomingVersion: "1.0.0",
+      presetName: "Legacy preset",
+    });
+
+    expect(retired.archivedIds).toEqual([legacy.id]);
+    expect(mustGetScript(legacy.id)).toMatchObject({
+      disabled: true,
+      folder: "Legacy preset · v0.9.0",
+      metadata: { _lumiverse_lumihub_preset: { id: "hub-new-id", version: "0.9.0" } },
+    });
+  });
+
+  test("rolls back a partial update and preserves the previous enabled set", () => {
+    installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-safe-update",
+      presetName: "Safe update preset",
+      hubPresetId: "hub-safe-update",
+      presetVersion: "1.0.0",
+      scripts: [{ name: "Bundled v1", find_regex: "v1", disabled: false }],
+    });
+    const [v1] = getRegexScriptsByPresetId(USER_ID, "preset-safe-update");
+    activatePresetBoundRegexScripts(USER_ID, "preset-safe-update");
+    expect(mustGetScript(v1.id).disabled).toBe(false);
+
+    expect(() => installLumiHubPresetRegexScripts(USER_ID, {
+      presetId: "preset-safe-update",
+      presetName: "Safe update preset",
+      hubPresetId: "hub-safe-update",
+      presetVersion: "2.0.0",
+      previous: {
+        hubPresetId: "hub-safe-update",
+        version: "1.0.0",
+        presetName: "Safe update preset",
+      },
+      scripts: [
+        { name: "Valid v2", find_regex: "v2", disabled: false },
+        { name: "Invalid v2", find_regex: "(", disabled: false },
+      ],
+    })).toThrow("LumiHub preset regex import was incomplete (1/2)");
+
+    expect(getRegexScriptsByPresetId(USER_ID, "preset-safe-update")).toHaveLength(1);
+    expect(mustGetScript(v1.id)).toMatchObject({
+      disabled: false,
+      folder: "Safe update preset · LumiHub",
+      metadata: { _lumiverse_lumihub_preset: { id: "hub-safe-update", version: "1.0.0" } },
+    });
+  });
 });
 
 describe("raw capture processing", () => {
@@ -855,7 +1291,34 @@ describe("raw capture processing", () => {
   });
 });
 
+describe("trim string processing", () => {
+  test("does not execute disabled scripts passed directly to the executor", async () => {
+    const script = runtimeScript({ disabled: true });
+
+    expect(await applyRegexScripts("x", [script], "ai_output")).toBe("x");
+  });
+
+  test("treats an empty trim string as a no-op", async () => {
+    const script = runtimeScript({ trim_strings: [""] });
+
+    expect(await applyRegexScripts("x", [script], "ai_output")).toBe("y");
+  });
+});
+
 describe("find-only macro processing", () => {
+  test("activation replacements use the bounded assembly snapshot regardless of macro mode or supplied templates", async () => {
+    const snapshot = createActivationInputSnapshot({ chatVariables: { mode: "combat.*" } });
+    for (const substitute_macros of ["none", "find", "raw", "escaped", "after"] as const) {
+      const script = runtimeScript({ preset_id: "preset", find_regex: "{{getchatvar::mode}}", replace_string: "matched", substitute_macros,
+        metadata: { prompt_activation: { source: "user_input", lifetime: "latest", mappings: [{ capture: "0", value: "combat.*", block_ids: ["rules"], enabled: true }] } } });
+      const env = { commit: false, variables: { local: new Map(), global: new Map(), chat: new Map([["mode", "changed"]]) },
+        dynamicMacros: {}, extra: { activationInputSnapshots: new Map([["preset", snapshot]]) } } as any;
+      const templates = { resolvedFindPatterns: new Map([[script.id, ".*"]]) };
+      expect(await applyRegexScripts("combat.* combatXYZ changed", [script], "ai_output", undefined, env, templates)).toBe("matched combatXYZ changed");
+      expect(env.variables.chat.get("mode")).toBe("changed");
+    }
+  });
+
   test("resolves the find pattern without resolving the replacement", async () => {
     const script = runtimeScript({
       find_regex: "{{upper::a}}",
@@ -1050,6 +1513,40 @@ describe("regex match actions", () => {
 });
 
 describe("associative regex actions", () => {
+  test("renders omitted optional named captures as empty action attributes", async () => {
+    const created = createRegexScript(USER_ID, {
+      name: "Optional requirement",
+      find_regex: "<choice>(?<label>[^<]+)</choice>(?:<req>(?<req>[^<]*)</req>)?",
+      replace_string: '<button data-req="$<req>" data-regex-action="choose">$<label></button>',
+      placement: ["ai_output"],
+      target: ["display"],
+      actions: [{
+        id: "choose",
+        type: "send",
+        multi_select: false,
+        cost: "1",
+        limit: "3",
+        title: "$<label>",
+        subtitle: "",
+        content: "Choose $<label>",
+      }],
+    });
+    expect(typeof created).not.toBe("string");
+
+    const output = await applyRegexScripts(
+      "<choice>North</choice>",
+      [created as RegexScript],
+      "ai_output",
+      undefined,
+      undefined,
+      undefined,
+      { source: "display_backend" },
+    );
+
+    expect(output).toContain('data-req=""');
+    expect(output).not.toContain("$<req>");
+  });
+
   test("persists actions and resolves their capture templates per replacement", async () => {
     const created = createRegexScript(USER_ID, {
       name: "Choices",

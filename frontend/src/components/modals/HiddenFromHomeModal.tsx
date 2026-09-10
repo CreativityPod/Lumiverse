@@ -6,6 +6,7 @@ import { CloseButton } from '@/components/shared/CloseButton'
 import { ModalShell } from '@/components/shared/ModalShell'
 import { Spinner } from '@/components/shared/Spinner'
 import { chatsApi } from '@/api/chats'
+import { charactersApi } from '@/api/characters'
 import { useStore } from '@/store'
 import { toast } from '@/lib/toast'
 import type { HiddenRecentChat } from '@/types/api'
@@ -25,6 +26,7 @@ export default function HiddenFromHomeModal() {
   const [tab, setTab] = useState<Tab>('characters')
   const [query, setQuery] = useState('')
   const [hiddenChats, setHiddenChats] = useState<HiddenRecentChat[]>([])
+  const [resolvedCharacterNames, setResolvedCharacterNames] = useState<Record<string, string>>({})
   const [loadingChats, setLoadingChats] = useState(true)
   const [restoringId, setRestoringId] = useState<string | null>(null)
 
@@ -44,10 +46,31 @@ export default function HiddenFromHomeModal() {
     loadHiddenChats()
   }, [loadHiddenChats])
 
+  useEffect(() => {
+    const knownCharacterIds = new Set(characters.map((character) => character.id))
+    const missingIds = hiddenCharacterIds.filter((id) => (
+      !knownCharacterIds.has(id) && !Object.hasOwn(resolvedCharacterNames, id)
+    ))
+    if (missingIds.length === 0) return
+
+    let cancelled = false
+    Promise.allSettled(missingIds.map(async (id) => {
+      const character = await charactersApi.get(id)
+      return [id, character.name] as const
+    })).then((results) => {
+      if (cancelled) return
+      const names = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+      if (names.length === 0) return
+      setResolvedCharacterNames((current) => ({ ...current, ...Object.fromEntries(names) }))
+    })
+
+    return () => { cancelled = true }
+  }, [characters, hiddenCharacterIds, resolvedCharacterNames])
+
   const hiddenCharacters = useMemo(() => hiddenCharacterIds.map((id) => {
     const character = characters.find((item) => item.id === id)
-    return { id, name: character?.name || t('hiddenFromHome.missingCharacter') }
-  }), [characters, hiddenCharacterIds, t])
+    return { id, name: character?.name || resolvedCharacterNames[id] || t('hiddenFromHome.missingCharacter') }
+  }), [characters, hiddenCharacterIds, resolvedCharacterNames, t])
 
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const visibleCharacters = useMemo(() => hiddenCharacters.filter((character) => (

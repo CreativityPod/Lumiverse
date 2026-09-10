@@ -5,6 +5,8 @@ import { EventType, type EventMessage } from "../ws/events";
 import {
   addGroupMember,
   addSwipe,
+  deleteSwipe,
+  setSwipeScopedExtra,
   applyChatAppearance,
   branchChat,
   convertSoloChatToGroup,
@@ -18,6 +20,7 @@ import {
   getPreviousSameRoleContent,
   getTrailingVisibleUserMessageIds,
   listHiddenRecentChats,
+  listGroupChatSummaries,
   listRecentChats,
   listRecentChatsGrouped,
   patchMessageExtra,
@@ -26,6 +29,7 @@ import {
   setGroupMemberAlternateFields,
   updateMessage,
 } from "./chats.service";
+import { makePromptActivationSource, promptActivationSource } from "./prompt-activation.service";
 
 function initChatsTestDb(): void {
   closeDatabase();
@@ -261,6 +265,42 @@ describe("chat lifecycle events", () => {
       unsubscribe();
     }
   });
+
+  test("emits CHAT_FORKED with the source-to-fork message ID map", async () => {
+    seedChat("source-chat", "c1", "Source", "{}", 100);
+    seedMessage("source-message-1", "source-chat", "Opening", {}, { index: 0 });
+    seedMessage("source-message-2", "source-chat", "Reply", {}, { index: 1, isUser: true });
+    seedMessage("source-message-3", "source-chat", "Not copied", {}, { index: 2 });
+
+    const events: EventMessage[] = [];
+    const unsubscribe = eventBus.on(EventType.CHAT_FORKED, (event) => events.push(event));
+
+    try {
+      const fork = branchChat("u1", "source-chat", "source-message-2");
+      expect(fork).not.toBeNull();
+
+      const forkedMessages = getMessages("u1", fork!.id);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.userId).toBe("u1");
+      expect(events[0]?.payload).toEqual(expect.objectContaining({
+        sourceChatId: "source-chat",
+        forkedChatId: fork!.id,
+        forkedAtMessageId: "source-message-2",
+        forkedAtMessageIndex: 1,
+        messageIdMap: {
+          "source-message-1": forkedMessages[0]?.id,
+          "source-message-2": forkedMessages[1]?.id,
+        },
+      }));
+      expect(events[0]?.payload.messageIdMap).not.toHaveProperty("source-message-3");
+      expect(forkedMessages.map((message) => message.id)).not.toContain("source-message-1");
+      expect(forkedMessages.map((message) => message.id)).not.toContain("source-message-2");
+    } finally {
+      unsubscribe();
+    }
+  });
 });
 
 describe("chat message search", () => {
@@ -473,6 +513,36 @@ describe("recent chats", () => {
     expect(result.data[0].is_group).toBe(true);
   });
 
+  test("keeps activation source on the generated swipe through navigation, deletion, and edits", () => {
+    seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+    seedMessage("msg-1", "chat-1", "first swipe", {});
+    addSwipe("u1", "msg-1", "second swipe");
+    cycleSwipe("u1", "msg-1", "left");
+    setSwipeScopedExtra("u1", "msg-1", 1, {
+      promptActivation: makePromptActivationSource("second swipe", "preset", true, "second swipe\n<state>combat</state>"),
+    });
+    expect(getMessage("u1", "msg-1")!.extra.promptActivation).toBeUndefined();
+    const second = cycleSwipe("u1", "msg-1", "right")!;
+    expect(promptActivationSource(second, "preset")).toBe("second swipe\n<state>combat</state>");
+    deleteSwipe("u1", "msg-1", 0);
+    expect(getMessage("u1", "msg-1")!.swipe_id).toBe(0);
+    expect(promptActivationSource(getMessage("u1", "msg-1")!, "preset")).toContain("<state>combat</state>");
+    updateMessage("u1", "msg-1", { content: "Edited", skipChunkRebuild: true });
+    expect(promptActivationSource(getMessage("u1", "msg-1")!, "preset")).toBe("Edited");
+  });
+
+  test("a branch only inherits activation sources up to its fork point", () => {
+    seedChat("chat-1", "c1", "Branch chat", "{}", 100);
+    seedMessage("msg-1", "chat-1", "before activation", {}, { index: 0 });
+    seedMessage("msg-2", "chat-1", "after activation", {
+      promptActivation: makePromptActivationSource("after activation", "preset", true, "after activation\n<state>combat</state>"),
+    }, { index: 1 });
+    const branch = branchChat("u1", "chat-1", "msg-1")!;
+    const messages = getMessages("u1", branch.id);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].extra.promptActivation).toBeUndefined();
+  });
+
   test("keeps reasoning scoped to the swipe it belongs to", () => {
     seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
     seedMessage("msg-1", "chat-1", "first swipe", {
@@ -610,6 +680,23 @@ describe("recent chats", () => {
     expect(restoredSecondSwipe.extra.usage).toEqual({ completion_tokens: 33, total_tokens: 44 });
   });
 
+  test("keeps generation outcomes on their originating swipe through navigation and deletion", () => {
+    seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+    const completed = { finish_reason: "end_turn", stop_details: null };
+    seedMessage("msg-1", "chat-1", "first swipe", { generationOutcome: completed });
+    expect(addSwipe("u1", "msg-1", "")!.extra.generationOutcome).toBeUndefined();
+    cycleSwipe("u1", "msg-1", "left");
+    const refused = { finish_reason: "refusal", stop_details: { type: "refusal", category: null, explanation: null }, error: "Declined" };
+    setSwipeScopedExtra("u1", "msg-1", 1, { generationOutcome: refused });
+    expect(getMessage("u1", "msg-1")!.extra.generationOutcome).toEqual(completed);
+    expect(cycleSwipe("u1", "msg-1", "right")!.extra.generationOutcome).toEqual(refused);
+    const remaining = deleteSwipe("u1", "msg-1", 0)!;
+    expect(remaining.extra.generationOutcome).toEqual(refused);
+    expect(remaining.extra.generationOutcomeBySwipe).toEqual([refused]);
+    setSwipeScopedExtra("u1", "msg-1", 0, { generationOutcome: completed });
+    expect(getMessage("u1", "msg-1")!.extra.generationOutcome).toEqual(completed);
+  });
+
   test("converts a solo chat into a new group chat with copied messages", () => {
     seedChat("solo", "c1", "Alpha chat", JSON.stringify({ author_note: "keep me" }), 200);
     seedMessage("msg-1", "solo", "Hello there", { greeting: true }, { index: 0, sendDate: 100 });
@@ -668,6 +755,27 @@ describe("recent chats", () => {
     expect(group.metadata.branched_from).toBeUndefined();
     expect(group.metadata.branch_at_message).toBeUndefined();
     expect(getChatTree("u1", group.id)?.id).toBe(group.id);
+  });
+
+  test("keeps a forked one-member converted group separate from unrelated solo RPs", () => {
+    seedChat("solo-source", "c1", "Converted RP", "{}", 100);
+    seedMessage("source-msg-1", "solo-source", "Opening", {}, { index: 0 });
+    seedMessage("source-msg-2", "solo-source", "Reply", {}, { index: 1, isUser: true });
+    seedChat("unrelated-solo", "c1", "Other RP", "{}", 300);
+    seedChat("unrelated-solo-fork", "c1", "Other RP — Branch", JSON.stringify({
+      branched_from: "unrelated-solo",
+      branch_at_message: "other-msg",
+    }), 400);
+
+    const converted = convertSoloChatToGroup("u1", "solo-source")!;
+    const convertedMessages = getMessages("u1", converted.id);
+    const fork = branchChat("u1", converted.id, convertedMessages[1].id)!;
+
+    const groupHistory = listGroupChatSummaries("u1", ["c1"]);
+
+    expect(groupHistory.map((chat) => chat.id).sort()).toEqual([converted.id, fork.id].sort());
+    expect(groupHistory.every((chat) => !chat.name.startsWith("Other RP"))).toBe(true);
+    expect(getChat("u1", converted.id)).not.toBeNull();
   });
 });
 

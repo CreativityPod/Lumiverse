@@ -8,6 +8,58 @@ function deferred<T>() {
 }
 
 describe('preset selection coordinator', () => {
+  test('keeps the working preset when a malformed target is rejected', async () => {
+    let activePresetId = 'working'
+    const flushed: string[] = []
+    const coordinator = createPresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (id) => { activePresetId = id! },
+      flushPreset: async (id) => { flushed.push(id) },
+      resolvePresetId: async (id) => ({ presetId: id === 'malformed' ? 'working' : id }),
+    })
+    expect(await coordinator.transition('malformed')).toBe(false)
+    expect(activePresetId).toBe('working')
+    expect(flushed).toEqual([])
+  })
+
+  test('a newer selection wins while target validation is pending', async () => {
+    let activePresetId = 'working'
+    const validation = deferred<boolean>()
+    const coordinator = createPresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (id) => { activePresetId = id! },
+      flushPreset: async () => {},
+      resolvePresetId: async (id) => {
+        if (id === 'slow') await validation.promise
+        return { presetId: id }
+      },
+    })
+    const slow = coordinator.transition('slow')
+    await Promise.resolve()
+    await Promise.resolve()
+    const latest = coordinator.transition('latest')
+    validation.resolve(true)
+    expect(await slow).toBe(false)
+    expect(await latest).toBe(true)
+    expect(activePresetId).toBe('latest')
+  })
+
+  test('recovery preserves malformed pending data instead of flushing it', async () => {
+    let activePresetId = 'malformed'
+    const flushed: string[] = []
+    const coordinator = createPresetSelectionCoordinator({
+      getActivePresetId: () => activePresetId,
+      setActivePresetId: (id) => { activePresetId = id! },
+      flushPreset: async (id) => { flushed.push(id) },
+      resolvePresetId: async (id) => ({ presetId: id }),
+    })
+    expect(await coordinator.transition('fallback', { recoverFromPresetId: 'malformed' })).toBe(true)
+    expect(activePresetId).toBe('fallback')
+    expect(flushed).toEqual([])
+    expect(await coordinator.transition('next', { recoverFromPresetId: 'malformed' })).toBe(true)
+    expect(flushed).toEqual(['fallback'])
+  })
+
   test('flushes the departing preset before exposing the next one', async () => {
     let activePresetId: string | null = 'preset-a'
     const flushed: string[] = []

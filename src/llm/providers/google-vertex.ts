@@ -1,7 +1,8 @@
+import { parseGoogleResponse, readGoogleStream } from "./google-response";
 import type { LlmProvider } from "../provider";
 import { COMMON_PARAMS, type ProviderCapabilities } from "../param-schema";
-import { cancelStreamAndCloseConnection, createCooperativeYielder, fetchWithPreflightAbort, readJsonWithAbort, readWithAbort } from "../stream-utils";
-import { getTextContent, type GenerationRequest, type GenerationResponse, type StreamChunk, type ToolCallResult, type LlmMessage, type LlmMessagePart } from "../types";
+import { fetchWithPreflightAbort, readJsonWithAbort } from "../stream-utils";
+import { getTextContent, type GenerationRequest, type GenerationResponse, type StreamChunk, type LlmMessage, type LlmMessagePart } from "../types";
 import { fetchProviderJson, throwProviderResponseError } from "../../utils/provider-errors";
 import { sanitizeGeminiSchema } from "./google";
 import {
@@ -10,6 +11,8 @@ import {
   GOOGLE_SEARCH_HANDLED_PARAMS,
   GOOGLE_SEARCH_PARAMETERS,
 } from "./google-search";
+import { splitLeadingSystemMessagePrefix } from "../system-message-prefix";
+import { normalizeGoogleMediaMimeType } from "./google-media";
 
 // ── Service account JWT → OAuth2 access token ──────────────────────────────
 
@@ -285,39 +288,7 @@ export class GoogleVertexProvider implements LlmProvider {
     if (!res.ok) await throwProviderResponseError("Vertex AI", "generate", res);
 
     const data = (await readJsonWithAbort<any>(res, request.signal)) as any;
-    const candidate = data.candidates?.[0];
-    const parts = candidate?.content?.parts || [];
-
-    let content = "";
-    let reasoning = "";
-    const fnCalls: ToolCallResult[] = [];
-    for (const p of parts) {
-      if (p.thought) {
-        reasoning += p.text || "";
-      } else if (p.functionCall) {
-        fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
-      } else {
-        content += p.text || "";
-      }
-    }
-
-    const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
-    const groundingMetadata = candidate?.groundingMetadata ?? data.groundingMetadata;
-
-    return {
-      content,
-      reasoning: reasoning || undefined,
-      finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
-      tool_calls: toolCalls,
-      usage: data.usageMetadata
-        ? {
-            prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-            completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-            total_tokens: data.usageMetadata.totalTokenCount || 0,
-            ...(groundingMetadata ? { provider_raw: { groundingMetadata } } : {}),
-          }
-        : undefined,
-    };
+    return parseGoogleResponse(data, this.displayName, request.parameters?._replay_thought_signatures === true);
   }
 
   async *generateStream(
@@ -343,77 +314,7 @@ export class GoogleVertexProvider implements LlmProvider {
 
     if (!res.ok) await throwProviderResponseError("Vertex AI", "stream", res);
 
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    const maybeYield = createCooperativeYielder(64, request.signal);
-
-    let streamDoneNaturally = false;
-    try {
-      while (true) {
-        const { done, value } = await readWithAbort(reader, request.signal);
-        if (done) { streamDoneNaturally = !request.signal?.aborted; break; }
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          await maybeYield();
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data: ")) continue;
-
-          try {
-            const data = JSON.parse(trimmed.slice(6));
-            const candidate = data.candidates?.[0];
-            const parts = candidate?.content?.parts || [];
-            const finishReason = candidate?.finishReason;
-
-            let text = "";
-            let reasoning = "";
-            const fnCalls: ToolCallResult[] = [];
-            for (const p of parts) {
-              if (p.thought) {
-                reasoning += p.text || "";
-              } else if (p.functionCall) {
-                fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
-              } else {
-                text += p.text || "";
-              }
-            }
-
-            const usage = data.usageMetadata
-              ? {
-                  prompt_tokens: data.usageMetadata.promptTokenCount || 0,
-                  completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
-                  total_tokens: data.usageMetadata.totalTokenCount || 0,
-                  ...((candidate?.groundingMetadata ?? data.groundingMetadata)
-                    ? { provider_raw: { groundingMetadata: candidate?.groundingMetadata ?? data.groundingMetadata } }
-                    : {}),
-                }
-              : undefined;
-
-            const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
-
-            if (text || reasoning || toolCalls) {
-              yield {
-                token: text,
-                reasoning: reasoning || undefined,
-                finish_reason: toolCalls ? "tool_calls" : (finishReason === "STOP" ? "stop" : undefined),
-                tool_calls: toolCalls,
-                usage,
-              };
-            } else if (finishReason || usage) {
-              yield { token: "", finish_reason: finishReason === "STOP" ? "stop" : (finishReason || undefined), usage };
-            }
-          } catch {
-            // Skip malformed SSE lines
-          }
-        }
-      }
-    } finally {
-      if (!streamDoneNaturally) await cancelStreamAndCloseConnection(reader, res);
-    }
+    yield* readGoogleStream(res, this.displayName, request.parameters?._replay_thought_signatures === true, request.signal);
   }
 
   async validateKey(apiKey: string, apiUrl: string): Promise<boolean> {
@@ -468,15 +369,37 @@ export class GoogleVertexProvider implements LlmProvider {
 
   // ── Body building (mirrors GoogleProvider.buildBody) ──────────────────
 
-  private formatParts(m: LlmMessage, toolNameById: Map<string, string>): any[] {
-    if (typeof m.content === "string") return [{ text: m.content }];
-    return m.content.map((part: LlmMessagePart) => {
+  private formatParts(
+    m: LlmMessage,
+    toolNameById: Map<string, string>,
+    replayThoughtSignatures: boolean,
+  ): any[] {
+    if (typeof m.content === "string") {
+      return [{
+        text: m.content,
+        ...(m.role === "assistant" && replayThoughtSignatures && m.thought_signature
+          ? { thoughtSignature: m.thought_signature }
+          : {}),
+      }];
+    }
+    const formatted = m.content.map((part: LlmMessagePart) => {
       switch (part.type) {
         case "text":
-          return { text: part.text };
+          return {
+            text: part.text,
+            ...(m.role === "assistant" && replayThoughtSignatures && part.thought_signature
+              ? { thoughtSignature: part.thought_signature }
+              : {}),
+          };
         case "image":
         case "audio":
-          return { inlineData: { mimeType: part.mime_type, data: part.data } };
+        case "video":
+          return {
+            inlineData: {
+              mimeType: normalizeGoogleMediaMimeType(part.mime_type),
+              data: part.data,
+            },
+          };
         case "tool_use":
           return { functionCall: { name: part.name, args: part.input }, thoughtSignature: part.thought_signature || "context_engineering_is_the_way_to_go" };
         case "tool_result": {
@@ -491,6 +414,13 @@ export class GoogleVertexProvider implements LlmProvider {
           return { text: "" };
       }
     });
+    if (m.role === "assistant" && replayThoughtSignatures && m.thought_signature) {
+      const target = [...formatted].reverse().find((part) =>
+        Object.hasOwn(part, "text") || Object.hasOwn(part, "inlineData"),
+      );
+      if (target) target.thoughtSignature = m.thought_signature;
+    }
+    return formatted;
   }
 
   private buildToolNameMap(messages: readonly LlmMessage[]): Map<string, string> {
@@ -504,7 +434,7 @@ export class GoogleVertexProvider implements LlmProvider {
     return map;
   }
 
-  private static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "_streaming"]);
+  private static readonly INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "_streaming", "_replay_thought_signatures"]);
 
   private static readonly HANDLED_PARAMS = new Set([
     "temperature", "max_tokens", "top_p", "top_k", "stop", "thinkingConfig",
@@ -515,9 +445,13 @@ export class GoogleVertexProvider implements LlmProvider {
   private buildBody(request: GenerationRequest): any {
     const params = request.parameters || {};
 
-    const systemMessages = request.messages.filter((m) => m.role === "system");
-    const otherMessages = request.messages.filter((m) => m.role !== "system");
+    // Vertex exposes a single systemInstruction. Preserve any system message
+    // after the leading prefix in-place as user-role content so configured
+    // in-history/post-history depth remains meaningful.
+    const { prefix: systemMessages, remainder: otherMessages } =
+      splitLeadingSystemMessagePrefix(request.messages);
     const toolNameById = this.buildToolNameMap(request.messages);
+    const replayThoughtSignatures = params._replay_thought_signatures === true;
     const functionTools = request.tools ?? [];
     const hasFunctionDeclarations = functionTools.length > 0;
     const googleSearchTool = buildGoogleSearchTool(
@@ -530,7 +464,7 @@ export class GoogleVertexProvider implements LlmProvider {
     const body: any = {
       contents: otherMessages.map((m) => ({
         role: m.role === "assistant" ? "model" : "user",
-        parts: this.formatParts(m, toolNameById),
+        parts: this.formatParts(m, toolNameById, replayThoughtSignatures),
       })),
     };
 

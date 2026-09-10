@@ -1,7 +1,7 @@
 export interface MessageAttachment {
-  type: "image" | "audio";
-  image_id: string;           // FK to images table (used for both image and audio)
-  mime_type: string;          // e.g. "image/png", "audio/wav"
+  type: "image" | "audio" | "video";
+  image_id: string;           // Polymorphic media ID retained for wire compatibility
+  mime_type: string;          // e.g. "image/png", "audio/wav", "video/mp4"
   original_filename: string;
   width?: number;             // images only
   height?: number;            // images only

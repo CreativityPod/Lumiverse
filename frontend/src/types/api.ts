@@ -212,7 +212,7 @@ export interface CharacterTtsExtension {
 
 // ---- Message Attachment ----
 export interface MessageAttachment {
-  type: "image" | "audio";
+  type: "image" | "audio" | "video";
   image_id: string;
   mime_type: string;
   original_filename: string;
@@ -268,6 +268,8 @@ export interface Message {
   parent_message_id: string | null;
   branch_id: string | null;
   created_at: number;
+  /** Optimistic-concurrency token from messages.revision (server default 1). */
+  revision?: number;
 }
 
 export interface ChatMessageSearchMatch {
@@ -349,6 +351,7 @@ export interface ConnectionModelsResult {
 }
 
 export interface EmbeddingModelsPreviewInput {
+  profile_id?: string
   provider?: EmbeddingConfig['provider']
   api_url?: string
   api_key?: string
@@ -585,6 +588,7 @@ export interface TtsConnectionVoicesPreviewInput {
   provider: string;
   api_url?: string;
   api_key?: string;
+  metadata?: Record<string, any>;
 }
 
 export interface TtsConnectionModelsPreviewInput {
@@ -592,6 +596,7 @@ export interface TtsConnectionModelsPreviewInput {
   provider: string;
   api_url?: string;
   api_key?: string;
+  metadata?: Record<string, any>;
 }
 
 export interface QwenCustomVoice {
@@ -782,6 +787,7 @@ export interface PresetRegistryItem {
   name: string;
   provider: string;
   block_count: number;
+  cover_url?: string | null;
   updated_at: number;
 }
 
@@ -789,6 +795,8 @@ export interface PresetRegistryItem {
 export interface CharacterGalleryItem {
   id: string;
   image_id: string;
+  /** Portable source for Markdown image embeds, preserved across CharX installs. */
+  reference: string;
   caption: string;
   sort_order: number;
   created_at: number;
@@ -1260,7 +1268,7 @@ export interface WorldBookEntryBulkActionResult {
   target_book_id?: string;
 }
 
-export type EmbeddingProvider = 'openai-compatible' | 'openai' | 'openrouter' | 'electronhub' | 'bananabread' | 'nanogpt' | 'nvidia-nim' | 'google_vertex';
+export type EmbeddingProvider = 'openai-compatible' | 'openai' | 'mistral' | 'cohere' | 'openrouter' | 'electronhub' | 'bananabread' | 'nanogpt' | 'nvidia-nim' | 'google_vertex';
 
 export interface EmbeddingProviderProfile {
   api_url: string;
@@ -1541,6 +1549,19 @@ export interface BulkImportResultItem {
 export interface BulkImportResult {
   results: BulkImportResultItem[]
   summary: { total: number; imported: number; skipped: number; failed: number }
+}
+
+export type CharacterImportJobStatus = 'accepting' | 'processing' | 'complete' | 'cancelled' | 'error'
+
+export interface CharacterImportJob {
+  jobId: string
+  status: CharacterImportJobStatus
+  total: number
+  uploaded: number
+  processed: number
+  results: BulkImportResultItem[]
+  summary: { total: number; imported: number; skipped: number; failed: number }
+  error?: string
 }
 
 export interface BulkPersonaImportResult {

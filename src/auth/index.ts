@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { createOAuthAccountIssuer } from "better-auth/db";
 import { username, admin, bearer, genericOAuth } from "better-auth/plugins";
 import { getDb } from "../db/connection";
 import { env } from "../env";
@@ -9,28 +10,38 @@ import { listEnabledSsoAuthConfigs } from "../services/sso-providers.service";
 
 // ─── Signup gate ────────────────────────────────────────────────────────
 // All signups are blocked unless a valid nonce is presented.
-// Nonces are single-use, short-lived (10s), and cryptographically random.
+// Nonces are single-use, short-lived (10s), cryptographically random, and
+// tracked as a small set so concurrent admin-created signups don't race on a
+// single slot (the previous single-slot design made one valid nonce unusable
+// when two creations were in flight, and burned it on the first failure).
 
-let creationNonce: string | null = null;
-let creationNonceExpiry = 0;
+const CREATION_NONCE_TTL_MS = 10_000;
+const MAX_OUTSTANDING_NONCES = 16;
+const outstandingNonces = new Map<string, number>(); // nonce → expiry
 
 export const CREATION_NONCE_HEADER = "x-lumiverse-creation-nonce";
 
 export function allowCreation(): string {
-  creationNonce = crypto.randomUUID();
-  creationNonceExpiry = Date.now() + 10_000;
-  return creationNonce;
+  // Bound memory: drop expired entries first, then evict oldest if still full.
+  const now = Date.now();
+  for (const [nonce, expiry] of outstandingNonces) {
+    if (now > expiry) outstandingNonces.delete(nonce);
+  }
+  if (outstandingNonces.size >= MAX_OUTSTANDING_NONCES) {
+    const oldest = [...outstandingNonces.entries()].sort((a, b) => a[1] - b[1])[0];
+    if (oldest) outstandingNonces.delete(oldest[0]);
+  }
+  const nonce = crypto.randomUUID();
+  outstandingNonces.set(nonce, now + CREATION_NONCE_TTL_MS);
+  return nonce;
 }
 
 function consumeNonce(expectedNonce: string | null): boolean {
-  if (!creationNonce) return false;
-  if (Date.now() > creationNonceExpiry) {
-    creationNonce = null;
-    return false;
-  }
-  if (creationNonce !== expectedNonce) return false;
-  creationNonce = null; // single use
-  return true;
+  if (!expectedNonce) return false;
+  const expiry = outstandingNonces.get(expectedNonce);
+  if (expiry === undefined) return false;
+  outstandingNonces.delete(expectedNonce); // single use
+  return Date.now() <= expiry;
 }
 
 // ─── BetterAuth instance ────────────────────────────────────────────────
@@ -74,6 +85,14 @@ export const auth = betterAuth({
     minPasswordLength: 8,
     maxPasswordLength: 128,
   },
+  // Sessions are sliding: active clients renew after one day and remain
+  // signed in for seven days after their latest renewal. requireAuth forwards
+  // Better Auth's replacement cookie so the browser lifetime stays aligned
+  // with the renewed database row.
+  session: {
+    expiresIn: 7 * 24 * 60 * 60,
+    updateAge: 24 * 60 * 60,
+  },
   plugins: [
     username({
       usernameNormalization: (u) => u.toLowerCase(),
@@ -91,6 +110,10 @@ export const auth = betterAuth({
       ? [genericOAuth({
           config: ssoConfigs.map((provider) => ({
             providerId: provider.providerId,
+            // Preserve Better Auth 1.6's provider-scoped account identity.
+            // Without this explicit namespace, 1.7 discovery providers use
+            // their protocol issuer and can merge aliases for one authority.
+            accountIssuer: createOAuthAccountIssuer(provider.providerId),
             clientId: provider.clientId,
             clientSecret: provider.clientSecret,
             discoveryUrl: provider.discoveryUrl,

@@ -14,6 +14,8 @@ import type { Character } from '@/types/api'
 import styles from './GroupChatCreatorModal.module.css'
 import clsx from 'clsx'
 import { clearSearchOnEscape } from '@/lib/clearableSearch'
+import { getGreetingTitle } from '@/lib/greetingMetadata'
+import { getGreetingCellImageUrl } from '@/lib/greetingImage'
 
 type Step = 'characters' | 'greeting' | 'settings'
 type GroupCardMode = 'swap' | 'merge_ignore_muted' | 'merge'
@@ -25,6 +27,7 @@ interface GreetingOption {
   greetingIndex: number
   label: string
   content: string
+  backgroundImageUrl: string | null
 }
 
 export default function GroupChatCreatorModal() {
@@ -109,8 +112,9 @@ export default function GroupChatCreatorModal() {
           characterId: char.id,
           characterName: char.name,
           greetingIndex: 0,
-          label: t('defaultGreeting'),
+          label: getGreetingTitle(char.extensions, 0) || t('defaultGreeting'),
           content: char.first_mes,
+          backgroundImageUrl: getGreetingCellImageUrl(char, 0, char.first_mes),
         })
       }
       if (char.alternate_greetings) {
@@ -120,8 +124,10 @@ export default function GroupChatCreatorModal() {
               characterId: char.id,
               characterName: char.name,
               greetingIndex: i + 1,
-              label: tg('greetingNumber', { number: i + 2 }),
+              label: getGreetingTitle(char.extensions, i + 1)
+                || tg('greetingNumber', { number: i + 2 }),
               content: g,
+              backgroundImageUrl: getGreetingCellImageUrl(char, i + 1, g),
             })
           }
         })
@@ -345,6 +351,11 @@ export default function GroupChatCreatorModal() {
                         })
                       }
                     >
+                      {opt.backgroundImageUrl && (
+                        <div className={styles.greetingBanner} aria-hidden="true">
+                          <img src={opt.backgroundImageUrl} alt="" loading="lazy" />
+                        </div>
+                      )}
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between' }}>
                         <div>
                           <span className={styles.greetingCharName}>{opt.characterName}</span>

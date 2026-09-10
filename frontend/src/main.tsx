@@ -6,7 +6,9 @@ import { registerSW } from 'virtual:pwa-register'
 import { getSafeInAppNavigationUrl } from './lib/navigationSafety'
 import { installWindowOpenGuard } from './lib/windowOpenGuard'
 import { computeViewportKeyboardInset } from './lib/viewportKeyboardInset'
+import { installKeyboardFocusReveal } from './lib/keyboardFocusReveal'
 import { rememberRegistration } from './lib/swUpdater'
+import { claimServiceWorkerReload } from './lib/swUpdatePolicy'
 import { installPwaLifecycleDiagnostics } from './lib/pwaLifecycleDiagnostics'
 import { initializeSafeThemeMode } from './lib/safeThemeMode'
 import { router } from './router'
@@ -31,6 +33,10 @@ registerSW({
   // registration lifecycle instead of duplicating it with a browser listener.
   onNeedReload() {
     if (reloading) return
+    if (!claimServiceWorkerReload(window.sessionStorage)) {
+      console.warn('[service-worker] Suppressed repeated automatic reload')
+      return
+    }
     reloading = true
     window.location.reload()
   },
@@ -221,36 +227,6 @@ function findScrollableAncestor(el: HTMLElement | null): { el: HTMLElement; hori
   return null
 }
 
-// Utility: find the nearest ancestor with overflow-y: auto or scroll,
-// regardless of whether content currently overflows. Used by the focusin
-// handler to find containers that can be given scroll room via CSS padding.
-function findScrollContainer(el: HTMLElement | null): HTMLElement | null {
-  while (el && el !== document.body && el !== document.documentElement) {
-    const { overflowY } = getComputedStyle(el)
-    if (overflowY === 'auto' || overflowY === 'scroll') return el
-    el = el.parentElement
-  }
-  return null
-}
-
-function revealFocusedTargetInContainer(target: HTMLElement, container: HTMLElement) {
-  const targetRect = target.getBoundingClientRect()
-  const containerRect = container.getBoundingClientRect()
-  const viewportBottom = window.visualViewport?.height ?? window.innerHeight
-  const visibleTop = Math.max(containerRect.top, 0) + 12
-  const visibleBottom = Math.min(containerRect.bottom, viewportBottom) - 18
-
-  let delta = 0
-  if (targetRect.bottom > visibleBottom) {
-    delta = targetRect.bottom - visibleBottom
-  } else if (targetRect.top < visibleTop) {
-    delta = targetRect.top - visibleTop
-  }
-
-  if (Math.abs(delta) < 1) return
-  container.scrollTop += delta
-}
-
 // ── iOS PWA: counteract visual viewport scroll ──
 // When the virtual keyboard opens in standalone mode, iOS scrolls the visual
 // viewport upward to reveal the focused input. This shifts the entire layout
@@ -403,31 +379,9 @@ if ((window.navigator as any).standalone === true && navigator.maxTouchPoints > 
     }
   }, { passive: false })
 
-  // ── Scroll focused inputs above the keyboard via container scroll ──
-  // Since we always counteract iOS's visual viewport scroll (scrollTo 0),
-  // the layout never shifts — tabs and headers stay in place. To reveal
-  // focused inputs behind the keyboard, we scroll the nearest scroll
-  // container (panelContent, modal content). Keyboard-height padding-bottom
-  // on these containers (set via CSS) creates scroll room even when the
-  // actual content is shorter than the container.
-  document.addEventListener('focusin', (e) => {
-    const target = e.target
-    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement ||
-          (target instanceof HTMLElement && target.isContentEditable))) return
-
-    // The chat InputArea self-positions above the keyboard via
-    // --app-keyboard-inset-bottom; scrolling an ancestor here drags the
-    // absolutely-positioned bar upward with the content (regression: input
-    // "flies to top" on focus).
-    if ((target as HTMLElement).closest('[data-component="InputArea"]')) return
-
-    const container = findScrollContainer((target as HTMLElement).parentElement)
-    if (!container) return
-
-    setTimeout(() => {
-      revealFocusedTargetInContainer(target as HTMLElement, container)
-    }, 350)
-  })
+  // Ordinary fields need ancestor scrolling because PWA viewport panning is
+  // suppressed. Bounded editors retain native caret/scroll ownership.
+  installKeyboardFocusReveal()
 }
 
 // ── Mobile layout recovery after native popups / backgrounding ──

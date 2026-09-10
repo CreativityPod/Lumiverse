@@ -3,6 +3,7 @@ import { getDb } from "../db/connection";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
 import { getVapidPrivateJWK } from "../crypto/vapid";
+import { validateHost, SSRFError } from "../utils/safe-fetch";
 import { getSetting } from "./settings.service";
 import type {
   PushSubscriptionRecord,
@@ -120,6 +121,28 @@ export async function sendPushToUser(
             },
           },
         });
+        // Re-validate at send time. Registration-time validation (HTTPS +
+        // private-range block) can be defeated later by DNS rebinding: a
+        // public hostname that flips to an internal address after signup
+        // would otherwise turn every generation into an internal POST.
+        try {
+          const parsedEndpoint = new URL(request.endpoint);
+          if (parsedEndpoint.protocol !== "https:") {
+            throw new SSRFError("Push endpoint must use HTTPS");
+          }
+          await validateHost(parsedEndpoint.hostname);
+        } catch (err) {
+          if (err instanceof SSRFError) {
+            console.warn(`[push] Skipping ${sub.id}: endpoint failed SSRF validation (${err.message})`);
+            return;
+          }
+          throw err;
+        }
+
+        // Presence can change while encryption and DNS validation are in
+        // flight. Suppress before delivery: WebKit requires every received
+        // push to display a notification, even if the PWA is now foregrounded.
+        if (eventBus.isUserVisible(userId)) return;
 
         // Send via fetch (Bun-native, no Node http/https needed)
         const response = await fetch(request.endpoint, {
@@ -221,7 +244,7 @@ export async function dispatchGenerationEndedPush(
   if (!prefs.enabled) return { sent: 0, reason: "disabled" };
 
   // Presence is user-wide, not device-local: if any Lumiverse session is
-  // currently visible and focused, suppress push fanout to every device.
+  // currently visible, suppress push fanout to every device.
   if (eventBus.isUserVisible(userId)) {
     return { sent: 0, reason: "user_active" };
   }

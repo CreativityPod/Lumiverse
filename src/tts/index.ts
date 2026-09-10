@@ -5,6 +5,8 @@ import { KokoroTtsProvider } from "./providers/kokoro";
 import { OpenRouterTtsProvider } from "./providers/openrouter-tts";
 import { CartesiaTtsProvider } from "./providers/cartesia";
 import { Qwen3TtsServerProvider } from "./providers/qwen3-tts-server";
+import { GoogleTtsProvider } from "./providers/google-tts";
+import { GoogleVertexTtsProvider } from "./providers/google-vertex-tts";
 
 registerTtsProvider(new CartesiaTtsProvider());
 registerTtsProvider(new OpenAITtsProvider());
@@ -12,3 +14,5 @@ registerTtsProvider(new ElevenLabsTtsProvider());
 registerTtsProvider(new KokoroTtsProvider());
 registerTtsProvider(new OpenRouterTtsProvider());
 registerTtsProvider(new Qwen3TtsServerProvider());
+registerTtsProvider(new GoogleTtsProvider());
+registerTtsProvider(new GoogleVertexTtsProvider());

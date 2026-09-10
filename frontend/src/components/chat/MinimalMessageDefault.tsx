@@ -64,6 +64,8 @@ export interface MinimalMessageDefaultProps {
   isContextAnchor: boolean
   handleEdit: () => void
   handleSaveEdit: () => void
+  handleEditAndSend: () => void
+  editAndSendPending: boolean
   handleCancelEdit: () => void
   handleDelete: () => void
   handleToggleHidden: () => void
@@ -180,8 +182,8 @@ export default function MinimalMessageDefault({
   isEditing, editContent, setEditContent, editReasoning, setEditReasoning, showReasoningEditor,
   isUser, isActivelyStreaming, displayContent, reasoning, reasoningDuration, reasoningStartedAt,
   tokenCount, generationMetrics, avatarUrl, fullAvatarUrl, displayAvatarUrl, displayName, macroUserName, isHidden, isContextAnchor,
-  handleEdit, handleSaveEdit, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
-  handleFork, handlePromptBreakdown,
+  handleEdit, handleSaveEdit, handleEditAndSend, handleCancelEdit, handleDelete, handleToggleHidden, handleToggleContextAnchor,
+  handleFork, handlePromptBreakdown, editAndSendPending,
 }: MinimalMessageDefaultProps) {
   const { t } = useTranslation('chat')
   const { t: tc } = useTranslation('common')
@@ -189,8 +191,8 @@ export default function MinimalMessageDefault({
   const swipeGesturesEnabled = useStore((s) => s.swipeGesturesEnabled)
   const showMessageTokenCount = useStore((s) => s.showMessageTokenCount ?? true)
   const messageContextMenuEnabled = useStore((s) => s.messageContextMenuEnabled ?? true)
-  // Keep a MessageAudioSlot wrapper mounted on every assistant bubble
-  // when TTS is enabled, OR whenever an audio attachment already exists.
+  // Keep a MessageAudioSlot wrapper mounted on every assistant bubble when
+  // TTS is enabled, and on either side whenever an audio attachment exists.
   // See BubbleMessageDefault for the full rationale.
   const ttsEnabled = useStore((s) => s.voiceSettings.ttsEnabled)
   // Audio is per-swipe: see BubbleMessageDefault for the full rationale.
@@ -200,7 +202,7 @@ export default function MinimalMessageDefault({
       a && a.type === 'audio' && (a.swipe_id === undefined || a.swipe_id === message.swipe_id),
     ) ?? null
   }, [message.extra?.attachments, message.swipe_id])
-  const renderAudioSlot = !isEditing && (ttsEnabled || !!audioAttachment) && !message.is_user
+  const renderAudioSlot = !isEditing && (!!audioAttachment || (ttsEnabled && !message.is_user))
   const isHighlighted = useStore((s) => s.highlightedMessageId === message.id)
 
   const cardRef = useRef<HTMLDivElement>(null)
@@ -231,6 +233,9 @@ export default function MinimalMessageDefault({
     confirmDelete,
     cancelDelete,
   } = useMessagePlayback(message.id, message.content, message.name, message.is_user)
+  // Uploaded user audio owns its own inline player. Keep the TTS action from
+  // treating that recording as generated speech that can be regenerated.
+  const canUseTtsAction = canPlay && (!isUser || !audioAttachment)
   const canOpenContextMenu = !isEditing && !isSelectMode && messageContextMenuEnabled
 
   const closeContextMenu = useCallback(() => setContextMenuPos(null), [])
@@ -289,7 +294,7 @@ export default function MinimalMessageDefault({
       icon: <Pencil size={14} />,
       onClick: () => contextAction(handleEdit),
     },
-    ...(canPlay ? [{
+    ...(canUseTtsAction ? [{
       key: 'play',
       label: isGenerating
         ? t('messageActions.cancelTtsGeneration')
@@ -336,7 +341,7 @@ export default function MinimalMessageDefault({
       onClick: () => contextAction(handleDelete),
     },
   ], [
-    canPlay, contextAction, handleCopy, handleDelete, handleEdit, handleFork,
+    canUseTtsAction, contextAction, handleCopy, handleDelete, handleEdit, handleFork,
     handlePromptBreakdown, handleToggleHidden, handleToggleContextAnchor, hasSavedAudio, isGenerating, isHidden, isContextAnchor, isPlaying, isUser,
     togglePlayback, t, tc,
   ])
@@ -405,6 +410,7 @@ export default function MinimalMessageDefault({
             generationMetrics={generationMetrics}
             showTokenCount={showMessageTokenCount}
           />
+          <span data-spindle-mount="message_header" data-spindle-scope={`message:${message.id}:minimal:header`} style={{ display: 'contents' }} />
         </div>
 
         {/* Reasoning block — hidden during editing since the edit area shows it inline */}
@@ -423,12 +429,16 @@ export default function MinimalMessageDefault({
         )}
 
         {/* Content */}
+        <span data-spindle-mount="message_body_before" data-spindle-scope={`message:${message.id}:minimal:body-before`} style={{ display: 'contents' }} />
         {isEditing ? (
           <MessageEditArea
             editContent={editContent}
             onChangeContent={setEditContent}
             onSave={handleSaveEdit}
             onCancel={handleCancelEdit}
+            onEditAndSend={isUser ? handleEditAndSend : undefined}
+            messageId={message.id}
+            editAndSendDisabled={editAndSendPending}
             editReasoning={showReasoningEditor ? editReasoning : undefined}
             onChangeReasoning={showReasoningEditor ? setEditReasoning : undefined}
           />
@@ -446,6 +456,7 @@ export default function MinimalMessageDefault({
         ) : isActivelyStreaming ? (
           <StreamingIndicator />
         ) : null}
+        <span data-spindle-mount="message_body_after" data-spindle-scope={`message:${message.id}:minimal:body-after`} style={{ display: 'contents' }} />
 
         {/* User attachments render after content */}
         {isUser && message.extra?.attachments && message.extra.attachments.length > 0 && !isEditing && (
@@ -470,11 +481,13 @@ export default function MinimalMessageDefault({
         {!isUser && !isEditing && message.index_in_chat !== 0 && (
           <SwipeControls message={message} chatId={chatId} />
         )}
+        <span data-spindle-mount="message_swipe_indicators" data-spindle-scope={`message:${message.id}:minimal:swipe-indicators`} style={{ display: 'contents' }} />
 
         {/* Greeting navigator for first message */}
         {message.index_in_chat === 0 && !isUser && !isEditing && (
           <GreetingNav message={message} chatId={chatId} />
         )}
+        <span data-spindle-mount="message_footer" data-spindle-scope={`message:${message.id}:minimal:footer`} style={{ display: 'contents' }} />
       </div>
 
       {/* Actions (hidden in select mode) */}
@@ -487,7 +500,7 @@ export default function MinimalMessageDefault({
             onToggleContextAnchor={handleToggleContextAnchor}
             onFork={handleFork}
             onPromptBreakdown={!isUser ? handlePromptBreakdown : undefined}
-            onPlay={canPlay ? togglePlayback : undefined}
+            onPlay={canUseTtsAction ? togglePlayback : undefined}
             isPlaying={isPlaying}
             isGenerating={isGenerating}
             hasSavedAudio={hasSavedAudio}

@@ -1,8 +1,43 @@
-import { useState, useEffect, useCallback, useMemo, useRef, useSyncExternalStore } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, useSyncExternalStore, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
-import { RefreshCw, RotateCw, Trash2, Github, Plus, ChevronDown, Download, FolderOpen, SlidersHorizontal, Bell, BellOff } from 'lucide-react'
+import {
+  Bell,
+  BellOff,
+  ChevronDown,
+  ChevronRight,
+  Download,
+  FolderOpen,
+  Github,
+  GripVertical,
+  LayoutGrid,
+  List,
+  Plus,
+  RefreshCw,
+  RotateCw,
+  Search,
+  SlidersHorizontal,
+  Trash2,
+  X,
+} from 'lucide-react'
 import { IconVersions } from '@tabler/icons-react'
+import {
+  DndContext,
+  KeyboardSensor,
+  MouseSensor,
+  TouchSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
 import { useStore } from '@/store'
 import { spindleApi } from '@/api/spindle'
 import type { ExtensionInfo, SpindlePermission } from 'lumiverse-spindle-types'
@@ -11,17 +46,19 @@ import SpindleSettings from './SpindleSettings'
 import { Spinner } from '@/components/shared/Spinner'
 import ConfirmationModal from '@/components/shared/ConfirmationModal'
 import { getSafeHttpsUrl } from '@/lib/navigationSafety'
+import { useScaledSortableStyle } from '@/lib/dndUiScale'
 import {
   getExtensionMountPointsVersion,
   hasExtensionMountPoint,
   subscribeExtensionMountPoints,
 } from '@/lib/spindle/loader'
 import { toast } from '@/lib/toast'
-import { SortControl } from '@/components/shared/SortControl'
 import styles from './SpindlePanel.module.css'
 import clsx from 'clsx'
 import {
   EXTENSION_SORT_OPTIONS,
+  filterExtensions,
+  reconcileExtensionOrder,
   sortExtensions,
   type ExtensionSortMode,
 } from './spindle-extension-sort'
@@ -30,6 +67,98 @@ interface EnableAllPermissionsTarget {
   extensionId: string
   extensionName: string
   permissions: string[]
+}
+
+type ExtensionViewMode = 'cards' | 'list'
+
+interface ExtensionPanelPreferences {
+  sortMode: ExtensionSortMode
+  viewMode: ExtensionViewMode
+  manualOrder: string[]
+}
+
+const EXTENSION_PANEL_PREFS_KEY = 'lumiverse:spindle:extension-panel-preferences'
+
+const DEFAULT_PANEL_PREFERENCES: ExtensionPanelPreferences = {
+  sortMode: 'installed',
+  viewMode: 'cards',
+  manualOrder: [],
+}
+
+const SORT_LABEL_FALLBACKS: Record<ExtensionSortMode, string> = {
+  manual: 'Manual',
+  installed: 'Recently installed',
+  updated: 'Recently updated',
+  'name-asc': 'Name A–Z',
+  'name-desc': 'Name Z–A',
+}
+
+function readPanelPreferences(): ExtensionPanelPreferences {
+  if (typeof window === 'undefined') return DEFAULT_PANEL_PREFERENCES
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(EXTENSION_PANEL_PREFS_KEY) || '{}') as Partial<ExtensionPanelPreferences>
+    const sortMode = EXTENSION_SORT_OPTIONS.some((option) => option.value === parsed.sortMode)
+      ? parsed.sortMode as ExtensionSortMode
+      : DEFAULT_PANEL_PREFERENCES.sortMode
+    const viewMode = parsed.viewMode === 'list' ? 'list' : 'cards'
+    const manualOrder = Array.isArray(parsed.manualOrder)
+      ? parsed.manualOrder.filter((id): id is string => typeof id === 'string')
+      : []
+    return { sortMode, viewMode, manualOrder }
+  } catch {
+    return DEFAULT_PANEL_PREFERENCES
+  }
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function SortableExtensionCard({
+  id,
+  dragEnabled,
+  className,
+  children,
+  dragLabel,
+}: {
+  id: string
+  dragEnabled: boolean
+  className: string
+  children: ReactNode
+  dragLabel: string
+}) {
+  const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({
+    id,
+    disabled: !dragEnabled,
+  })
+  const { setNodeRef, style } = useScaledSortableStyle({
+    setNodeRef: setSortableRef,
+    transform,
+    transition,
+    isDragging,
+  })
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={clsx(className, dragEnabled && styles.extensionCardManual, isDragging && styles.extensionCardDragging)}
+    >
+      {dragEnabled && (
+        <button
+          type="button"
+          className={styles.dragHandle}
+          aria-label={dragLabel}
+          title={dragLabel}
+          {...attributes}
+          {...listeners}
+        >
+          <GripVertical size={15} />
+        </button>
+      )}
+      {children}
+    </div>
+  )
 }
 
 export default function SpindlePanel() {
@@ -87,7 +216,18 @@ export default function SpindlePanel() {
   const [confirmUpdateAllOpen, setConfirmUpdateAllOpen] = useState(false)
   const [enableAllPermissionsTarget, setEnableAllPermissionsTarget] = useState<EnableAllPermissionsTarget | null>(null)
   const [bulkPermissionExtensionId, setBulkPermissionExtensionId] = useState<string | null>(null)
-  const [extensionSortMode, setExtensionSortMode] = useState<ExtensionSortMode>('installed')
+  const [extensionSearch, setExtensionSearch] = useState('')
+  const [extensionSortMode, setExtensionSortMode] = useState<ExtensionSortMode>(() => readPanelPreferences().sortMode)
+  const [extensionViewMode, setExtensionViewMode] = useState<ExtensionViewMode>(() => readPanelPreferences().viewMode)
+  const [manualExtensionOrder, setManualExtensionOrder] = useState<string[]>(() => readPanelPreferences().manualOrder)
+  const [expandedListRows, setExpandedListRows] = useState<Set<string>>(() => new Set())
+  const [expandedPermissionRows, setExpandedPermissionRows] = useState<Set<string>>(() => new Set())
+
+  const extensionDragSensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  )
 
   // Branch selection for install
   const [installBranches, setInstallBranches] = useState<string[]>([])
@@ -121,6 +261,24 @@ export default function SpindlePanel() {
     if (useStore.getState().extensions.length > 0) return
     loadExtensions()
   }, [loadExtensions])
+
+  useEffect(() => {
+    if (extensions.length === 0) return
+    setManualExtensionOrder((current) => {
+      const reconciled = reconcileExtensionOrder(extensions, current)
+      return sameStringArray(current, reconciled) ? current : reconciled
+    })
+  }, [extensions])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const preferences: ExtensionPanelPreferences = {
+      sortMode: extensionSortMode,
+      viewMode: extensionViewMode,
+      manualOrder: manualExtensionOrder,
+    }
+    window.localStorage.setItem(EXTENSION_PANEL_PREFS_KEY, JSON.stringify(preferences))
+  }, [extensionSortMode, extensionViewMode, manualExtensionOrder])
 
   useEffect(() => {
     if (!addMenuOpen) return
@@ -342,16 +500,18 @@ export default function SpindlePanel() {
     return isPrivileged || (scope === 'user' && !!user?.id && installedBy === user.id)
   })
   const manageableCount = manageableExtensions.length
+  const filteredExtensions = useMemo(
+    () => filterExtensions(extensions, extensionSearch),
+    [extensions, extensionSearch],
+  )
   const sortedExtensions = useMemo(
-    () => sortExtensions(extensions, extensionSortMode),
-    [extensions, extensionSortMode],
+    () => sortExtensions(filteredExtensions, extensionSortMode, manualExtensionOrder),
+    [filteredExtensions, extensionSortMode, manualExtensionOrder],
   )
   const extensionSortOptions = EXTENSION_SORT_OPTIONS.map((option) => ({
     value: option.value,
-    label: t(`spindlePanel.sort.${option.labelKey}`),
+    label: t(`spindlePanel.sort.${option.labelKey}`, { defaultValue: SORT_LABEL_FALLBACKS[option.value] }),
   }))
-  const extensionSortLabel = extensionSortOptions.find((option) => option.value === extensionSortMode)?.label
-    ?? t('spindlePanel.sort.dateInstalled')
   const extensionUpdatesById = useMemo(
     () => new Map(extensionUpdates.map((update) => [update.extensionId, update])),
     [extensionUpdates],
@@ -429,25 +589,123 @@ export default function SpindlePanel() {
     setAddMenuOpen(true)
   }, [addMenuOpen, computeAddMenuPosition])
 
+  const toggleListRow = useCallback((extensionId: string) => {
+    setExpandedListRows((current) => {
+      const next = new Set(current)
+      if (next.has(extensionId)) next.delete(extensionId)
+      else next.add(extensionId)
+      return next
+    })
+  }, [])
+
+  const togglePermissionDetails = useCallback((extensionId: string) => {
+    setExpandedPermissionRows((current) => {
+      const next = new Set(current)
+      if (next.has(extensionId)) next.delete(extensionId)
+      else next.add(extensionId)
+      return next
+    })
+  }, [])
+
+  const handleExtensionDragEnd = useCallback((event: DragEndEvent) => {
+    if (extensionSortMode !== 'manual' || extensionSearch.trim()) return
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+
+    const reconciled = reconcileExtensionOrder(extensions, manualExtensionOrder)
+    const oldIndex = reconciled.indexOf(String(active.id))
+    const newIndex = reconciled.indexOf(String(over.id))
+    if (oldIndex < 0 || newIndex < 0) return
+    setManualExtensionOrder(arrayMove(reconciled, oldIndex, newIndex))
+  }, [extensionSortMode, extensionSearch, extensions, manualExtensionOrder])
+
+  const canDragExtensions = extensionSortMode === 'manual' && !extensionSearch.trim()
+
   return (
     <>
     <div className={styles.panel}>
-      {/* Add extension menu — only visible to admin/owner */}
-      {isPrivileged && (
-        <div className={styles.installRow}>
-          <div className={styles.addMenuWrap}>
+      <div className={styles.managementToolbar}>
+        <div className={styles.toolbarPrimaryRow}>
+          <div className={styles.searchField}>
+            <Search size={14} aria-hidden="true" />
+            <input
+              type="search"
+              value={extensionSearch}
+              onChange={(event) => setExtensionSearch(event.target.value)}
+              placeholder={t('spindlePanel.searchPlaceholder', { defaultValue: 'Search extensions…' })}
+              aria-label={t('spindlePanel.searchAria', { defaultValue: 'Search installed extensions' })}
+            />
+            {extensionSearch && (
+              <button
+                type="button"
+                className={styles.searchClearBtn}
+                onClick={() => setExtensionSearch('')}
+                aria-label={t('spindlePanel.clearSearch', { defaultValue: 'Clear extension search' })}
+                title={t('spindlePanel.clearSearch', { defaultValue: 'Clear extension search' })}
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
+
+          {isPrivileged && (
+            <div className={styles.addMenuWrap}>
+              <button
+                ref={addMenuButtonRef}
+                className={styles.installBtn}
+                onClick={toggleAddMenu}
+                aria-expanded={addMenuOpen}
+                aria-haspopup="menu"
+              >
+                <Plus size={13} /> {t('spindlePanel.addExtension')} <ChevronDown size={13} />
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className={styles.toolbarActions}>
+          <div
+            className={styles.viewToggle}
+            role="group"
+            aria-label={t('spindlePanel.viewMode', { defaultValue: 'Extension view' })}
+          >
             <button
-              ref={addMenuButtonRef}
-              className={styles.installBtn}
-              onClick={toggleAddMenu}
-              aria-expanded={addMenuOpen}
-              aria-haspopup="menu"
+              type="button"
+              className={clsx(styles.viewToggleBtn, extensionViewMode === 'cards' && styles.viewToggleBtnActive)}
+              onClick={() => setExtensionViewMode('cards')}
+              aria-pressed={extensionViewMode === 'cards'}
+              title={t('spindlePanel.cardView', { defaultValue: 'Card view' })}
             >
-              <Plus size={13} /> {t('spindlePanel.addExtension')} <ChevronDown size={13} />
+              <LayoutGrid size={13} />
+              <span>{t('spindlePanel.cards', { defaultValue: 'Cards' })}</span>
+            </button>
+            <button
+              type="button"
+              className={clsx(styles.viewToggleBtn, extensionViewMode === 'list' && styles.viewToggleBtnActive)}
+              onClick={() => setExtensionViewMode('list')}
+              aria-pressed={extensionViewMode === 'list'}
+              title={t('spindlePanel.listView', { defaultValue: 'List view' })}
+            >
+              <List size={13} />
+              <span>{t('spindlePanel.list', { defaultValue: 'List' })}</span>
             </button>
           </div>
+
+          <label className={styles.sortField}>
+            <span>{t('spindlePanel.sortLabel', { defaultValue: 'Sort' })}</span>
+            <select
+              value={extensionSortMode}
+              onChange={(event) => setExtensionSortMode(event.target.value as ExtensionSortMode)}
+              aria-label={t('spindlePanel.sortLabel', { defaultValue: 'Sort extensions' })}
+            >
+              {extensionSortOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+
         </div>
-      )}
+      </div>
 
       {importSummary && <div className={styles.importSummary}>{importSummary}</div>}
 
@@ -455,20 +713,28 @@ export default function SpindlePanel() {
 
       <SpindleUIControlPanel />
 
-      {/* Extensions list */}
       <div className={styles.listHeaderRow}>
         <span className={styles.sectionLabel}>
           {t('spindlePanel.installed', { count: extensions.length })}
         </span>
         <div className={styles.listHeaderActions}>
-          <SortControl<ExtensionSortMode>
-            options={extensionSortOptions}
-            value={extensionSortMode}
-            onChange={setExtensionSortMode}
-            title={t('spindlePanel.sortBy', { field: extensionSortLabel })}
-            dropdownWidth={150}
-            dropdownAlign="end"
-          />
+          <div className={styles.listHeaderMeta}>
+            {extensionSearch.trim() && (
+              <span>
+                {t('spindlePanel.searchResults', {
+                  count: sortedExtensions.length,
+                  defaultValue: `${sortedExtensions.length} matching`,
+                })}
+              </span>
+            )}
+            {extensionSortMode === 'manual' && (
+              <span>
+                {extensionSearch.trim()
+                  ? t('spindlePanel.clearSearchToReorder', { defaultValue: 'Clear search to reorder' })
+                  : t('spindlePanel.dragToReorderHint', { defaultValue: 'Drag to reorder' })}
+              </span>
+            )}
+          </div>
           {manageableCount > 0 && (
             <button
               type="button"
@@ -507,11 +773,22 @@ export default function SpindlePanel() {
             </>
           )}
         </div>
+      ) : sortedExtensions.length === 0 ? (
+        <div className={styles.emptyState}>
+          {t('spindlePanel.noSearchResults', { defaultValue: 'No installed extensions match this search.' })}
+        </div>
       ) : (
-        <div className={styles.extensionList}>
-          {sortedExtensions.map((ext) => (
-            <div key={ext.id} className={styles.extensionCard}>
-              {(() => {
+        <DndContext
+          sensors={extensionDragSensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleExtensionDragEnd}
+        >
+          <SortableContext
+            items={sortedExtensions.map((extension) => extension.id)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className={styles.extensionList}>
+              {sortedExtensions.map((ext) => {
                 const installScope = ((ext.metadata as any)?.install_scope || 'operator') as 'operator' | 'user'
                 const installedBy = ((ext.metadata as any)?.installed_by_user_id || null) as string | null
                 const extBranch = ((ext.metadata as any)?.branch || null) as string | null
@@ -523,257 +800,322 @@ export default function SpindlePanel() {
                 const updateAlertLabel = updateToastsEnabled
                   ? t('spindlePanel.updateAlertsToastAndBadge')
                   : t('spindlePanel.updateAlertsBadgeOnly')
-
-                return (
-                  <>
-              <div className={styles.extensionHeader}>
-                <div className={styles.extensionInfo}>
-                  <div className={styles.extensionName}>
-                    <span
-                      className={clsx(
-                        styles.statusDot,
-                        ext.status === 'running' && styles.statusRunning,
-                        ext.status === 'error' && styles.statusError,
-                        ext.status === 'stopped' && styles.statusStopped
-                      )}
-                    />{' '}
-                    {ext.name}
-                  </div>
-                  <span className={styles.extensionMeta}>
-                    {t('spindlePanel.extensionVersionBy', { version: ext.version, author: ext.author })}
-                  </span>
-                  <span className={styles.extensionMeta}>
-                    {scopeLabel}
-                    {isNonDefaultBranch && (
-                      <span className={styles.branchBadge}>
-                        <IconVersions size={10} /> {extBranch}
-                      </span>
-                    )}
-                  </span>
-                </div>
-
-                <div className={styles.extensionActions}>
-                  {canManage && (
-                    <button
-                      type="button"
-                      className={clsx(
-                        styles.updateNotificationBtn,
-                        updateToastsEnabled && styles.updateNotificationBtnActive,
-                      )}
-                      onClick={() => handleUpdateToastToggle(ext.identifier)}
-                      aria-pressed={updateToastsEnabled}
-                      aria-label={updateAlertLabel}
-                      title={updateAlertLabel}
-                    >
-                      {updateToastsEnabled ? <Bell size={13} /> : <BellOff size={13} />}
-                    </button>
-                  )}
-                  <button
-                    className={clsx(
-                      styles.toggleBtn,
-                      ext.enabled ? styles.toggleOn : styles.toggleOff
-                    )}
-                    onClick={() => handleToggle(ext)}
-                    disabled={isExtBusy(ext.id) || !canManage}
-                    title={canManage ? (ext.enabled ? t('spindlePanel.disable') : t('spindlePanel.enable')) : t('spindlePanel.managedByOperator')}
-                  />
-                </div>
-              </div>
-
-              {/* Operation status indicator */}
-              {extensionOperationStatus?.extensionId === ext.id && extensionOperationStatus.operation.endsWith('ing') && (
-                <div className={styles.operationStatus}>
-                  <Spinner size={12} fast />
-                  {t(`spindlePanel.operations.${extensionOperationStatus.operation}`, { defaultValue: extensionOperationStatus.operation })}
-                </div>
-              )}
-
-              {ext.description && (
-                <div className={styles.extensionDesc}>{ext.description}</div>
-              )}
-
-              {/* Permissions — union of declared + granted so runtime-requested perms are visible */}
-              {(() => {
+                const isExpanded = extensionViewMode === 'cards' || expandedListRows.has(ext.id)
                 const allPerms = [...new Set([...ext.permissions, ...ext.granted_permissions])]
                 const disabledPerms = allPerms.filter((perm) => !ext.granted_permissions.includes(perm))
+                const grantedPermissionCount = allPerms.length - disabledPerms.length
                 const isBulkPermissionBusy = bulkPermissionExtensionId === ext.id
                 const isPermissionBusy = isBulkPermissionBusy || togglingPerm?.startsWith(`${ext.id}:`) === true
-                return allPerms.length > 0 ? (
-                  <div className={styles.permissionsBlock}>
-                    <div className={styles.permissionsHeader}>
-                      <span className={styles.permissionsLabel}>{t('spindlePanel.permissionsLabel')}</span>
-                      <button
-                        type="button"
-                        className={styles.enableAllBtn}
-                        onClick={() => handleEnableAllPermissions(ext, disabledPerms)}
-                        disabled={!canManage || disabledPerms.length === 0 || isPermissionBusy}
-                        title={
-                          !canManage
-                            ? t('spindlePanel.managedByOperator')
-                            : disabledPerms.length === 0
-                              ? t('spindlePanel.allPermissionsEnabled')
-                              : t('spindlePanel.enableAllPermissionsHint')
-                        }
-                      >
-                        {isBulkPermissionBusy && <Spinner size={12} fast />}
-                        {isBulkPermissionBusy ? t('spindlePanel.enablingAllPermissions') : t('spindlePanel.enableAllPermissions')}
-                      </button>
-                    </div>
-                    <div className={styles.permissions}>
-                      {allPerms.map((perm) => {
-                        const granted = ext.granted_permissions.includes(perm)
-                        const isToggling = togglingPerm === `${ext.id}:${perm}`
-                        const pretty = perm
-                          .replaceAll('_', ' ')
-                          .replace(/\b\w/g, (ch) => ch.toUpperCase())
-                        return (
-                          <button
-                            key={perm}
-                            className={clsx(
-                              styles.permPill,
-                              granted ? styles.permPillActive : styles.permPillInactive,
-                              (isToggling || isBulkPermissionBusy) && styles.permPillToggling
-                            )}
-                            onClick={() => handlePermissionToggle(ext, perm)}
-                            title={
-                              canManage
-                                ? t('spindlePanel.permissionStatus', { name: pretty, status: granted ? t('spindlePanel.enabled') : t('spindlePanel.disabled') })
-                                : t('spindlePanel.managedByOperator')
-                            }
-                            disabled={!canManage || isToggling || isBulkPermissionBusy}
-                          >
-                            {isToggling && <Spinner size={10} fast />}
-                            {pretty}
-                          </button>
-                        )
-                      })}
-                    </div>
-                  </div>
-                ) : null
-              })()}
+                const permissionsExpanded = expandedPermissionRows.has(ext.id)
 
-              {/* Actions row — labeled primaries + small secondary icons */}
-              <div className={styles.actionRow}>
-                <div className={styles.primaryActions}>
-                  <button
-                    type="button"
+                return (
+                  <SortableExtensionCard
+                    key={ext.id}
+                    id={ext.id}
+                    dragEnabled={canDragExtensions}
                     className={clsx(
-                      styles.labeledBtn,
-                      hasUpdate && styles.updateAvailableBtn,
+                      styles.extensionCard,
+                      extensionViewMode === 'list' && styles.extensionCardList,
+                      extensionViewMode === 'list' && isExpanded && styles.extensionCardListExpanded,
                     )}
-                    onClick={() => handleUpdate(ext)}
-                    disabled={isExtBusy(ext.id) || !canManage}
-                    title={canManage
-                      ? (hasUpdate ? t('spindlePanel.updateAvailableHint') : t('spindlePanel.updateHint'))
-                      : t('spindlePanel.managedByOperator')}
+                    dragLabel={t('spindlePanel.dragToReorder', { name: ext.name, defaultValue: `Drag ${ext.name} to reorder` })}
                   >
-                    {extensionOperationStatus?.extensionId === ext.id && extensionOperationStatus.operation === 'updating'
-                      ? <Spinner size={14} fast />
-                      : (
-                        <span className={styles.updateIconWrap}>
-                          <RefreshCw size={14} />
-                          {hasUpdate && <span className={styles.updateDot} aria-hidden="true" />}
-                        </span>
+                    <div className={styles.extensionHeader}>
+                      {extensionViewMode === 'list' && (
+                        <button
+                          type="button"
+                          className={styles.expandRowBtn}
+                          onClick={() => toggleListRow(ext.id)}
+                          aria-expanded={isExpanded}
+                          aria-label={isExpanded
+                            ? t('spindlePanel.collapseExtension', { name: ext.name, defaultValue: `Collapse ${ext.name}` })
+                            : t('spindlePanel.expandExtension', { name: ext.name, defaultValue: `Expand ${ext.name}` })}
+                          title={isExpanded
+                            ? t('spindlePanel.collapse', { defaultValue: 'Collapse' })
+                            : t('spindlePanel.expand', { defaultValue: 'Expand' })}
+                        >
+                          {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </button>
                       )}
-                    <span>{t('spindlePanel.update')}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={styles.labeledBtn}
-                    onClick={() => handleRestart(ext)}
-                    disabled={isExtBusy(ext.id) || !ext.enabled}
-                    title={ext.enabled ? t('spindlePanel.restartHint') : t('spindlePanel.notEnabled')}
-                  >
-                    {extensionOperationStatus?.extensionId === ext.id && extensionOperationStatus.operation === 'restarting'
-                      ? <Spinner size={14} fast />
-                      : <RotateCw size={14} />}
-                    <span>{t('spindlePanel.restart')}</span>
-                  </button>
-                  {canManage && (
-                    <button
-                      type="button"
-                      className={clsx(
-                        styles.labeledBtn,
-                        branchMenuExtId === ext.id && styles.labeledBtnActive,
-                      )}
-                      onClick={() => handleOpenBranchMenu(ext)}
-                      disabled={isExtBusy(ext.id)}
-                      title={t('spindlePanel.switchBranch')}
-                    >
-                      <IconVersions size={14} />
-                      <span>{t('spindlePanel.branch')}</span>
-                    </button>
-                  )}
-                  {extensionsWithRegisteredSettings.has(ext.id) && (
-                    <button
-                      type="button"
-                      className={styles.labeledBtn}
-                      onClick={() => openSettings('extensions', { extensionId: ext.id })}
-                      title={t('spindlePanel.openSettings')}
-                    >
-                      <SlidersHorizontal size={14} />
-                      <span>{t('spindlePanel.settingsLabel')}</span>
-                    </button>
-                  )}
-                </div>
-                <div className={styles.secondaryActions}>
-                  {getSafeHttpsUrl(ext.github) && (
-                    <a
-                      className={styles.iconBtnSmall}
-                      href={getSafeHttpsUrl(ext.github)!}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      title={t('spindlePanel.viewOnGitHub')}
-                      aria-label={t('spindlePanel.viewOnGitHub')}
-                    >
-                      <Github size={13} />
-                    </a>
-                  )}
-                  <button
-                    type="button"
-                    className={clsx(styles.iconBtnSmall, styles.iconBtnDanger)}
-                    onClick={() => handleRemove(ext)}
-                    disabled={isExtBusy(ext.id) || !canManage}
-                    title={canManage ? t('spindlePanel.removeExtension') : t('spindlePanel.managedByOperator')}
-                    aria-label={t('spindlePanel.removeExtension')}
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </div>
-              </div>
 
-              {/* Branch switch dropdown */}
-              {branchMenuExtId === ext.id && (
-                <div className={styles.branchMenu}>
-                  {fetchingExtBranches ? (
-                    <span className={styles.branchMenuLoading}>{t('spindlePanel.loadingBranches')}</span>
-                  ) : branchMenuBranches.length === 0 ? (
-                    <span className={styles.branchMenuLoading}>{t('spindlePanel.noBranches')}</span>
-                  ) : (
-                    branchMenuBranches.map((b) => (
-                      <button
-                        key={b}
-                        className={clsx(
-                          styles.branchMenuItem,
-                          b === branchMenuCurrent && styles.branchMenuItemCurrent
+                      <div className={styles.extensionInfo}>
+                        <div className={styles.extensionName}>
+                          <span
+                            className={clsx(
+                              styles.statusDot,
+                              ext.status === 'running' && styles.statusRunning,
+                              ext.status === 'error' && styles.statusError,
+                              ext.status === 'stopped' && styles.statusStopped
+                            )}
+                          />{' '}
+                          {ext.name}
+                        </div>
+                        <span className={styles.extensionMeta}>
+                          {t('spindlePanel.extensionVersionBy', { version: ext.version, author: ext.author })}
+                        </span>
+                        <span className={styles.extensionMeta}>
+                          {scopeLabel}
+                          {isNonDefaultBranch && (
+                            <span className={styles.branchBadge}>
+                              <IconVersions size={10} /> {extBranch}
+                            </span>
+                          )}
+                        </span>
+                        {extensionViewMode === 'list' && allPerms.length > 0 && (
+                          <span className={styles.extensionMeta}>
+                            {t('spindlePanel.permissionsCompact', {
+                              granted: grantedPermissionCount,
+                              total: allPerms.length,
+                              defaultValue: `${grantedPermissionCount}/${allPerms.length} permissions`,
+                            })}
+                          </span>
                         )}
-                        onClick={() => b !== branchMenuCurrent && handleSwitchBranch(ext, b)}
-                        disabled={b === branchMenuCurrent || isExtBusy(ext.id)}
-                      >
-                        <IconVersions size={12} />
-                        {b}
-                        {b === branchMenuCurrent && <span className={styles.branchCurrentLabel}>{t('spindlePanel.current')}</span>}
-                      </button>
-                    ))
-                  )}
-                </div>
-              )}
-                  </>
+                      </div>
+
+                      <div className={styles.extensionActions}>
+                        {canManage && (
+                          <button
+                            type="button"
+                            className={clsx(
+                              styles.updateNotificationBtn,
+                              updateToastsEnabled && styles.updateNotificationBtnActive,
+                            )}
+                            onClick={() => handleUpdateToastToggle(ext.identifier)}
+                            aria-pressed={updateToastsEnabled}
+                            aria-label={updateAlertLabel}
+                            title={updateAlertLabel}
+                          >
+                            {updateToastsEnabled ? <Bell size={13} /> : <BellOff size={13} />}
+                          </button>
+                        )}
+                        <button
+                          className={clsx(
+                            styles.toggleBtn,
+                            ext.enabled ? styles.toggleOn : styles.toggleOff
+                          )}
+                          onClick={() => handleToggle(ext)}
+                          disabled={isExtBusy(ext.id) || !canManage}
+                          title={canManage ? (ext.enabled ? t('spindlePanel.disable') : t('spindlePanel.enable')) : t('spindlePanel.managedByOperator')}
+                        />
+                      </div>
+                    </div>
+
+                    {isExpanded && (
+                      <>
+                        {extensionOperationStatus?.extensionId === ext.id && extensionOperationStatus.operation.endsWith('ing') && (
+                          <div className={styles.operationStatus}>
+                            <Spinner size={12} fast />
+                            {t(`spindlePanel.operations.${extensionOperationStatus.operation}`, { defaultValue: extensionOperationStatus.operation })}
+                          </div>
+                        )}
+
+                        {ext.description && (
+                          <div className={styles.extensionDesc}>{ext.description}</div>
+                        )}
+
+                        {allPerms.length > 0 && (
+                          <div className={styles.permissionsBlock}>
+                            <div className={styles.permissionsHeader}>
+                              <div className={styles.permissionsSummary}>
+                                <span className={styles.permissionsLabel}>{t('spindlePanel.permissionsLabel')}</span>
+                                <span className={clsx(
+                                  styles.permissionsCount,
+                                  disabledPerms.length > 0 && styles.permissionsCountIncomplete,
+                                )}>
+                                  {t('spindlePanel.permissionsGrantedSummary', {
+                                    granted: grantedPermissionCount,
+                                    total: allPerms.length,
+                                    defaultValue: `${grantedPermissionCount} / ${allPerms.length} enabled`,
+                                  })}
+                                </span>
+                              </div>
+                              <div className={styles.permissionHeaderActions}>
+                                {disabledPerms.length > 0 && (
+                                  <button
+                                    type="button"
+                                    className={clsx(
+                                      styles.enableAllBtn,
+                                      grantedPermissionCount === 0 && styles.enableAllBtnProminent,
+                                    )}
+                                    onClick={() => handleEnableAllPermissions(ext, disabledPerms)}
+                                    disabled={!canManage || isPermissionBusy}
+                                    title={!canManage
+                                      ? t('spindlePanel.managedByOperator')
+                                      : t('spindlePanel.enableAllPermissionsHint')}
+                                  >
+                                    {isBulkPermissionBusy && <Spinner size={12} fast />}
+                                    {isBulkPermissionBusy ? t('spindlePanel.enablingAllPermissions') : t('spindlePanel.enableAllPermissions')}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  className={styles.permissionReviewBtn}
+                                  onClick={() => togglePermissionDetails(ext.id)}
+                                  aria-expanded={permissionsExpanded}
+                                >
+                                  {permissionsExpanded
+                                    ? t('spindlePanel.hidePermissions', { defaultValue: 'Hide' })
+                                    : t('spindlePanel.reviewPermissions', { defaultValue: 'Review' })}
+                                  {permissionsExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                </button>
+                              </div>
+                            </div>
+                            {permissionsExpanded && (
+                              <div className={styles.permissions}>
+                                {allPerms.map((perm) => {
+                                  const granted = ext.granted_permissions.includes(perm)
+                                  const isToggling = togglingPerm === `${ext.id}:${perm}`
+                                  const pretty = perm
+                                    .replaceAll('_', ' ')
+                                    .replace(/\b\w/g, (ch) => ch.toUpperCase())
+                                  return (
+                                    <button
+                                      key={perm}
+                                      className={clsx(
+                                        styles.permPill,
+                                        granted ? styles.permPillActive : styles.permPillInactive,
+                                        (isToggling || isBulkPermissionBusy) && styles.permPillToggling
+                                      )}
+                                      onClick={() => handlePermissionToggle(ext, perm)}
+                                      title={canManage
+                                        ? t('spindlePanel.permissionStatus', { name: pretty, status: granted ? t('spindlePanel.enabled') : t('spindlePanel.disabled') })
+                                        : t('spindlePanel.managedByOperator')}
+                                      disabled={!canManage || isToggling || isBulkPermissionBusy}
+                                    >
+                                      {isToggling && <Spinner size={10} fast />}
+                                      {pretty}
+                                    </button>
+                                  )
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className={styles.actionRow}>
+                          <div className={styles.primaryActions}>
+                            <button
+                              type="button"
+                              className={clsx(
+                                styles.labeledBtn,
+                                hasUpdate && styles.updateAvailableBtn,
+                              )}
+                              onClick={() => handleUpdate(ext)}
+                              disabled={isExtBusy(ext.id) || !canManage}
+                              title={canManage
+                                ? (hasUpdate ? t('spindlePanel.updateAvailableHint') : t('spindlePanel.updateHint'))
+                                : t('spindlePanel.managedByOperator')}
+                            >
+                              {extensionOperationStatus?.extensionId === ext.id && extensionOperationStatus.operation === 'updating'
+                                ? <Spinner size={14} fast />
+                                : (
+                                  <span className={styles.updateIconWrap}>
+                                    <RefreshCw size={14} />
+                                    {hasUpdate && <span className={styles.updateDot} aria-hidden="true" />}
+                                  </span>
+                                )}
+                              <span>{t('spindlePanel.update')}</span>
+                            </button>
+                            <button
+                              type="button"
+                              className={styles.labeledBtn}
+                              onClick={() => handleRestart(ext)}
+                              disabled={isExtBusy(ext.id) || !ext.enabled}
+                              title={ext.enabled ? t('spindlePanel.restartHint') : t('spindlePanel.notEnabled')}
+                            >
+                              {extensionOperationStatus?.extensionId === ext.id && extensionOperationStatus.operation === 'restarting'
+                                ? <Spinner size={14} fast />
+                                : <RotateCw size={14} />}
+                              <span>{t('spindlePanel.restart')}</span>
+                            </button>
+                            {canManage && (
+                              <button
+                                type="button"
+                                className={clsx(
+                                  styles.labeledBtn,
+                                  branchMenuExtId === ext.id && styles.labeledBtnActive,
+                                )}
+                                onClick={() => handleOpenBranchMenu(ext)}
+                                disabled={isExtBusy(ext.id)}
+                                title={t('spindlePanel.switchBranch')}
+                              >
+                                <IconVersions size={14} />
+                                <span>{t('spindlePanel.branch')}</span>
+                              </button>
+                            )}
+                            {extensionsWithRegisteredSettings.has(ext.id) && (
+                              <button
+                                type="button"
+                                className={styles.labeledBtn}
+                                onClick={() => openSettings('extensions', { extensionId: ext.id })}
+                                title={t('spindlePanel.openSettings')}
+                              >
+                                <SlidersHorizontal size={14} />
+                                <span>{t('spindlePanel.settingsLabel')}</span>
+                              </button>
+                            )}
+                          </div>
+                          <div className={styles.secondaryActions}>
+                            {getSafeHttpsUrl(ext.github) && (
+                              <a
+                                className={styles.iconBtnSmall}
+                                href={getSafeHttpsUrl(ext.github)!}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={t('spindlePanel.viewOnGitHub')}
+                                aria-label={t('spindlePanel.viewOnGitHub')}
+                              >
+                                <Github size={13} />
+                              </a>
+                            )}
+                            <button
+                              type="button"
+                              className={clsx(styles.iconBtnSmall, styles.iconBtnDanger)}
+                              onClick={() => handleRemove(ext)}
+                              disabled={isExtBusy(ext.id) || !canManage}
+                              title={canManage ? t('spindlePanel.removeExtension') : t('spindlePanel.managedByOperator')}
+                              aria-label={t('spindlePanel.removeExtension')}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </div>
+
+                        {branchMenuExtId === ext.id && (
+                          <div className={styles.branchMenu}>
+                            {fetchingExtBranches ? (
+                              <span className={styles.branchMenuLoading}>{t('spindlePanel.loadingBranches')}</span>
+                            ) : branchMenuBranches.length === 0 ? (
+                              <span className={styles.branchMenuLoading}>{t('spindlePanel.noBranches')}</span>
+                            ) : (
+                              branchMenuBranches.map((branch) => (
+                                <button
+                                  key={branch}
+                                  className={clsx(
+                                    styles.branchMenuItem,
+                                    branch === branchMenuCurrent && styles.branchMenuItemCurrent
+                                  )}
+                                  onClick={() => branch !== branchMenuCurrent && handleSwitchBranch(ext, branch)}
+                                  disabled={branch === branchMenuCurrent || isExtBusy(ext.id)}
+                                >
+                                  <IconVersions size={12} />
+                                  {branch}
+                                  {branch === branchMenuCurrent && (
+                                    <span className={styles.branchCurrentLabel}>{t('spindlePanel.current')}</span>
+                                  )}
+                                </button>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </SortableExtensionCard>
                 )
-              })()}
+              })}
             </div>
-          ))}
-        </div>
+          </SortableContext>
+        </DndContext>
       )}
     </div>
     {addMenuOpen && isPrivileged && createPortal(

@@ -57,6 +57,17 @@ await initVapidKeys();
 const db = initDatabase();
 await runMigrations(db);
 
+const {
+  describeImageProcessingRecovery,
+  getImageProcessingRecovery,
+} = await import("./services/images.service");
+const leftoverThumbnails = getImageProcessingRecovery();
+if (leftoverThumbnails.pending > 0) {
+  console.warn(
+    `[startup] ${describeImageProcessingRecovery(leftoverThumbnails)}. Not auto-started — recover from Operator → Image Processing after changing settings if needed.`,
+  );
+}
+
 // Move legacy plaintext Pollinations application keys into the per-user
 // encrypted secret store before the rest of the application begins serving.
 const { migrateLegacyPollinationsAppKeys } = await import("./services/connections.service");
@@ -68,8 +79,39 @@ if (pollinationsKeysMigrated > 0) {
 // Chat-head generation state is intentionally ephemeral. Clear any retained
 // in-memory pool state during startup so clients never resurrect stale heads
 // after a restart or hot-reload.
-const { clearAllPoolEntries } = await import("./services/generation-pool.service");
+const { clearAllPoolEntries, getPoolEntry } = await import("./services/generation-pool.service");
 clearAllPoolEntries();
+
+// Wire the edit-and-send dispatcher's liveness probe to the generation pool so
+// runtime reconciliation can distinguish genuinely finished generations from
+// crashed ones instead of trusting in-memory state alone.
+try {
+  const { setEditAndSendGenerationActiveCheck } = await import("./services/edit-and-send-dispatcher.service");
+  setEditAndSendGenerationActiveCheck((_userId, generationId) => {
+    const entry = getPoolEntry(generationId);
+    return !!entry && entry.status !== "completed" && entry.status !== "stopped" && entry.status !== "error";
+  });
+} catch (err) {
+  console.error("[startup] edit-and-send generation active check hook failed:", err);
+}
+
+try {
+  const { recoverEditAndSendOutbox } = await import("./services/edit-and-send-dispatcher.service");
+  const recovered = await recoverEditAndSendOutbox();
+  if (recovered > 0) {
+    console.log(`[startup] Recovered ${recovered} edit-and-send outbox item(s)`);
+  }
+} catch (err) {
+  console.error("[startup] edit-and-send outbox recovery failed:", err);
+}
+
+try {
+  const { providerRegistry } = await import("./spindle/provider-registry");
+  const { getSecret } = await import("./services/secrets.service");
+  providerRegistry.configure({ getSecret });
+} catch (err) {
+  console.error("[startup] provider registry secret hook failed:", err);
+}
 
 // Dynamic import: auth modules call getDb() at module level, so must load after initDatabase()
 const { seedOwner, backfillUserIds, backfillDefaultPresets, getFirstUserId } = await import("./auth/seed");
@@ -95,6 +137,29 @@ const {
   detectHostnameSuggestions,
 } = await import("./services/trusted-hosts.service");
 loadTrustedHosts();
+
+// Load the operator-approved broker origin allowlist and push it into the
+// provider registry so extension broker URLs are validated at registration.
+// The initial configure above runs before the owner is seeded, so origins
+// must be attached here once getFirstUserId() can resolve the setting.
+const {
+  load: loadApprovedBrokerOrigins,
+  getApprovedBrokerOrigins,
+} = await import("./services/broker-origins.service");
+loadApprovedBrokerOrigins();
+try {
+  const { providerRegistry } = await import("./spindle/provider-registry");
+  const { getSecret } = await import("./services/secrets.service");
+  providerRegistry.configure({
+    getSecret,
+    approvedBrokerOrigins: getApprovedBrokerOrigins(),
+  });
+} catch (err) {
+  console.error("[startup] provider registry broker origin hook failed:", err);
+}
+if (getApprovedBrokerOrigins().length === 0) {
+  console.log("[startup] Broker origin allowlist empty — broker URLs may target any http(s) origin");
+}
 
 runStartupDatabaseMaintenance(db, getDatabasePath(), getFirstUserId());
 startDatabaseMonitor(() => db, getDatabasePath());
@@ -148,6 +213,11 @@ import("./services/tokenizer.service").then(({ prewarm }) => prewarm()).catch(()
 
 // Import app after database is ready (auth config needs getDb())
 const { default: app, websocket } = await import("./app");
+
+// Bun 1.4 surfaces native low-memory notifications. Release reconstructable
+// caches before the OS resorts to terminating this long-running server.
+const { installMemoryPressureHandler } = await import("./services/memory-pressure.service");
+installMemoryPressureHandler();
 
 // Register push notification EventBus listeners
 const { initPushListeners } = await import("./services/push.service");
@@ -239,6 +309,23 @@ setTimeout(() => {
   });
 }, 0);
 
+// Warm Illarin credentials and push a declaration update when the backend
+// version changed since Illarin last accepted one. Deferred like LumiHub.
+setTimeout(() => {
+  import("./illarin/warmup").then(({ warmUpInstances }) => {
+    void warmUpInstances()
+      .catch((err) => console.error("[Illarin] Warmup failed:", err))
+      .then(async () => {
+        try {
+          const { startAllDeliveryWorkers } = await import("./illarin/delivery-worker");
+          await startAllDeliveryWorkers();
+        } catch (err) {
+          console.error("[Illarin] Delivery workers failed to start:", err);
+        }
+      });
+  });
+}, 0);
+
 // Auto-connect MCP servers (fire-and-forget, same deferred pattern as LumiHub)
 setTimeout(() => {
   import("./services/mcp-client-manager").then(({ getMcpClientManager }) => {
@@ -314,11 +401,15 @@ async function gracefulShutdown(signal: string) {
   const { stopTicketSweep } = await import("./ws/tickets");
   const { stopOAuthStateSweep } = await import("./spindle/oauth-state");
   const { stopPkceSweep } = await import("./routes/lumihub.routes");
+  const { stopIllarinSweeps } = await import("./routes/illarin.routes");
+  const { stopAllDeliveryWorkers } = await import("./illarin/delivery-worker");
   const { stopChatChunkVectorizationWorker, stopQueryCacheCleanup, stopWorldBookVectorizationSweep } = await import("./services/vectorization-queue.service");
   const { stopVersionCheckCleanup } = await import("./services/embeddings.service");
   stopTicketSweep();
   stopOAuthStateSweep();
   stopPkceSweep();
+  stopIllarinSweeps();
+  stopAllDeliveryWorkers();
   stopChatChunkVectorizationWorker();
   stopQueryCacheCleanup();
   stopWorldBookVectorizationSweep();

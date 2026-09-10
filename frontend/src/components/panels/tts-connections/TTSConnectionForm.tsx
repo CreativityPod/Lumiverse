@@ -1,8 +1,9 @@
-import { useState, useCallback, useEffect, useMemo } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { FormField, TextInput, TextArea, Select, Button } from '@/components/shared/FormComponents'
 import { Toggle } from '@/components/shared/Toggle'
 import ModelCombobox from '@/components/panels/connection-manager/ModelCombobox'
+import { VERTEX_REGIONS } from '@/components/panels/connection-manager/vertexConstants'
 import { ttsConnectionsApi } from '@/api/tts-connections'
 import { isQwenTtsProvider, QWEN_LANGUAGE_OPTIONS } from '@/lib/qwenTts'
 import type {
@@ -30,6 +31,13 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
   const [voice, setVoice] = useState(profile?.voice || '')
   const [isDefault, setIsDefault] = useState(profile?.is_default || false)
   const [defaultParameters, setDefaultParameters] = useState<Record<string, any>>(profile?.default_parameters || {})
+
+  const isVertex = provider === 'google_vertex_tts'
+  const isGoogle = isVertex || provider === 'google_tts'
+  const googleUseStreaming = defaultParameters.use_streaming_endpoint !== false
+  const [vertexRegion, setVertexRegion] = useState(profile?.metadata?.vertex_region || 'us-central1')
+  const [saFileName, setSaFileName] = useState<string | null>(profile?.metadata?.sa_file_name || null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const [voices, setVoices] = useState<TtsVoice[]>([])
   const [voicesLoading, setVoicesLoading] = useState(false)
@@ -86,13 +94,44 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     )
   }, [voiceOptions])
 
+  // Handle service account JSON file upload
+  const handleFileUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      try {
+        const text = reader.result as string
+        // Validate it's valid JSON with required fields
+        const parsed = JSON.parse(text)
+        if (!parsed.private_key || !parsed.client_email || !parsed.project_id) {
+          alert(t('connectionForm.invalidServiceAccountMissingFields'))
+          return
+        }
+        // Store the raw JSON as the "API key"
+        setApiKey(text)
+        setSaFileName(file.name)
+      } catch {
+        alert(t('connectionForm.invalidJsonFile'))
+      }
+    }
+    reader.readAsText(file)
+    // Reset file input so the same file can be re-selected
+    e.target.value = ''
+  }, [t])
+
   const fetchModels = useCallback(async () => {
     setModelsLoading(true)
     try {
+      const metadata: Record<string, any> = { ...profile?.metadata }
+      if (isVertex) {
+        metadata.vertex_region = vertexRegion
+      }
       const result = await ttsConnectionsApi.previewModels({
         connection_id: profile?.id,
         provider,
-        api_url: apiUrl.trim() || undefined,
+        api_url: isVertex ? undefined : (apiUrl.trim() || undefined),
+        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
         api_key: apiKey.trim() || undefined,
       })
       setModels(result.models)
@@ -101,15 +140,20 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     } finally {
       setModelsLoading(false)
     }
-  }, [apiKey, apiUrl, profile?.id, provider])
+  }, [apiKey, apiUrl, isVertex, profile?.id, profile?.metadata, provider, vertexRegion])
 
   const fetchVoices = useCallback(async () => {
     setVoicesLoading(true)
     try {
+      const metadata: Record<string, any> = { ...profile?.metadata }
+      if (isVertex) {
+        metadata.vertex_region = vertexRegion
+      }
       const result = await ttsConnectionsApi.previewVoices({
         connection_id: profile?.id,
         provider,
-        api_url: apiUrl.trim() || undefined,
+        api_url: isVertex ? undefined : (apiUrl.trim() || undefined),
+        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
         api_key: apiKey.trim() || undefined,
       })
       setVoices(result.voices)
@@ -118,7 +162,7 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     } finally {
       setVoicesLoading(false)
     }
-  }, [apiKey, apiUrl, profile?.id, provider])
+  }, [apiKey, apiUrl, isVertex, profile?.id, profile?.metadata, provider, vertexRegion])
 
   useEffect(() => {
     if (profile?.id && capabilities?.voiceListStyle === 'dynamic') {
@@ -156,6 +200,18 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     })
   }, [])
 
+  const setGoogleUseStreaming = useCallback((next: boolean) => {
+    setDefaultParameters((prev) => {
+      const updated = { ...prev }
+      if (next) {
+        delete updated.use_streaming_endpoint
+      } else {
+        updated.use_streaming_endpoint = false
+      }
+      return updated
+    })
+  }, [])
+
   const setQwenUseStreaming = useCallback((next: boolean) => {
     setDefaultParameters((prev) => {
       const updated = { ...prev }
@@ -170,6 +226,14 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
 
   const handleSubmit = useCallback(() => {
     if (!name.trim()) return
+    const metadata: Record<string, any> = { ...profile?.metadata }
+    if (isVertex) {
+      metadata.vertex_region = vertexRegion
+      if (saFileName) metadata.sa_file_name = saFileName
+    } else {
+      delete metadata.vertex_region
+      delete metadata.sa_file_name
+    }
     const qwenDefaults: Record<string, any> = {}
     if (isQwen && typeof defaultParameters.language === 'string' && defaultParameters.language) {
       qwenDefaults.language = defaultParameters.language
@@ -180,17 +244,24 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
     if (isQwen && defaultParameters.use_streaming_endpoint === false) {
       qwenDefaults.use_streaming_endpoint = false
     }
+    const googleDefaults: Record<string, any> = { ...defaultParameters }
+    if (defaultParameters.use_streaming_endpoint === false) {
+      googleDefaults.use_streaming_endpoint = false
+    } else {
+      delete googleDefaults.use_streaming_endpoint
+    }
     onSave({
       name: name.trim(),
       provider,
       api_key: apiKey.trim() || undefined,
-      api_url: apiUrl.trim() || undefined,
+      api_url: isVertex ? undefined : (apiUrl.trim() || undefined),
       model: model.trim() || undefined,
       voice: voice.trim() || undefined,
       is_default: isDefault,
-      default_parameters: isQwen ? qwenDefaults : undefined,
+      default_parameters: isQwen ? qwenDefaults : isGoogle ? (Object.keys(googleDefaults).length > 0 ? googleDefaults : undefined) : undefined,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
     })
-  }, [name, provider, apiKey, apiUrl, model, voice, isDefault, isQwen, defaultParameters, onSave])
+  }, [name, provider, apiKey, apiUrl, model, voice, isDefault, isQwen, isGoogle, defaultParameters, onSave, isVertex, vertexRegion, saFileName, profile?.metadata])
 
   return (
     <div className={styles.form}>
@@ -202,24 +273,68 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
         <Select value={provider} onChange={setProvider} options={providerOptions} />
       </FormField>
 
-      {capabilities?.apiKeyRequired && (
-        <FormField label={t('ttsConnectionForm.apiKey')} hint={profile?.has_api_key ? t('ttsConnectionForm.keySetHint') : undefined}>
-          <TextInput
-            value={apiKey}
-            onChange={setApiKey}
-            placeholder={profile?.has_api_key ? '••••••••' : t('ttsConnectionForm.enterApiKey')}
-            type="password"
-          />
-        </FormField>
-      )}
+      {isVertex ? (
+        <>
+          <FormField
+            label={t('connectionForm.serviceAccountJson')}
+            hint={
+              profile?.has_api_key
+                ? t('connectionForm.credentialsLoaded', { file: saFileName ? ` (${saFileName})` : '' })
+                : t('connectionForm.uploadServiceAccount')
+            }
+          >
+            <div className={styles.fileUploadRow}>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {apiKey ? t('connectionForm.fileLoaded') : t('connectionForm.chooseFile')}
+              </Button>
+              {(saFileName || apiKey) && (
+                <span className={styles.fileUploadName}>
+                  {saFileName || t('connectionForm.serviceAccountFilename')}
+                </span>
+              )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,application/json"
+                onChange={handleFileUpload}
+                style={{ display: 'none' }}
+              />
+            </div>
+          </FormField>
+          <FormField label={t('connectionForm.region')} hint={t('connectionForm.vertexRegionHint')}>
+            <Select
+              value={vertexRegion}
+              onChange={setVertexRegion}
+              options={VERTEX_REGIONS.map((r) => ({ value: r, label: r }))}
+            />
+          </FormField>
+        </>
+      ) : (
+        <>
+          {capabilities?.apiKeyRequired && (
+            <FormField label={t('ttsConnectionForm.apiKey')} hint={profile?.has_api_key ? t('ttsConnectionForm.keySetHint') : undefined}>
+              <TextInput
+                value={apiKey}
+                onChange={setApiKey}
+                placeholder={profile?.has_api_key ? '••••••••' : t('ttsConnectionForm.enterApiKey')}
+                type="password"
+              />
+            </FormField>
+          )}
 
-      <FormField label={t('ttsConnectionForm.apiUrl')} hint={t('ttsConnectionForm.apiUrlHint')}>
-        <TextInput
-          value={apiUrl}
-          onChange={setApiUrl}
-          placeholder={capabilities?.defaultUrl || 'https://...'}
-        />
-      </FormField>
+          <FormField label={t('ttsConnectionForm.apiUrl')} hint={t('ttsConnectionForm.apiUrlHint')}>
+            <TextInput
+              value={apiUrl}
+              onChange={setApiUrl}
+              placeholder={capabilities?.defaultUrl || 'https://...'}
+            />
+          </FormField>
+        </>
+      )}
 
       <FormField label={t('ttsConnectionForm.model')} hint={capabilities?.modelListStyle === 'dynamic' ? t('ttsConnectionForm.refreshHint') : undefined}>
         <ModelCombobox
@@ -252,6 +367,17 @@ export default function TTSConnectionForm({ providers, profile, onSave, onCancel
           emptyMessage={t('ttsConnectionForm.noVoices')}
         />
       </FormField>
+
+      {isGoogle && (
+        <FormField label="">
+          <Toggle.Checkbox
+            checked={googleUseStreaming}
+            onChange={setGoogleUseStreaming}
+            label={t('ttsConnectionForm.qwenUseStreaming')}
+            hint={t('ttsConnectionForm.qwenUseStreamingHint')}
+          />
+        </FormField>
+      )}
 
       {isQwen && (
         <>

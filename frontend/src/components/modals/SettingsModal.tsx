@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { motion } from 'motion/react'
-import { RefreshCw, GripVertical } from 'lucide-react'
+import { RefreshCw, GripVertical, Plus } from 'lucide-react'
 import {
   DndContext,
   closestCenter,
@@ -30,16 +30,28 @@ import { Toggle } from '@/components/shared/Toggle'
 import { spinClass } from '@/components/shared/Spinner'
 import { ExpandableTextarea } from '@/components/shared/ExpandedTextEditor'
 import { useStore } from '@/store'
+import { readProductivityFeature } from '@/lib/spindle/productivity-feature-toggles'
 import { spindleApi } from '@/api/spindle'
 import { connectionsApi } from '@/api/connections'
-import { embeddingsApi } from '@/api/embeddings'
+import { chatsApi } from '@/api/chats'
+import { charactersApi } from '@/api/characters'
+import {
+  embeddingsApi,
+  EMBEDDING_ERROR_CODES,
+  buildEmbeddingConfigUpdate,
+  isUsableProfileId,
+  redactEmbeddingErrorMessage,
+  selectFallbackChain,
+  selectedEmbeddingProfileIds,
+  type EmbeddingConfigWithProfiles,
+} from '@/api/embeddings'
 import { imagesApi } from '@/api/images'
 import { settingsApi } from '@/api/settings'
 import { notificationSoundsApi } from '@/api/notification-sounds'
 import { unlockNotificationAudio } from '@/lib/notificationAudio'
 import { webSearchApi, type WebSearchProviderProfile, type WebSearchSettingsInput, type WebSearchTestResponse } from '@/api/web-search'
-import type { DrawerSettings, GuidedGeneration, QuickReplySet } from '@/types/store'
-import type { EmbeddingConfig, ChatMemorySettings } from '@/types/api'
+import type { DrawerSettings, GuidedGeneration, LongMessageCollapsePreset, QuickReplySet } from '@/types/store'
+import type { EmbeddingConfig, ChatMemorySettings, ChatSummary, Character, CharacterSummary } from '@/types/api'
 import type { WorldBookVectorPresetMode, WorldBookVectorSettings } from '@/types/world-book-vector-settings'
 import AccountSettings from '@/components/settings/AccountSettings'
 import UserManagement from '@/components/settings/UserManagement'
@@ -55,9 +67,14 @@ import McpServerSettings from '@/components/settings/mcp-servers/McpServerSettin
 import DataPortability from '@/components/settings/DataPortability'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 import CollapsibleSection from '@/components/shared/CollapsibleSection'
+import EmbeddingConnectionPicker from '@/components/shared/EmbeddingConnectionPicker'
+import ConnectionSelect from '@/components/shared/ConnectionSelect'
+import SearchableSelect, { type SearchableSelectOption } from '@/components/shared/SearchableSelect'
+import pickerStyles from '@/components/shared/SidecarConnectionPicker.module.css'
 import ModelCombobox from '@/components/panels/connection-manager/ModelCombobox'
 import { getVisibleSettingsTabs, sectionAnchorId, SETTINGS_TABS } from '@/lib/settings-tab-registry'
 import { activateExtensionSettingsTab } from '@/lib/spindle/settings-tab-bridge'
+import { getSafeHttpsUrl } from '@/lib/navigationSafety'
 import type { SettingsTabState } from '@/store/slices/spindle-placement'
 import SettingsSearch from './SettingsSearch'
 import styles from './SettingsModal.module.css'
@@ -71,20 +88,27 @@ interface SettingsModalProps {
 export default function SettingsModal({ onClose }: SettingsModalProps) {
   const { t: ts } = useTranslation('settings')
   const settingsActiveView = useStore((s) => s.settingsActiveView)
+  const setSettingsActiveView = useStore((s) => s.setSettingsActiveView)
   const settingsScrollTarget = useStore((s) => s.settingsScrollTarget)
   const user = useStore((s) => s.user)
   const settingsTabs = useStore((s) => s.settingsTabs)
+  const productivityTabPosition = useStore((s) => (s as any).productivityTabPosition ?? 'after-display')
   const [activeView, setActiveView] = useState(settingsActiveView || 'display')
 
   const VIEWS = useMemo(() => {
     void settingsTabs
-    return getVisibleSettingsTabs(user?.role)
-  }, [settingsTabs, user?.role])
+    return getVisibleSettingsTabs(user?.role, productivityTabPosition)
+  }, [settingsTabs, user?.role, productivityTabPosition])
 
   const contentRef = useRef<HTMLDivElement>(null)
   const navNonce = useRef(0)
   const handledScrollTargetNonce = useRef<number | null>(null)
   const [scrollTarget, setScrollTarget] = useState<{ anchorId: string | null; nonce: number } | null>(null)
+
+  const selectView = useCallback((view: string) => {
+    setActiveView(view)
+    setSettingsActiveView(view)
+  }, [setSettingsActiveView])
 
   useEffect(() => {
     setActiveView(settingsActiveView || 'display')
@@ -92,13 +116,13 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
   useEffect(() => {
     if (!VIEWS.some((tab) => tab.id === activeView) && VIEWS.length > 0) {
-      setActiveView(VIEWS[0].id)
+      selectView(VIEWS[0].id)
     }
-  }, [VIEWS, activeView])
+  }, [VIEWS, activeView, selectView])
 
   // Open a tab from the in-modal search and remember where to scroll.
   const handleSearchNavigate = (tabId: string, anchorId: string | null) => {
-    setActiveView(tabId)
+    selectView(tabId)
     setScrollTarget({ anchorId, nonce: navNonce.current++ })
   }
 
@@ -137,7 +161,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
     if (extensionId) {
       if (activeView !== 'extensions') {
-        setActiveView('extensions')
+        selectView('extensions')
         return
       }
 
@@ -175,7 +199,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
     handledScrollTargetNonce.current = targetNonce
     setScrollTarget({ anchorId, nonce: targetNonce })
-  }, [activeView, settingsActiveView, settingsScrollTarget])
+  }, [activeView, settingsActiveView, settingsScrollTarget, selectView])
 
   return createPortal(
     <div className={styles.overlay} onClick={onClose}>
@@ -202,7 +226,7 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
                   key={tab.id}
                   type="button"
                   className={clsx(styles.navBtn, activeView === tab.id && styles.navBtnActive)}
-                  onClick={() => setActiveView(tab.id)}
+                  onClick={() => selectView(tab.id)}
                 >
                   <Icon size={14} />
                   <span>{translateSettingsField(tab.id, 'shortName', tab.shortName)}</span>
@@ -213,6 +237,10 @@ export default function SettingsModal({ onClose }: SettingsModalProps) {
 
           <div className={styles.content} ref={contentRef}>
             <SettingsView view={activeView} />
+            <div
+              data-spindle-mount="settings_section"
+              data-spindle-scope={`settings-section:${activeView}:modal`}
+            />
             <div
               className={clsx(
                 styles.extensionMountHost,
@@ -268,6 +296,8 @@ function SettingsView({ view }: { view: string }) {
       coreContent = <WebSearchSettings />; break
     case 'lumihub':
       coreContent = <LumiHubSettings />; break
+    case 'illarin':
+      coreContent = <IllarinSettings />; break
     case 'tokenizers':
       coreContent = <TokenizerManager />; break
     case 'users':
@@ -303,7 +333,9 @@ function SettingsView({ view }: { view: string }) {
   return (
     <>
       {coreContent}
-      {extensionTabs.length > 0 && <SettingsExtensionTabBodies tabs={extensionTabs} />}
+      {extensionTabs.length > 0
+        ? <SettingsExtensionTabBodies tabs={extensionTabs} />
+        : <div data-spindle-mount="settings_tab" data-settings-tab-id={view} />}
     </>
   )
 }
@@ -323,7 +355,7 @@ function SettingsExtensionTabBodies({ tabs }: { tabs: readonly SettingsTabState[
     }
   }, [tabs])
 
-  return <div ref={hostRef} data-settings-tab-id={tabs[0]?.tabId} />
+  return <div ref={hostRef} data-spindle-mount="settings_tab" data-settings-tab-id={tabs[0]?.tabId} />
 }
 
 function createId(prefix: string) {
@@ -336,6 +368,10 @@ function DisplaySettings() {
   const drawerSettings = useStore((s) => s.drawerSettings)
   const modalWidthMode = useStore((s) => s.modalWidthMode)
   const modalMaxWidth = useStore((s) => s.modalMaxWidth)
+  const longMessageCollapseEnabled = useStore((s) => s.longMessageCollapseEnabled)
+  const longMessageCollapsePreset = useStore((s) => s.longMessageCollapsePreset)
+  const longMessageCollapseCustomHeight = useStore((s) => s.longMessageCollapseCustomHeight)
+  const longMessageCollapseDepth = useStore((s) => s.longMessageCollapseDepth)
   const landingPageChatsDisplayed = useStore((s) => s.landingPageChatsDisplayed)
   const landingPageLayoutMode = useStore((s) => s.landingPageLayoutMode)
   const landingPageGalleryWidth = useStore((s) => s.landingPageGalleryWidth)
@@ -359,7 +395,73 @@ function DisplaySettings() {
     <div className={styles.settingsSection}>
       <LanguageSwitcher />
 
-      <h3 id={sectionAnchorId('display', 'modalWidth')} className={styles.sectionTitle} style={{ marginTop: 16 }}>{t('display.modalWidth.title')}</h3>
+      <h3 id={sectionAnchorId('display', 'longMessages')} className={styles.sectionTitle} style={{ marginTop: 16 }}>{t('display.longMessages.title')}</h3>
+      <p className={styles.helperText}>
+        {t('display.longMessages.helper')}
+      </p>
+
+      <Toggle.Checkbox
+        checked={longMessageCollapseEnabled}
+        onChange={(checked) => setSetting('longMessageCollapseEnabled', checked)}
+        label={t('display.longMessages.enabled')}
+        hint={t('display.longMessages.enabledHint')}
+      />
+
+      {longMessageCollapseEnabled && (
+        <>
+          <div className={styles.field}>
+            <label className={styles.fieldLabel}>{t('display.longMessages.height')}</label>
+            <div className={styles.segmented}>
+              {(['compact', 'comfortable', 'tall', 'custom'] as LongMessageCollapsePreset[]).map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  className={clsx(styles.segmentedBtn, longMessageCollapsePreset === preset && styles.segmentedBtnActive)}
+                  onClick={() => setSetting('longMessageCollapsePreset', preset)}
+                >
+                  {t(`display.longMessages.${preset}`)}
+                </button>
+              ))}
+            </div>
+          </div>
+          {longMessageCollapsePreset === 'custom' && (
+            <div className={styles.field}>
+              <label className={styles.fieldLabel}>{t('display.longMessages.customHeight')}</label>
+              <div className={styles.rangeRow}>
+                <input
+                  type="range"
+                  className={styles.rangeSlider}
+                  min={100}
+                  max={4000}
+                  step={1}
+                  value={longMessageCollapseCustomHeight}
+                  aria-label={t('display.longMessages.customHeight')}
+                  onChange={(event) => setSetting(
+                    'longMessageCollapseCustomHeight',
+                    Number(event.currentTarget.value),
+                  )}
+                />
+                <span className={styles.rangeValue}>{longMessageCollapseCustomHeight}px</span>
+              </div>
+              <span className={styles.helperText}>{t('display.longMessages.customHeightHint')}</span>
+            </div>
+          )}
+          <div className={styles.field}>
+            <label className={styles.fieldLabel}>{t('display.longMessages.depth')}</label>
+            <NumericInput
+              className={styles.numberInput}
+              min={0}
+              max={500}
+              value={longMessageCollapseDepth}
+              integer
+              onChange={(value) => setSetting('longMessageCollapseDepth', Math.max(0, value ?? 0))}
+            />
+            <span className={styles.helperText}>{t('display.longMessages.depthHint')}</span>
+          </div>
+        </>
+      )}
+
+      <h3 id={sectionAnchorId('display', 'modalWidth')} className={styles.sectionTitle} style={{ marginTop: 12 }}>{t('display.modalWidth.title')}</h3>
       <p className={styles.helperText}>
         {t('display.modalWidth.helper')}
       </p>
@@ -816,14 +918,14 @@ function CompletionSoundUploader({ disabled, current, onChange, onError, onSucce
 function ChatSettings() {
   const { t } = useTranslation('settings')
   const { t: tc } = useTranslation('common')
-  const displayMode = useStore((s) => s.chatSheldDisplayMode)
+  const displayMode = useStore((s) => s.chatDisplayMode)
   const minimalUseFullAvatar = useStore((s) => s.minimalUseFullAvatar ?? false)
   const bubbleUserAlign = useStore((s) => s.bubbleUserAlign)
   const bubbleDisableHover = useStore((s) => s.bubbleDisableHover)
   const bubbleHideAvatarBg = useStore((s) => s.bubbleHideAvatarBg)
   const bubbleUseFullAvatar = useStore((s) => s.bubbleUseFullAvatar ?? false)
   const bubbleOpacity = useStore((s) => s.bubbleOpacity ?? 1)
-  const enterToSend = useStore((s) => s.chatSheldEnterToSend)
+  const enterToSend = useStore((s) => s.inputBarEnterToSend)
   const saveDraftInput = useStore((s) => s.saveDraftInput)
   const portraitPanelSide = useStore((s) => s.portraitPanelSide)
   const chatWidthMode = useStore((s) => s.chatWidthMode)
@@ -832,6 +934,7 @@ function ChatSettings() {
   const regenFeedback = useStore((s) => s.regenFeedback)
   const suppressContextDropWarnings = useStore((s) => s.suppressContextDropWarnings)
   const setSetting = useStore((s) => s.setSetting)
+  const setInputBarEnterToSend = useStore((s) => s.setInputBarEnterToSend)
 
   return (
     <div className={styles.settingsSection}>
@@ -844,7 +947,7 @@ function ChatSettings() {
           <button
             type="button"
             className={clsx(styles.displayModeCard, displayMode === 'minimal' && styles.displayModeCardActive)}
-            onClick={() => setSetting('chatSheldDisplayMode', 'minimal')}
+            onClick={() => setSetting('chatDisplayMode', 'minimal')}
           >
             <div className={styles.previewMinimal}>
               {/* Character message */}
@@ -882,7 +985,7 @@ function ChatSettings() {
           <button
             type="button"
             className={clsx(styles.displayModeCard, displayMode === 'bubble' && styles.displayModeCardActive)}
-            onClick={() => setSetting('chatSheldDisplayMode', 'bubble')}
+            onClick={() => setSetting('chatDisplayMode', 'bubble')}
           >
             <div className={styles.previewBubble}>
               {/* Character bubble message */}
@@ -1081,7 +1184,7 @@ function ChatSettings() {
 
       <Toggle.Checkbox
         checked={enterToSend}
-        onChange={(checked) => setSetting('chatSheldEnterToSend', checked)}
+        onChange={setInputBarEnterToSend}
         label={t('chat.enterToSend')}
       />
 
@@ -1147,6 +1250,19 @@ function ChatSettings() {
             onChange={(checked) => setSetting('regenFeedback', { ...regenFeedback, includePreviousGeneration: checked })}
             label={t('chat.regenIncludePrevious')}
           />
+
+          <div className={styles.field}>
+            <label className={styles.fieldLabel}>{t('chat.regenFormat')}</label>
+            <ExpandableTextarea
+              className={formStyles.textarea}
+              value={regenFeedback.format}
+              onChange={(format) => setSetting('regenFeedback', { ...regenFeedback, format })}
+              placeholder="[OOC: {{$regenInput}}]"
+              rows={4}
+              title={t('chat.regenFormat')}
+            />
+            <p className={styles.helperText}>{t('chat.regenFormatHint')}</p>
+          </div>
         </>
       )}
 
@@ -1208,13 +1324,151 @@ function ExtensionSettingsView() {
 interface SortableGuideRowProps {
   guide: GuidedGeneration
   editing: boolean
+  chats: ChatSummary[]
+  characters: Character[]
+  activeChatId: string | null
+  activeCharacterId: string | null
   onToggleEnabled: (id: string, value: boolean) => void
   onToggleEdit: (id: string) => void
   onUpdate: (id: string, patch: Partial<GuidedGeneration>) => void
   onRemove: (id: string) => void
 }
 
-function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpdate, onRemove }: SortableGuideRowProps) {
+const GUIDED_CHARACTER_PAGE_SIZE = 20
+
+function GuidedCharacterTargetPicker({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (id: string) => void
+}) {
+  const { t } = useTranslation('settings')
+  const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [items, setItems] = useState<CharacterSummary[]>([])
+  const [total, setTotal] = useState(0)
+  const [received, setReceived] = useState(0)
+  const [loading, setLoading] = useState(false)
+  const [selectedFallback, setSelectedFallback] = useState<SearchableSelectOption | null>(null)
+  const requestGenerationRef = useRef(0)
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250)
+    return () => window.clearTimeout(timer)
+  }, [search])
+
+  const handleSearchChange = useCallback((value: string) => {
+    setSearch(value)
+    setItems([])
+    setTotal(0)
+    setReceived(0)
+  }, [])
+
+  useEffect(() => {
+    const generation = ++requestGenerationRef.current
+    const controller = new AbortController()
+    setItems([])
+    setTotal(0)
+    setReceived(0)
+    setLoading(true)
+    charactersApi.listSummaries({
+      limit: GUIDED_CHARACTER_PAGE_SIZE,
+      offset: 0,
+      search: debouncedSearch || undefined,
+      sort: 'name',
+      direction: 'asc',
+    }, controller.signal).then((result) => {
+      if (generation !== requestGenerationRef.current) return
+      setItems(result.data)
+      setTotal(result.total)
+      setReceived(result.data.length)
+    }).catch((error: unknown) => {
+      if (generation !== requestGenerationRef.current) return
+      if (!(error instanceof DOMException && error.name === 'AbortError')) {
+        setItems([])
+        setTotal(0)
+        setReceived(0)
+      }
+    }).finally(() => {
+      if (generation === requestGenerationRef.current) setLoading(false)
+    })
+    return () => controller.abort()
+  }, [debouncedSearch])
+
+  const loadMore = useCallback(() => {
+    if (loading || received >= total) return
+    const generation = requestGenerationRef.current
+    setLoading(true)
+    charactersApi.listSummaries({
+      limit: GUIDED_CHARACTER_PAGE_SIZE,
+      offset: received,
+      search: debouncedSearch || undefined,
+      sort: 'name',
+      direction: 'asc',
+    }).then((result) => {
+      if (generation !== requestGenerationRef.current) return
+      setItems((current) => {
+        const seen = new Set(current.map((item) => item.id))
+        return [...current, ...result.data.filter((item) => !seen.has(item.id))]
+      })
+      setTotal(result.total)
+      setReceived((current) => current + result.data.length)
+    }).catch(() => {}).finally(() => {
+      if (generation === requestGenerationRef.current) setLoading(false)
+    })
+  }, [debouncedSearch, loading, received, total])
+
+  useEffect(() => {
+    if (!value || items.some((item) => item.id === value)) {
+      setSelectedFallback(null)
+      return
+    }
+    let cancelled = false
+    charactersApi.get(value).then((character) => {
+      if (cancelled) return
+      setSelectedFallback({
+        value: character.id,
+        label: character.name,
+        sublabel: character.creator || undefined,
+      })
+    }).catch(() => { if (!cancelled) setSelectedFallback(null) })
+    return () => { cancelled = true }
+  }, [items, value])
+
+  const options = useMemo(() => {
+    const pageOptions = items.map((character) => ({
+      value: character.id,
+      label: character.name,
+      sublabel: character.creator || undefined,
+    }))
+    return !search && selectedFallback && !items.some((item) => item.id === selectedFallback.value)
+      ? [selectedFallback, ...pageOptions]
+      : pageOptions
+  }, [items, search, selectedFallback])
+  return (
+    <SearchableSelect
+      value={value}
+      onChange={onChange}
+      options={options}
+      forceSearch
+      remoteSearch
+      onSearchChange={handleSearchChange}
+      searchPlaceholder={t('guided.searchCharacters')}
+      placeholder={t('guided.noTargets')}
+      emptyMessage={t('guided.noTargets')}
+      ariaLabel={t('guided.autoEnableTarget')}
+      loading={loading}
+      hasMore={received < total}
+      onLoadMore={loadMore}
+      loadingMessage={t('guided.loadingCharacters')}
+      loadMoreLabel={t('guided.loadMoreCharacters')}
+      portal
+    />
+  )
+}
+
+function SortableGuideRow({ guide, editing, chats, characters, activeChatId, activeCharacterId, onToggleEnabled, onToggleEdit, onUpdate, onRemove }: SortableGuideRowProps) {
   const { t } = useTranslation('settings')
   const { t: tc } = useTranslation('common')
   const { attributes, listeners, setNodeRef: setSortableRef, transform, transition, isDragging } = useSortable({ id: guide.id })
@@ -1225,6 +1479,21 @@ function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpd
     user_suffix: t('guided.positionAfter'),
   }[guide.position] ?? guide.position
   const modeLabel = guide.mode === 'oneshot' ? t('guided.oneshot') : t('guided.persistent')
+  const profiles = useStore((s) => s.profiles)
+  const autoTargetLabel = guide.autoEnable?.scope === 'connection'
+    ? profiles.find((profile) => profile.id === guide.autoEnable?.id)?.name
+    : guide.autoEnable?.scope === 'chat'
+      ? chats.find((chat) => chat.id === guide.autoEnable?.id)?.name
+      : guide.autoEnable?.scope === 'character'
+        ? characters.find((character) => character.id === guide.autoEnable?.id)?.name
+        : null
+  const autoLabel = guide.autoEnable
+    ? t('guided.autoSummary', { target: autoTargetLabel || t('guided.missingTarget') })
+    : null
+  const chatOptions = useMemo(() => chats.map((chat) => ({
+    value: chat.id,
+    label: chat.name || t('guided.unnamedChat'),
+  })), [chats, t])
   return (
     <div
       ref={setNodeRef}
@@ -1244,7 +1513,7 @@ function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpd
         <Toggle.Switch checked={guide.enabled} onChange={(v) => onToggleEnabled(guide.id, v)} size="sm" />
         <div className={styles.cardTitleWrap}>
           <div className={styles.cardTitle}>{guide.name || t('guided.untitled')}</div>
-          <div className={styles.cardMeta}>{modeLabel} · {positionLabel}</div>
+          <div className={styles.cardMeta}>{modeLabel} · {positionLabel}{autoLabel ? ` · ${autoLabel}` : ''}</div>
         </div>
         <Button variant="ghost" size="sm" onClick={() => onToggleEdit(guide.id)}>{editing ? tc('actions.done') : tc('actions.edit')}</Button>
         <Button variant="danger-ghost" size="sm" onClick={() => onRemove(guide.id)}>{tc('actions.delete')}</Button>
@@ -1268,6 +1537,62 @@ function SortableGuideRow({ guide, editing, onToggleEnabled, onToggleEdit, onUpd
               <option value="oneshot">{t('guided.oneshot')}</option>
             </select>
           </div>
+          <div className={styles.drawerRow}>
+            <select
+              className={styles.select}
+              value={guide.autoEnable?.scope || ''}
+              aria-label={t('guided.autoEnableScope')}
+              onChange={(event) => {
+                const scope = event.target.value as NonNullable<GuidedGeneration['autoEnable']>['scope'] | ''
+                if (!scope) {
+                  onUpdate(guide.id, { autoEnable: null })
+                  return
+                }
+                const firstId = scope === 'connection'
+                  ? profiles[0]?.id
+                  : scope === 'chat'
+                    ? (activeChatId && chats.some((chat) => chat.id === activeChatId) ? activeChatId : chats[0]?.id)
+                    : (activeCharacterId || characters[0]?.id)
+                onUpdate(guide.id, { autoEnable: { scope, id: firstId || '' } })
+              }}
+            >
+              <option value="">{t('guided.autoEnableNone')}</option>
+              <option value="connection">{t('guided.autoEnableConnection')}</option>
+              <option value="chat">{t('guided.autoEnableChat')}</option>
+              <option value="character">{t('guided.autoEnableCharacter')}</option>
+            </select>
+            {guide.autoEnable?.scope === 'connection' && (
+              <ConnectionSelect
+                kind="llm"
+                value={guide.autoEnable.id}
+                onChange={(id) => onUpdate(guide.id, { autoEnable: { scope: 'connection', id } })}
+                placeholder={t('guided.noTargets')}
+                searchPlaceholder={t('guided.searchConnections')}
+                emptyMessage={t('guided.noTargets')}
+                ariaLabel={t('guided.autoEnableTarget')}
+                portal
+              />
+            )}
+            {guide.autoEnable?.scope === 'chat' && (
+              <SearchableSelect
+                value={guide.autoEnable.id}
+                onChange={(id) => onUpdate(guide.id, { autoEnable: { scope: 'chat', id } })}
+                options={chatOptions}
+                placeholder={t('guided.noChatsForCharacter')}
+                searchPlaceholder={t('guided.searchChats')}
+                emptyMessage={t('guided.noChatsForCharacter')}
+                ariaLabel={t('guided.autoEnableTarget')}
+                portal
+              />
+            )}
+            {guide.autoEnable?.scope === 'character' && (
+              <GuidedCharacterTargetPicker
+                value={guide.autoEnable.id}
+                onChange={(id) => onUpdate(guide.id, { autoEnable: { scope: 'character', id } })}
+              />
+            )}
+          </div>
+          <p className={styles.placeholder}>{t('guided.autoEnableHint')}</p>
           <ExpandableTextarea
             className={formStyles.textarea}
             value={guide.content}
@@ -1288,7 +1613,24 @@ function GuidedGenerationSettings() {
   const guides = useStore((s) => s.guidedGenerations)
   const setSetting = useStore((s) => s.setSetting)
   const openModal = useStore((s) => s.openModal)
+  const activeChatId = useStore((s) => s.activeChatId)
+  const activeCharacterId = useStore((s) => s.activeCharacterId)
+  const characters = useStore((s) => s.characters)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [chats, setChats] = useState<ChatSummary[]>([])
+
+  useEffect(() => {
+    if (!activeCharacterId) {
+      setChats([])
+      return
+    }
+    let cancelled = false
+    setChats([])
+    chatsApi.listCharacterChats(activeCharacterId)
+      .then((result) => { if (!cancelled) setChats(result) })
+      .catch(() => { if (!cancelled) setChats([]) })
+    return () => { cancelled = true }
+  }, [activeCharacterId])
 
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
@@ -1356,6 +1698,10 @@ function GuidedGenerationSettings() {
               key={g.id}
               guide={g}
               editing={editingId === g.id}
+              chats={chats}
+              characters={characters}
+              activeChatId={activeChatId}
+              activeCharacterId={activeCharacterId}
               onToggleEnabled={(id, value) => updateGuide(id, { enabled: value })}
               onToggleEdit={(id) => setEditingId((prev) => (prev === id ? null : id))}
               onUpdate={updateGuide}
@@ -1986,22 +2332,40 @@ const normalizeWorldBookVectorSettings = (
   }
 }
 
+const EMBEDDING_LEGACY_PROVIDERS: ReadonlyArray<EmbeddingConfig['provider']> = [
+  'openai-compatible',
+  'openai',
+  'openrouter',
+  'electronhub',
+  'bananabread',
+  'nanogpt',
+]
+
+function embeddingErrorCode(err: { body?: { code?: unknown }; code?: unknown } | null | undefined): string | null {
+  const code = typeof err?.body?.code === 'string' ? err.body.code : typeof err?.code === 'string' ? err.code : null
+  if (code === EMBEDDING_ERROR_CODES.PROVIDER_UNAVAILABLE || code === EMBEDDING_ERROR_CODES.FALLBACK_EXHAUSTED) return code
+  return null
+}
+
 function EmbeddingsSettings() {
   const { t } = useTranslation('settings')
+  const showEmbeddingFallbackUi = useStore((s) => readProductivityFeature(s, 'showEmbeddingFallbackUi'))
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [errorCode, setErrorCode] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [cfg, setCfg] = useState<EmbeddingConfigWithProfiles | null>(null)
+  const [draftFallbacks, setDraftFallbacks] = useState<Array<{ key: string }>>([])
   const [apiKey, setApiKey] = useState('')
-  const [cfg, setCfg] = useState<EmbeddingConfig | null>(null)
-  const [worldBookSettings, setWorldBookSettings] = useState<WorldBookVectorSettings>(DEFAULT_WORLD_BOOK_VECTOR_SETTINGS)
-  const [worldBookSettingsLoading, setWorldBookSettingsLoading] = useState(true)
-  const [worldBookSettingsStatus, setWorldBookSettingsStatus] = useState<string | null>(null)
   const [models, setModels] = useState<string[]>([])
   const [modelLabels, setModelLabels] = useState<Record<string, string>>({})
   const [modelsLoading, setModelsLoading] = useState(false)
+  const [worldBookSettings, setWorldBookSettings] = useState<WorldBookVectorSettings>(DEFAULT_WORLD_BOOK_VECTOR_SETTINGS)
+  const [worldBookSettingsLoading, setWorldBookSettingsLoading] = useState(true)
+  const [worldBookSettingsStatus, setWorldBookSettingsStatus] = useState<string | null>(null)
   const worldBookSettingsLoadedRef = useRef(false)
   const worldBookSettingsDirtyRef = useRef(false)
   const worldBookSettingsSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -2009,12 +2373,16 @@ function EmbeddingsSettings() {
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
+    setErrorCode(null)
     try {
       const next = await embeddingsApi.getConfig()
       setCfg(next)
+      setDraftFallbacks([])
       setApiKey('')
     } catch (err: any) {
-      setError(err?.body?.error || err?.message || t('embeddings.loadFailed'))
+      const code = embeddingErrorCode(err)
+      setErrorCode(code)
+      setError(redactEmbeddingErrorMessage(err?.body?.error || err?.message || t('embeddings.loadFailed')))
     } finally {
       setLoading(false)
     }
@@ -2022,6 +2390,12 @@ function EmbeddingsSettings() {
 
   useEffect(() => {
     load()
+  }, [load])
+
+  useEffect(() => {
+    const reloadConnections = () => { load() }
+    window.addEventListener('lumiverse:embedding-connections-changed', reloadConnections)
+    return () => window.removeEventListener('lumiverse:embedding-connections-changed', reloadConnections)
   }, [load])
 
   useEffect(() => {
@@ -2074,6 +2448,8 @@ function EmbeddingsSettings() {
   const PROVIDER_DEFAULTS: Record<string, { api_url: string; model: string }> = {
     'openai-compatible': { api_url: 'https://api.openai.com/v1/embeddings', model: 'text-embedding-3-small' },
     openai: { api_url: 'https://api.openai.com/v1/embeddings', model: 'text-embedding-3-small' },
+    mistral: { api_url: 'https://api.mistral.ai/v1/embeddings', model: 'mistral-embed' },
+    cohere: { api_url: 'https://api.cohere.com/v2/embed', model: 'embed-v4.0' },
     openrouter: { api_url: 'https://openrouter.ai/api/v1/embeddings', model: 'text-embedding-3-small' },
     electronhub: { api_url: 'https://api.electronhub.top/v1/embeddings', model: 'text-embedding-3-small' },
     bananabread: { api_url: 'http://localhost:8008/v1/embeddings', model: 'mixedbread-ai/mxbai-embed-large-v1' },
@@ -2085,7 +2461,7 @@ function EmbeddingsSettings() {
     return provider === 'openai-compatible' || provider === 'bananabread' || provider === 'nvidia-nim'
   }
 
-  const update = (patch: Partial<EmbeddingConfig>) => {
+  const update = (patch: Partial<EmbeddingConfigWithProfiles>) => {
     setCfg((current) => {
       if (!current) return current
       let nextPatch = patch
@@ -2104,6 +2480,88 @@ function EmbeddingsSettings() {
       }
       return { ...current, ...nextPatch }
     })
+  }
+
+  const applyPrimaryConnection = (id: string) => {
+    const nextId = isUsableProfileId(id) ? id : null
+    setCfg((current) => {
+      if (!current) return current
+      const next: EmbeddingConfigWithProfiles = {
+        ...current,
+        primaryProfileId: nextId,
+        fallbackProfileIds: (current.fallbackProfileIds ?? []).filter((fallbackId) => fallbackId !== nextId && isUsableProfileId(fallbackId)),
+      }
+      const connection = nextId ? current.connectionProfiles?.find((entry) => entry.id === nextId) : undefined
+      if (!connection) return next
+      if (EMBEDDING_LEGACY_PROVIDERS.includes(connection.provider as EmbeddingConfig['provider'])) {
+        next.provider = connection.provider as EmbeddingConfig['provider']
+      }
+      if (connection.model) next.model = connection.model
+      if (connection.api_url) next.api_url = connection.api_url
+      if (typeof connection.dimensions === 'number' && Number.isFinite(connection.dimensions) && connection.dimensions > 0) {
+        next.dimensions = Math.floor(connection.dimensions)
+      }
+      return next
+    })
+  }
+
+  const setFallbackOrder = (ids: string[]) => {
+    update({
+      fallbackProfileIds: ids.filter((id) => isUsableProfileId(id)),
+    })
+  }
+
+  const addFallback = (id: string) => {
+    if (!isUsableProfileId(id)) return
+    setCfg((current) => {
+      if (!current || current.primaryProfileId === id) return current
+      const fallbackProfileIds = (current.fallbackProfileIds ?? []).filter((fallbackId) => isUsableProfileId(fallbackId))
+      if (fallbackProfileIds.includes(id)) return current
+      return { ...current, fallbackProfileIds: [...fallbackProfileIds, id] }
+    })
+  }
+
+  const assignFallback = (fromId: string | null, toId: string, draftKey?: string) => {
+    if (!isUsableProfileId(toId)) return
+    if (fromId && fromId === toId) return
+    if (fromId) {
+      setCfg((current) => {
+        if (!current || current.primaryProfileId === toId) return current
+        const ids = (current.fallbackProfileIds ?? []).filter((fallbackId) => isUsableProfileId(fallbackId))
+        if (ids.includes(toId)) return current
+        return {
+          ...current,
+          fallbackProfileIds: ids.map((id) => (id === fromId ? toId : id)),
+        }
+      })
+      return
+    }
+    addFallback(toId)
+    if (draftKey) setDraftFallbacks((current) => current.filter((row) => row.key !== draftKey))
+  }
+
+  const updateFallbackModel = (id: string, model: string) => {
+    if (!isUsableProfileId(id)) return
+    setCfg((current) => {
+      if (!current) return current
+      const connectionProfiles = (current.connectionProfiles ?? [])
+        .map((profile) => (profile.id === id ? { ...profile, model } : profile))
+      return { ...current, connectionProfiles }
+    })
+  }
+
+  const updateFallbackDimensions = (id: string, value: number | null) => {
+    if (!isUsableProfileId(id)) return
+    setCfg((current) => {
+      if (!current) return current
+      const connectionProfiles = (current.connectionProfiles ?? [])
+        .map((profile) => (profile.id === id ? { ...profile, dimensions: value } : profile))
+      return { ...current, connectionProfiles }
+    })
+  }
+
+  const removeFallback = (id: string) => {
+    setFallbackOrder((cfg?.fallbackProfileIds ?? []).filter((fallbackId) => fallbackId !== id))
   }
 
   const updateWorldBookSettings = (patch: Partial<WorldBookVectorSettings>) => {
@@ -2129,33 +2587,65 @@ function EmbeddingsSettings() {
     if (!cfg) return
     setSaving(true)
     setError(null)
+    setErrorCode(null)
     setSuccess(null)
     try {
-      const saved = await embeddingsApi.updateConfig({
-        enabled: cfg.enabled,
-        provider: cfg.provider,
-        api_url: cfg.api_url,
-        model: cfg.model,
-        dimensions: cfg.dimensions,
-        send_dimensions: cfg.send_dimensions,
-        retrieval_top_k: worldBookSettings.retrievalTopK,
-        hybrid_weight_mode: cfg.hybrid_weight_mode,
-        preferred_context_size: cfg.preferred_context_size,
-        batch_size: cfg.batch_size,
-        similarity_threshold: cfg.similarity_threshold,
-        rerank_cutoff: cfg.rerank_cutoff,
-        vectorize_world_books: cfg.vectorize_world_books,
-        vectorize_chat_messages: cfg.vectorize_chat_messages,
-        vectorize_chat_documents: cfg.vectorize_chat_documents,
-        chat_memory_mode: cfg.chat_memory_mode,
-        request_timeout: cfg.request_timeout,
-        api_key: apiKey.trim() ? apiKey.trim() : undefined,
-      })
+      let payload: Parameters<typeof embeddingsApi.updateConfig>[0]
+      if (showEmbeddingFallbackUi) {
+        const selectedIds = selectedEmbeddingProfileIds(cfg)
+        // Connections owns the complete dedicated embedding-profile list.
+        // Settings only chooses the active chain and may override its models;
+        // saving here must never discard unselected embedding connections.
+        const connectionProfiles = (cfg.connectionProfiles ?? []).map((profile) => {
+          if (profile.id === cfg.primaryProfileId) {
+            return {
+              ...profile,
+              ...(cfg.dimensions != null ? { dimensions: cfg.dimensions } : {}),
+              ...(cfg.model ? { model: cfg.model } : {}),
+            }
+          }
+          return profile
+        })
+        const primary = connectionProfiles.find((profile) => profile.id === cfg.primaryProfileId) ?? connectionProfiles[0]
+        payload = buildEmbeddingConfigUpdate({
+          ...cfg,
+          retrieval_top_k: worldBookSettings.retrievalTopK,
+          connectionProfiles,
+          primaryProfileId: primary?.id ?? null,
+          fallbackProfileIds: selectedIds.filter((id) => id !== primary?.id && connectionProfiles.some((profile) => profile.id === id)),
+          ...(primary ? {
+            ...(EMBEDDING_LEGACY_PROVIDERS.includes(primary.provider as EmbeddingConfig['provider'])
+              ? { provider: primary.provider as EmbeddingConfig['provider'] }
+              : {}),
+            model: cfg.model || primary.model,
+            api_url: primary.api_url || cfg.api_url,
+            dimensions: primary.dimensions ?? cfg.dimensions,
+          } : {}),
+        })
+      } else {
+        const built = buildEmbeddingConfigUpdate({
+          ...cfg,
+          retrieval_top_k: worldBookSettings.retrievalTopK,
+        })
+        payload = {
+          ...built,
+          connectionProfiles: undefined,
+          provider: cfg.provider,
+          model: cfg.model,
+          api_url: cfg.api_url,
+          dimensions: cfg.dimensions,
+          ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+        }
+      }
+      const saved = await embeddingsApi.updateConfig(payload)
       setCfg(saved)
-      setApiKey('')
+      setDraftFallbacks([])
+      if (!showEmbeddingFallbackUi) setApiKey('')
       setSuccess(t('embeddings.saveSuccess'))
     } catch (err: any) {
-      setError(err?.body?.error || err?.message || t('embeddings.saveFailed'))
+      const code = embeddingErrorCode(err)
+      setErrorCode(code)
+      setError(redactEmbeddingErrorMessage(err?.body?.error || err?.message || t('embeddings.saveFailed')))
     } finally {
       setSaving(false)
     }
@@ -2164,12 +2654,14 @@ function EmbeddingsSettings() {
   const test = async () => {
     setTesting(true)
     setError(null)
+    setErrorCode(null)
     setSuccess(null)
     try {
       const result = await embeddingsApi.testConfig('Lumiverse vector test')
       setCfg((current) => current
         ? {
             ...current,
+            ...result.config,
             dimensions: result.applied_dimensions,
             has_api_key: result.config.has_api_key,
             inherited: result.config.inherited,
@@ -2177,7 +2669,9 @@ function EmbeddingsSettings() {
         : result.config)
       setSuccess(t('embeddings.testSuccess', { dims: result.applied_dimensions }))
     } catch (err: any) {
-      setError(err?.body?.error || err?.message || t('embeddings.testFailed'))
+      const code = embeddingErrorCode(err)
+      setErrorCode(code)
+      setError(redactEmbeddingErrorMessage(err?.body?.error || err?.message || t('embeddings.testFailed')))
     } finally {
       setTesting(false)
     }
@@ -2220,7 +2714,9 @@ function EmbeddingsSettings() {
     {
       label: t('embeddings.checkApiKey'),
       description: t('embeddings.checkApiKeyDesc'),
-      complete: cfg.has_api_key,
+      complete: showEmbeddingFallbackUi
+        ? (cfg.has_api_key || !!cfg.connectionProfiles?.find((entry) => entry.id === cfg.primaryProfileId)?.hasSecret)
+        : cfg.has_api_key,
     },
     {
       label: t('embeddings.checkDimensions'),
@@ -2240,6 +2736,16 @@ function EmbeddingsSettings() {
   const inherited = !!cfg.inherited
   const canEditApiUrl = providerAllowsCustomApiUrl(cfg.provider)
   const defaultApiUrl = PROVIDER_DEFAULTS[cfg.provider]?.api_url || cfg.api_url
+  const primaryId = isUsableProfileId(cfg.primaryProfileId) ? cfg.primaryProfileId : null
+  const fallbackIds = (cfg.fallbackProfileIds ?? []).filter((id) => isUsableProfileId(id) && id !== primaryId)
+  const projectedForChain = (cfg.connectionProfiles ?? []).map((profile) => {
+    if (profile.id === primaryId && cfg.model) return { ...profile, model: cfg.model }
+    return profile
+  })
+  const chain = selectFallbackChain({
+    ...cfg,
+    connectionProfiles: projectedForChain,
+  })
   const worldBookPresetDescriptions: Record<WorldBookVectorPresetMode, string> = {
     lean: t('embeddings.presetLeanDesc'),
     balanced: t('embeddings.presetBalancedDesc'),
@@ -2264,7 +2770,11 @@ function EmbeddingsSettings() {
         </p>
       )}
 
-      {error && <p className={styles.errorText}>{error}</p>}
+      {error && (
+        <p className={styles.errorText} data-embedding-error-code={errorCode ?? undefined}>
+          {errorCode ? `${errorCode}: ${error}` : error}
+        </p>
+      )}
       {success && <p className={styles.successText}>{success}</p>}
 
       <div className={styles.embeddingChecklist}>
@@ -2335,99 +2845,227 @@ function EmbeddingsSettings() {
             label={t('embeddings.enable')}
           />
 
-          <div className={styles.settingsGridTwo}>
-            <div className={styles.field}>
-              <label className={styles.fieldLabel}>{t('embeddings.provider')}</label>
-              <select className={styles.select} value={cfg.provider} onChange={(e) => update({ provider: e.target.value as EmbeddingConfig['provider'] })} disabled={inherited}>
-                <option value="openai-compatible">OpenAI Compatible</option>
-                <option value="openai">OpenAI</option>
-                <option value="openrouter">OpenRouter</option>
-                <option value="electronhub">ElectronHub</option>
-                <option value="bananabread">BananaBread</option>
-                <option value="nanogpt">Nano-GPT</option>
-                <option value="nvidia-nim">NVIDIA NIM</option>
-              </select>
-            </div>
+          {!showEmbeddingFallbackUi ? (
+            /* ── Pure Original Legacy Form (when showEmbeddingFallbackUi is false) ── */
+            <>
+              <div className={styles.settingsGridTwo}>
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel}>{t('embeddings.provider')}</label>
+                  <select
+                    className={styles.select}
+                    value={cfg.provider}
+                    onChange={(e) => update({ provider: e.target.value as EmbeddingConfig['provider'] })}
+                    disabled={inherited}
+                  >
+                    <option value="openai-compatible">OpenAI Compatible</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="mistral">Mistral</option>
+                    <option value="cohere">Cohere</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="electronhub">ElectronHub</option>
+                    <option value="bananabread">BananaBread</option>
+                    <option value="nanogpt">Nano-GPT</option>
+                    <option value="nvidia-nim">NVIDIA NIM</option>
+                  </select>
+                </div>
 
-            <div className={styles.field}>
-              <label className={styles.fieldLabel}>{t('embeddings.model')}</label>
-              <ModelCombobox
-                value={cfg.model}
-                onChange={(value) => update({ model: value })}
-                models={models}
-                modelLabels={modelLabels}
-                loading={modelsLoading}
-                onRefresh={fetchModels}
-                autoRefreshOnFocus
-                refreshKey={`${cfg.provider}:${cfg.api_url}`}
-                placeholder={t('embeddings.modelPlaceholder')}
-                emptyMessage={t('embeddings.noModels')}
-                browseHint={t('embeddings.browseHint')}
-                disabled={inherited}
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel}>{t('embeddings.model')}</label>
+                  <ModelCombobox
+                    value={cfg.model}
+                    onChange={(value) => update({ model: value })}
+                    models={models}
+                    modelLabels={modelLabels}
+                    loading={modelsLoading}
+                    onRefresh={fetchModels}
+                    autoRefreshOnFocus
+                    refreshKey={`${cfg.provider}:${cfg.api_url}`}
+                    placeholder={t('embeddings.modelPlaceholder')}
+                    emptyMessage={t('embeddings.noModels')}
+                    browseHint={t('embeddings.browseHint')}
+                    disabled={inherited}
+                  />
+                </div>
+              </div>
+
+              {canEditApiUrl ? (
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel}>{t('embeddings.apiUrl')}</label>
+                  <input className={styles.select} value={cfg.api_url} onChange={(e) => update({ api_url: e.target.value })} disabled={inherited} />
+                  <span className={styles.helperText}>{t('embeddings.apiUrlPathHint')}</span>
+                  {cfg.provider === 'bananabread' && (
+                    <span className={styles.helperText}>{t('embeddings.bananabreadHint')}</span>
+                  )}
+                  {cfg.provider === 'nvidia-nim' && (
+                    <span className={styles.helperText}>{t('embeddings.nvidiaNimHint')}</span>
+                  )}
+                </div>
+              ) : (
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel}>{t('embeddings.apiEndpoint')}</label>
+                  <span className={styles.helperText}>{t('embeddings.apiEndpointDefault', { url: defaultApiUrl })}</span>
+                </div>
+              )}
+
+              <div className={styles.settingsGridTwo}>
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel}>{t('embeddings.dimensionsOptional')}</label>
+                  <NumericInput
+                    className={styles.numberInput}
+                    min={1}
+                    value={cfg.dimensions ?? null}
+                    integer
+                    allowEmpty
+                    onChange={(value) => update({ dimensions: value })}
+                  />
+                </div>
+
+                {!inherited && (
+                  <div className={styles.field}>
+                    <label className={styles.fieldLabel}>
+                      {cfg.has_api_key ? t('embeddings.apiKeyConfigured') : t('embeddings.apiKeyNotConfigured')}
+                    </label>
+                    <input
+                      className={styles.select}
+                      type="password"
+                      value={apiKey}
+                      placeholder={t('embeddings.apiKeyPlaceholder')}
+                      onChange={(e) => setApiKey(e.target.value)}
+                    />
+                  </div>
+                )}
+              </div>
+
+              <Toggle.Checkbox
+                checked={cfg.send_dimensions ?? false}
+                onChange={(checked) => update({ send_dimensions: checked })}
+                label={t('embeddings.sendDimensions')}
+                hint={t('embeddings.sendDimensionsHint')}
               />
-            </div>
-          </div>
-
-          {canEditApiUrl ? (
-            <div className={styles.field}>
-              <label className={styles.fieldLabel}>{t('embeddings.apiUrl')}</label>
-              <input className={styles.select} value={cfg.api_url} onChange={(e) => update({ api_url: e.target.value })} disabled={inherited} />
-              <span className={styles.helperText}>
-                {t('embeddings.apiUrlPathHint')}
-              </span>
-              {cfg.provider === 'bananabread' && (
-                <span className={styles.helperText}>
-                  {t('embeddings.bananabreadHint')}
-                </span>
-              )}
-              {cfg.provider === 'nvidia-nim' && (
-                <span className={styles.helperText}>{t('embeddings.nvidiaNimHint')}</span>
-              )}
-            </div>
+            </>
           ) : (
-            <div className={styles.field}>
-              <label className={styles.fieldLabel}>{t('embeddings.apiEndpoint')}</label>
-              <span className={styles.helperText}>{t('embeddings.apiEndpointDefault', { url: defaultApiUrl })}</span>
-            </div>
-          )}
-
-          <div className={styles.settingsGridTwo}>
-            <div className={styles.field}>
-              <label className={styles.fieldLabel}>{t('embeddings.dimensionsOptional')}</label>
-              <NumericInput
-                className={styles.numberInput}
-                min={1}
-                value={cfg.dimensions ?? null}
-                integer
-                allowEmpty
-                onChange={(value) => update({ dimensions: value })}
+            /* ── Connection Profiles & Fallbacks Mode (when showEmbeddingFallbackUi is true) ── */
+            <>
+              <EmbeddingConnectionPicker
+                label={t('embeddings.connection')}
+                ariaLabel={t('embeddings.connection')}
+                profiles={cfg.connectionProfiles ?? []}
+                connectionProfileId={primaryId ?? null}
+                model={cfg.model || null}
+                onConnectionChange={(id) => applyPrimaryConnection(id || '')}
+                onModelChange={(model) => update({ model: model || '' })}
+                disabled={inherited}
+                testId="embeddings-primary-connection"
               />
-            </div>
 
-            {!inherited && (
               <div className={styles.field}>
-                <label className={styles.fieldLabel}>
-                  {cfg.has_api_key ? t('embeddings.apiKeyConfigured') : t('embeddings.apiKeyNotConfigured')}
-                </label>
-                <input
-                  className={styles.select}
-                  type="password"
-                  value={apiKey}
-                  placeholder={t('embeddings.apiKeyPlaceholder')}
-                  onChange={(e) => setApiKey(e.target.value)}
+                <label className={styles.fieldLabel}>{t('embeddings.dimensionsOptional')}</label>
+                <NumericInput
+                  className={styles.numberInput}
+                  min={1}
+                  value={cfg.dimensions ?? null}
+                  integer
+                  allowEmpty
+                  onChange={(value) => update({ dimensions: value })}
                 />
               </div>
-            )}
-          </div>
 
-          <Toggle.Checkbox
-            checked={cfg.send_dimensions ?? false}
-            onChange={(checked) => update({ send_dimensions: checked })}
-            label={t('embeddings.sendDimensions')}
-            hint={t('embeddings.sendDimensionsHint')}
-          />
+              <Toggle.Checkbox
+                checked={cfg.send_dimensions ?? false}
+                onChange={(checked) => update({ send_dimensions: checked })}
+                label={t('embeddings.sendDimensions')}
+                hint={t('embeddings.sendDimensionsHint')}
+              />
+            </>
+          )}
         </div>
       </div>
+
+      {showEmbeddingFallbackUi && <div className={styles.settingsCard} data-embeddings-profiles>
+        <div className={styles.settingsCardHeader}>
+          <div>
+            <div className={styles.subsectionTitle}>Profiles</div>
+            <div className={styles.settingsCardTitle}>Primary and fallback connections</div>
+            <div className={styles.settingsCardMeta}>
+              Ordered fallbacks skip incompatible dimensions. Vertex uses project and region, not a host URL.
+            </div>
+          </div>
+        </div>
+        <div className={styles.settingsCardBody}>
+          <p className={styles.helperText} data-fallback-chain>
+            Fallback chain: {chain.length > 0 ? chain.map((profile) => profile.model || profile.provider || profile.id).join(' → ') : 'none'}
+          </p>
+          {fallbackIds.map((id, fallbackIndex) => {
+            const snapshot = projectedForChain.find((profile) => profile.id === id)
+            const modelValue = snapshot?.model || ''
+            return (
+              <div
+                key={id}
+                data-embedding-profile={id}
+                data-has-secret={snapshot?.hasSecret ? 'true' : 'false'}
+              >
+                <EmbeddingConnectionPicker
+                  label={t('embeddings.connection')}
+                  ariaLabel={t('embeddings.fallbackConnection', { defaultValue: 'Fallback {{n}}', n: fallbackIndex + 1 })}
+                  profiles={cfg.connectionProfiles ?? []}
+                  connectionProfileId={id}
+                  model={modelValue || null}
+                  onConnectionChange={(nextId) => assignFallback(id, nextId || '')}
+                  onModelChange={(model) => updateFallbackModel(id, model || '')}
+                  disabled={inherited}
+                  onRemove={inherited ? undefined : () => removeFallback(id)}
+                  testId={`embeddings-fallback-${id}`}
+                />
+                <div className={styles.field}>
+                  <label className={styles.fieldLabel}>{t('embeddings.dimensionsOptional')}</label>
+                  <NumericInput
+                    className={styles.numberInput}
+                    min={1}
+                    integer
+                    allowEmpty
+                    value={snapshot?.dimensions ?? null}
+                    onChange={(value) => updateFallbackDimensions(id, value)}
+                    disabled={inherited}
+                  />
+                  <span className={styles.helperText}>
+                    {t('embeddings.fallbackDimensionsHint', {
+                      defaultValue: 'Used when this fallback\'s native size differs from the primary. Mismatched dims are skipped in the fallback chain.',
+                    })}
+                  </span>
+                </div>
+              </div>
+            )
+          })}
+          {draftFallbacks.map((draft) => (
+            <div key={draft.key} data-embedding-fallback-draft={draft.key}>
+              <EmbeddingConnectionPicker
+                label={t('embeddings.connection')}
+                ariaLabel="Add fallback"
+                profiles={(cfg.connectionProfiles ?? []).filter((profile) => profile.id !== primaryId && !fallbackIds.includes(profile.id))}
+                connectionProfileId={null}
+                model={null}
+                onConnectionChange={(nextId) => assignFallback(null, nextId || '', draft.key)}
+                onModelChange={() => undefined}
+                disabled={inherited}
+                onRemove={inherited ? undefined : () => setDraftFallbacks((current) => current.filter((row) => row.key !== draft.key))}
+              />
+            </div>
+          ))}
+          <div className={pickerStyles.addFallbackRow}>
+            <button
+              type="button"
+              className={pickerStyles.addBtn}
+              disabled={inherited}
+              data-testid="embeddings-add-fallback"
+              aria-label="Add fallback"
+              onClick={() => setDraftFallbacks((current) => [...current, { key: `draft-${Date.now()}-${current.length}` }])}
+            >
+              <Plus size={12} />
+              Add fallback
+            </button>
+          </div>
+        </div>
+      </div>}
 
       <div className={styles.settingsCard}>
         <div className={styles.settingsCardHeader}>
@@ -2936,132 +3574,6 @@ function WebSearchSettings() {
   )
 }
 
-function ImageOptimizationSettings() {
-  const { t } = useTranslation('settings')
-  const thumbnailSettings = useStore((s) => (s as any).thumbnailSettings as { smallSize?: number, largeSize?: number } | undefined)
-  const setSetting = useStore((s) => s.setSetting)
-
-  const smallSize = thumbnailSettings?.smallSize ?? 300
-  const largeSize = thumbnailSettings?.largeSize ?? 700
-
-  const [rebuilding, setRebuilding] = useState(false)
-  const [rebuildProgress, setRebuildProgress] = useState<{ current: number, total: number } | null>(null)
-  const [rebuildStatus, setRebuildStatus] = useState<string | null>(null)
-
-  const update = (patch: { smallSize?: number, largeSize?: number }) => {
-    setSetting('thumbnailSettings', { smallSize, largeSize, ...patch })
-  }
-
-  const formatRebuildParts = (generated: number, skipped: number, failed: number) => {
-    const parts: string[] = []
-    if (generated > 0) parts.push(t('advanced.rebuildGenerated', { count: generated }))
-    if (skipped > 0) parts.push(t('advanced.rebuildSkipped', { count: skipped }))
-    if (failed > 0) parts.push(t('advanced.rebuildFailedCount', { count: failed }))
-    return parts.join(', ')
-  }
-
-  const handleRebuild = async () => {
-    if (rebuilding) return
-    setRebuilding(true)
-    setRebuildStatus(t('advanced.rebuildStarting'))
-    setRebuildProgress(null)
-    try {
-      const result = await imagesApi.rebuildThumbnails({
-        onProgress: (p) => {
-          setRebuildProgress({ current: p.current, total: p.total })
-          const parts = [`${p.current}/${p.total}`]
-          if (p.generated > 0) parts.push(t('advanced.rebuildGenerated', { count: p.generated }))
-          if (p.skipped > 0) parts.push(t('advanced.rebuildSkipped', { count: p.skipped }))
-          if (p.failed > 0) parts.push(t('advanced.rebuildFailedCount', { count: p.failed }))
-          setRebuildStatus(parts.join(' \u2022 '))
-        },
-      })
-      setRebuildStatus(t('advanced.rebuildDone', {
-        summary: formatRebuildParts(result.generated, result.skipped, result.failed),
-      }))
-    } catch (err: any) {
-      setRebuildStatus(t('advanced.rebuildFailed', {
-        error: err.message || t('advanced.rebuildUnknownError'),
-      }))
-    } finally {
-      setRebuilding(false)
-    }
-  }
-
-  const pct = rebuildProgress && rebuildProgress.total > 0
-    ? Math.round((rebuildProgress.current / rebuildProgress.total) * 100)
-    : 0
-
-  return (
-    <>
-      <p className={styles.placeholder}>
-        {t('advanced.imgOptHelper')}
-      </p>
-
-      <div className={styles.field}>
-        <div className={styles.imgOptSliderHeader}>
-          <label className={styles.fieldLabel}>{t('advanced.smallTier')}</label>
-          <span className={styles.imgOptSliderValue}>{smallSize}px</span>
-        </div>
-        <input
-          type="range"
-          className={styles.imgOptSlider}
-          min={100} max={500} step={50}
-          value={smallSize}
-          onChange={(e) => update({ smallSize: Number(e.target.value) })}
-        />
-        <span className={styles.placeholder} style={{ fontSize: 11 }}>
-          {t('advanced.smallTierHint')}
-        </span>
-      </div>
-
-      <div className={styles.field}>
-        <div className={styles.imgOptSliderHeader}>
-          <label className={styles.fieldLabel}>{t('advanced.largeTier')}</label>
-          <span className={styles.imgOptSliderValue}>{largeSize}px</span>
-        </div>
-        <input
-          type="range"
-          className={styles.imgOptSlider}
-          min={400} max={1200} step={50}
-          value={largeSize}
-          onChange={(e) => update({ largeSize: Number(e.target.value) })}
-        />
-        <span className={styles.placeholder} style={{ fontSize: 11 }}>
-          {t('advanced.largeTierHint')}
-        </span>
-      </div>
-
-      <div className={styles.imgOptRebuild}>
-        <div className={styles.field} style={{ flex: 1 }}>
-          <label className={styles.fieldLabel}>{t('advanced.rebuildCache')}</label>
-          <span className={styles.placeholder} style={{ fontSize: 11 }}>
-            {t('advanced.rebuildCacheHint')}
-          </span>
-        </div>
-        <button
-          type="button"
-          className={clsx(styles.segmentedBtn, styles.segmentedBtnActive)}
-          style={{ padding: '6px 16px', whiteSpace: 'nowrap' }}
-          disabled={rebuilding}
-          onClick={handleRebuild}
-        >
-          {rebuilding ? t('advanced.rebuilding') : t('advanced.rebuildThumbnails')}
-        </button>
-      </div>
-      {rebuilding && rebuildProgress && rebuildProgress.total > 0 && (
-        <div style={{ width: '100%', height: 4, borderRadius: 2, background: 'var(--lumiverse-fill-subtle)', overflow: 'hidden' }}>
-          <div style={{ width: `${pct}%`, height: '100%', borderRadius: 2, background: 'var(--lumiverse-primary)', transition: 'width 0.2s ease' }} />
-        </div>
-      )}
-      {rebuildStatus && (
-        <span className={styles.placeholder} style={{ fontSize: 11 }}>
-          {rebuildStatus}
-        </span>
-      )}
-    </>
-  )
-}
 
 function AdvancedSettings() {
   const { t } = useTranslation('settings')
@@ -3135,11 +3647,6 @@ function AdvancedSettings() {
   return (
     <div className={styles.settingsSection}>
       <h3 id={sectionAnchorId('advanced', 'general')} className={styles.sectionTitle}>{t('advanced.title')}</h3>
-
-      {/* Image Optimization accordion */}
-      <CollapsibleSection title={t('advanced.imageOptimization')} defaultExpanded={false}>
-        <ImageOptimizationSettings />
-      </CollapsibleSection>
 
       <CollapsibleSection title={t('advanced.spindleLogging')} defaultExpanded={false}>
         <Toggle.Checkbox
@@ -3631,6 +4138,291 @@ function LumiHubSettings() {
       )}
 
       {error && <span className={styles.errorText}>{error}</span>}
+    </div>
+  )
+}
+
+function IllarinSettings() {
+  const { t } = useTranslation('settings')
+  const user = useStore((s) => s.user)
+  const defaultInstanceName = user?.name ? `${user.name}'s Lumiverse` : t('illarin.defaultInstance')
+  const [illarinUrl, setIllarinUrl] = useState('https://illarin.xyz')
+  const [instanceName, setInstanceName] = useState(defaultInstanceName)
+  const [status, setStatus] = useState<{
+    linked: boolean
+    illarin_url?: string
+    instance_name?: string
+    instance_id?: string
+    scopes?: string[]
+    linked_at?: string | null
+    declaration_version?: string | null
+    pending_link?: { status: 'pending' | 'linked' | 'failed'; reason?: string | null } | null
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [linking, setLinking] = useState(false)
+  const statusRef = useRef(status)
+  useEffect(() => { statusRef.current = status }, [status])
+  const [unlinking, setUnlinking] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [deviceCode, setDeviceCode] = useState<{ user_code: string; verification_url: string } | null>(null)
+
+  // Loopback browser linking only reaches the backend when the BROWSER runs
+  // on the same machine as the server; otherwise fall back to device codes.
+  const isLocalOrigin = ['127.0.0.1', 'localhost', '::1'].includes(window.location.hostname)
+  const pollRef = useRef<{ timer?: ReturnType<typeof setInterval>; timeout?: ReturnType<typeof setTimeout> }>({})
+
+  const stopPolling = useCallback(() => {
+    clearInterval(pollRef.current.timer)
+    clearTimeout(pollRef.current.timeout)
+  }, [])
+  useEffect(() => stopPolling, [stopPolling])
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/v1/illarin/status', { credentials: 'include' })
+      if (res.ok) {
+        const data = await res.json()
+        setStatus(data)
+        if (data.illarin_url) setIllarinUrl(data.illarin_url)
+        if (data.instance_name) setInstanceName((current) => current || data.instance_name)
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchStatus()
+    const interval = setInterval(fetchStatus, 10_000)
+    return () => clearInterval(interval)
+  }, [fetchStatus])
+
+  const finishLinking = () => {
+    stopPolling()
+    setLinking(false)
+    setDeviceCode(null)
+    fetchStatus()
+  }
+
+  const startDeviceFlow = async () => {
+    const res = await fetch('/api/v1/illarin/link/device', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ illarin_url: illarinUrl.trim(), instance_name: instanceName.trim() || defaultInstanceName }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      setError((body as any).error || t('illarin.errLinkFailed'))
+      setLinking(false)
+      return false
+    }
+    const data = await res.json() as { user_code: string; verification_url: string; expires_at: string }
+    setDeviceCode({ user_code: data.user_code, verification_url: data.verification_url })
+    // Poll respecting the server-enforced interval; give up at expiry.
+    pollRef.current.timer = setInterval(async () => {
+      const check = await fetch('/api/v1/illarin/link/device/status', { credentials: 'include' })
+      if (!check.ok) return
+      const checkData = await check.json() as { status: string }
+      if (checkData.status === 'linked') finishLinking()
+      else if (checkData.status !== 'pending') {
+        setError(t('illarin.errLinkFailed'))
+        finishLinking()
+      }
+    }, 3000)
+    pollRef.current.timeout = setTimeout(finishLinking, 10 * 60 * 1000)
+    return true
+  }
+
+  const handleLink = async () => {
+    if (!illarinUrl.trim()) {
+      setError(t('illarin.errUrl'))
+      return
+    }
+
+    // Reserve the tab while this click still has browser user activation.
+    // Calling window.open only after the API request is blocked by mobile
+    // browsers, even though the request originated from this button click.
+    const authorizationTab = isLocalOrigin ? window.open('', '_blank') : null
+    if (authorizationTab) authorizationTab.opener = null
+
+    setError(null)
+    setLinking(true)
+    if (!isLocalOrigin) {
+      await startDeviceFlow()
+      return
+    }
+    try {
+      const res = await fetch('/api/v1/illarin/link/browser', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ illarin_url: illarinUrl.trim(), instance_name: instanceName.trim() || defaultInstanceName }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        authorizationTab?.close()
+        setError((body as any).error || t('illarin.errLinkFailed'))
+        setLinking(false)
+        return
+      }
+      const data = await res.json() as { authorize_url?: string }
+      const authorizeUrl = getSafeHttpsUrl(data.authorize_url)
+      if (!authorizeUrl) {
+        authorizationTab?.close()
+        setError(t('illarin.errLinkFailed'))
+        setLinking(false)
+        return
+      }
+
+      // Prefer the tab reserved synchronously above. If popups are disabled,
+      // same-tab navigation still lets the user complete the loopback flow.
+      if (authorizationTab) authorizationTab.location.replace(authorizeUrl)
+      else window.location.assign(authorizeUrl)
+
+      // Backend listens on loopback while the authorization page is open.
+      pollRef.current.timer = setInterval(async () => {
+        await fetchStatus()
+        if (statusRef.current?.linked || statusRef.current?.pending_link?.status === 'failed') {
+          if (statusRef.current?.pending_link?.status === 'failed' && !statusRef.current.linked) {
+            setError(t('illarin.errLinkFailed'))
+            stopPolling()
+            setLinking(false)
+          } else {
+            finishLinking()
+          }
+        }
+      }, 2000)
+      pollRef.current.timeout = setTimeout(finishLinking, 5 * 60 * 1000)
+    } catch (err: any) {
+      authorizationTab?.close()
+      setError(err.message || t('illarin.errConnectFailed'))
+      setLinking(false)
+    }
+  }
+
+  const handleUnlink = async () => {
+    setUnlinking(true)
+    try {
+      await fetch('/api/v1/illarin/unlink', { method: 'POST', credentials: 'include' })
+      setStatus((prev) => (prev ? { ...prev, linked: false } : { linked: false }))
+    } catch {
+      setError(t('illarin.errUnlinkFailed'))
+    } finally {
+      setUnlinking(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className={styles.settingsSection}>
+        <h3 id={sectionAnchorId('illarin', 'general')} className={styles.sectionTitle}>{t('illarin.title')}</h3>
+        <span className={styles.helperText}>{t('illarin.loading')}</span>
+      </div>
+    )
+  }
+
+  return (
+    <div className={styles.settingsSection}>
+      <h3 id={sectionAnchorId('illarin', 'general')} className={styles.sectionTitle}>{t('illarin.title')}</h3>
+      <span className={styles.helperText}>{t('illarin.helper')}</span>
+
+      {status?.linked ? (
+        <div className={styles.lumihubCard}>
+          <div className={styles.lumihubStatusRow}>
+            <span className={clsx(styles.lumihubDot, styles.lumihubDotOnline)} />
+            <span className={styles.lumihubStatusText}>
+              {t('illarin.linkedAs', { name: status.instance_name })}
+            </span>
+          </div>
+
+          <div className={styles.field}>
+            <span className={styles.fieldLabel}>{t('illarin.url')}</span>
+            <span className={styles.lumihubMeta}>{status.illarin_url}</span>
+          </div>
+
+          <div className={styles.field}>
+            <span className={styles.fieldLabel}>{t('illarin.instanceIdLabel')}</span>
+            <span className={styles.lumihubMeta}>{status.instance_id}</span>
+          </div>
+
+          <div className={styles.field}>
+            <span className={styles.fieldLabel}>{t('illarin.scopesLabel')}</span>
+            <span className={styles.lumihubMeta}>{(status.scopes ?? []).join(', ')}</span>
+          </div>
+
+          {status.declaration_version && (
+            <div className={styles.field}>
+              <span className={styles.fieldLabel}>{t('illarin.versionLabel')}</span>
+              <span className={styles.lumihubMeta}>v{status.declaration_version}</span>
+            </div>
+          )}
+
+          <span className={styles.lumihubMeta}>{t('illarin.unlinkHint')}</span>
+
+          <Button variant="danger-ghost" size="sm" onClick={handleUnlink} disabled={unlinking} loading={unlinking}>
+            {unlinking ? t('illarin.unlinking') : t('illarin.unlink')}
+          </Button>
+        </div>
+      ) : (
+        <div className={styles.lumihubCard}>
+          <div className={styles.field}>
+            <span className={styles.fieldLabel}>{t('illarin.url')}</span>
+            <input
+              className={styles.lumihubInput}
+              type="text"
+              placeholder={t('illarin.urlPlaceholder')}
+              value={illarinUrl}
+              onChange={(e) => setIllarinUrl(e.target.value)}
+            />
+          </div>
+
+          <div className={styles.field}>
+            <span className={styles.fieldLabel}>{t('illarin.instanceName')}</span>
+            <input
+              className={styles.lumihubInput}
+              type="text"
+              value={instanceName}
+              onChange={(e) => setInstanceName(e.target.value)}
+            />
+          </div>
+
+          {deviceCode && (
+            <div className={styles.lumihubDisclosure}>
+              <span className={styles.lumihubDisclosureTitle}>{t('illarin.deviceTitle')}</span>
+              <span className={styles.lumihubDisclosureText}>
+                {t('illarin.deviceStep1', { url: deviceCode.verification_url })}
+                <br />
+                {t('illarin.deviceStep2')}
+              </span>
+              <span className={styles.lumihubInput} style={{ fontSize: '1.4em', textAlign: 'center', letterSpacing: '0.2em' }}>
+                {deviceCode.user_code}
+              </span>
+              <span className={styles.lumihubDisclosureText}>{t('illarin.deviceNote')}</span>
+            </div>
+          )}
+
+          {linking && (
+            <span className={styles.helperText}>
+              {deviceCode ? t('illarin.waitingDevice') : t('illarin.waitingBrowser')}
+            </span>
+          )}
+
+          {error && <span className={styles.helperText} style={{ color: 'var(--lumiverse-danger)' }}>{error}</span>}
+
+          <Button variant="primary" size="sm" onClick={handleLink} disabled={linking} loading={linking}>
+            {linking ? t('illarin.linking') : t('illarin.link')}
+          </Button>
+
+          {!isLocalOrigin && !deviceCode && (
+            <Button variant="ghost" size="sm" onClick={() => { setLinking(true); void startDeviceFlow() }}>
+              {t('illarin.deviceFallback')}
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   )
 }

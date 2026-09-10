@@ -6,6 +6,8 @@ export interface LlmTextPart {
   type: "text";
   text: string;
   cache_control?: Record<string, unknown>;
+  /** Opaque Gemini thought signature for this non-tool part. */
+  thought_signature?: string;
 }
 
 export interface LlmImagePart {
@@ -19,6 +21,13 @@ export interface LlmAudioPart {
   type: "audio";
   data: string;      // base64-encoded
   mime_type: string;  // e.g. "audio/wav", "audio/mp3"
+  cache_control?: Record<string, unknown>;
+}
+
+export interface LlmVideoPart {
+  type: "video";
+  data: string;      // base64-encoded
+  mime_type: string;  // e.g. "video/mp4", "video/webm"
   cache_control?: Record<string, unknown>;
 }
 
@@ -43,6 +52,7 @@ export type LlmMessagePart =
   | LlmTextPart
   | LlmImagePart
   | LlmAudioPart
+  | LlmVideoPart
   | LlmToolUsePart
   | LlmToolResultPart;
 
@@ -91,6 +101,8 @@ export interface LlmMessage {
    *  Replayed verbatim (entire sequence, unmodified) on the assistant message
    *  to preserve chain-of-thought across tool calls. Opaque to Lumiverse. */
   reasoning_details?: Record<string, unknown>[];
+  /** Opaque Gemini signature on a non-tool response part, replayed when enabled. */
+  thought_signature?: string;
 }
 
 /** Helper: extract the text content from an LlmMessage regardless of format. */
@@ -125,6 +137,9 @@ export function describeContentForDisplay(
         case "audio":
           countPart("audio");
           return `[audio: ${part.mime_type}]`;
+        case "video":
+          countPart("video");
+          return `[video: ${part.mime_type}]`;
         case "tool_use":
           countPart("tool_use");
           return `[tool_call: ${part.name}(${JSON.stringify(part.input)})]`;
@@ -215,6 +230,8 @@ export interface GenerationResponse {
   content: string;
   reasoning?: string;
   finish_reason: string;
+  stop_details?: GenerationStopDetails | null;
+  stop_sequence?: string | null;
   /** Present when the LLM requested function calls instead of (or in addition to) generating text. */
   tool_calls?: ToolCallResult[];
   /** Provider-native reasoning blocks captured this turn (Anthropic), to replay
@@ -223,13 +240,24 @@ export interface GenerationResponse {
   /** OpenRouter `reasoning_details` captured this turn, to replay on tool-use
    *  continuations. */
   reasoning_details?: Record<string, unknown>[];
+  /** Optional Gemini signature from a non-tool response part. */
+  thought_signature?: string;
   usage?: GenerationUsage;
+}
+
+/** Provider explanation for a terminal outcome, such as an Anthropic refusal. */
+export interface GenerationStopDetails {
+  type: string;
+  category?: string | null;
+  explanation?: string | null;
 }
 
 export interface StreamChunk {
   token: string;
   reasoning?: string;
   finish_reason?: string;
+  stop_details?: GenerationStopDetails | null;
+  stop_sequence?: string | null;
   /** Accumulated function calls (set on the final chunk when finish_reason indicates tool use). */
   tool_calls?: ToolCallResult[];
   /** Provider-native reasoning blocks (set on the final chunk alongside
@@ -239,6 +267,8 @@ export interface StreamChunk {
   /** OpenRouter `reasoning_details`, accumulated across stream chunks and set on
    *  the final chunk alongside tool_calls. */
   reasoning_details?: Record<string, unknown>[];
+  /** Optional Gemini signature from a non-tool response part. */
+  thought_signature?: string;
   usage?: GenerationUsage;
 }
 
@@ -294,6 +324,8 @@ export interface AssemblyContext {
   regenFeedback?: string;
   /** Where to inject regen feedback: 'system' (last system msg) or 'user' (last user msg). */
   regenFeedbackPosition?: "system" | "user";
+  /** Freeform prompt template containing the guarded {{$regenInput}} placeholder. */
+  regenFeedbackFormat?: string;
   /** When true, an extension owns this chat's `target:prompt` regex and the
    *  host skips its own per-message prompt-regex pass. */
   skipPromptRegex?: boolean;
@@ -467,10 +499,8 @@ export interface AssemblyResult {
    *  The generate service must prepend this to the LLM response content since the model
    *  continues *after* the prefill (it's not included in the model's output). */
   assistantPrefill?: string;
-  /**
-   * A Moonshot/Kimi Partial Mode prefix for `reasoning_content`. The generation
-   * service surfaces this before the provider's streamed reasoning tail.
-   */
+  /** A provider-native `reasoning_content` prefix. The generation service
+   * surfaces this before the provider's streamed reasoning tail. */
   assistantReasoningPrefill?: string;
   /** Summary of all world info entries activated during this assembly. */
   activatedWorldInfo?: ActivatedWorldInfoEntry[];

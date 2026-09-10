@@ -2,6 +2,9 @@ import { Hono } from "hono";
 import * as svc from "../services/regex-scripts.service";
 import { parsePagination } from "../services/pagination";
 import { applyDisplayRegex } from "../services/display-regex.service";
+import { matchPromptActivation, MAX_ACTIVATION_CONTENT_LENGTH } from "../utils/regex-prompt-activation";
+import { resolveActivationFindPattern } from "../utils/regex-activation-inputs";
+import { loadActivationInputSnapshot } from "../services/regex-activation-inputs.service";
 import type { RegexMacroMode, RegexPlacement, RegexScope, RegexScript, RegexTarget } from "../types/regex-script";
 
 const app = new Hono();
@@ -204,7 +207,36 @@ app.post("/apply", async (c) => {
     result: applied.result,
     touched_vars: Array.from(applied.touchedVars),
     cacheable: applied.cacheable,
+    timed_out_script_ids: Array.from(applied.timedOutScriptIds),
   });
+});
+
+// POST /test — test regex
+app.post("/test-activation", async (c) => {
+  const body = await c.req.json().catch(() => null);
+  if (!body || typeof body.content !== "string" || typeof body.find_regex !== "string"
+    || typeof body.flags !== "string" || !validateFlags(body.flags) || !body.prompt_activation
+    || body.find_regex.length > APPLY_MAX_PATTERN_LENGTH) {
+    return c.json({ error: "A pattern, flags, content and prompt activation configuration are required" }, 400);
+  }
+  if (body.content.length > MAX_ACTIVATION_CONTENT_LENGTH) return c.json({ error: "Content exceeds maximum length" }, 413);
+  const error = svc.validatePromptActivationBinding(c.get("userId"), {
+    name: "Preview", find_regex: body.find_regex, preset_id: body.preset_id,
+    metadata: { prompt_activation: body.prompt_activation },
+  });
+  if (error) return c.json({ error }, 400);
+  try {
+    const inputs = body.find_regex.includes("{{") ? loadActivationInputSnapshot(c.get("userId"), body.preset_id, {
+      chat_id: body.chat_id, character_id: body.character_id, persona_id: body.persona_id, connection_id: body.connection_id,
+    }, [body.find_regex]) : undefined;
+    const findRegex = resolveActivationFindPattern(body.find_regex, inputs);
+    return c.json({
+      matches: await matchPromptActivation({ ...body, find_regex: findRegex }, body.prompt_activation, body.content),
+      ...(inputs ? { resolved_find_regex: findRegex } : {}),
+    });
+  } catch (error) {
+    return c.json({ matches: [], error: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 // POST /test — test regex
@@ -322,6 +354,34 @@ app.post("/:id/report-performance", async (c) => {
   });
   if (!result.script) return c.json({ error: "Not found" }, 404);
   return c.json(result.script);
+});
+
+// POST /:id/report-evidence — persist client-side execution evidence
+// (metadata.regex_evidence.quarantined) used by the display-regex tier rules.
+// Quarantine is the only field accepted: it is the only evidence that changes
+// which tier a script runs in. Successful-timing evidence was removed rather
+// than kept, because nothing read it and it could not promote a script.
+// `quarantined: false` is a valid body and clears the flag, which is how the
+// panel lets a user un-quarantine a script.
+export type RegexEvidenceReportBody = {
+  quarantined?: boolean;
+};
+
+function parseEvidenceBody(body: any): RegexEvidenceReportBody | null {
+  if (body?.quarantined === undefined) return null;
+  return { quarantined: !!body.quarantined };
+}
+
+app.post("/:id/report-evidence", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json().catch(() => ({}));
+  const patch = parseEvidenceBody(body);
+  if (!patch) return c.json({ error: "evidence patch requires a quarantined field" }, 400);
+  const script = svc.reportRegexScriptEvidence(userId, c.req.param("id"), {
+    quarantined: patch.quarantined,
+  });
+  if (!script) return c.json({ error: "Not found" }, 404);
+  return c.json(script);
 });
 
 // PUT /:id/toggle — quick enable/disable

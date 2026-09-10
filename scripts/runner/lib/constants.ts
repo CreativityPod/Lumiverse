@@ -28,6 +28,15 @@ export const TIMEOUT_BUN_CACHE_MS = 30_000;
 // firm ceiling so an actual hang still recovers, but do not abort a healthy
 // install halfway through its normal work.
 export const TIMEOUT_BUN_INSTALL_MS = 10 * 60_000;
+// Termux installs are deliberately cold-cache, copy every package instead of
+// hardlinking, and may run through proot syscall emulation. On slower Android
+// storage that can legitimately take much longer than the desktop path.
+export const TIMEOUT_BUN_INSTALL_TERMUX_MS = 30 * 60_000;
 // Windows Vite builds can legitimately take longer than five minutes on cold
 // disks or when an antivirus scanner inspects generated assets.
 export const TIMEOUT_BUN_BUILD_MS = 10 * 60_000;
+// A Tauri build compiles the whole native dependency tree — tauri, wry, and
+// the platform bindings — the first time it runs. That routinely outlasts the
+// frontend build budget on a laptop, and a timeout kill part-way through
+// leaves the user with nothing to show for the wait.
+export const TIMEOUT_DESKTOP_BUILD_MS = 30 * 60_000;

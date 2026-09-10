@@ -92,6 +92,14 @@ For chats you own, the host does not run display regex scripts against content y
 
 Returning `null` (or throwing) from `resolveBody` shows the raw content for that render without caching it as resolved, so later renders retry.
 
+## Streaming scheduling
+
+Each mounted message keeps one active body-resolution pass and one active script-application pass. Each stage retains only its newest pending input and starts it when the active pass finishes. There is no fixed debounce interval. Resolvers must accept full snapshots; intermediate token revisions may never be submitted.
+
+Completed append-only prefixes can advance the visible message while a newer snapshot is pending. Rewrites, new streams, context invalidations and unmounts prevent obsolete completions from being applied. The final authoritative message still passes through preprocessing and script application as needed.
+
+For host-owned display, a missing required terminal literal can prove that a script cannot match before any worker or backend dispatch. This uses a cached literal guard, not execution of the user-authored regex. Patterns outside the recognized subset keep isolated execution. Trimming, repeat-back, macro side effects and ordered replacement chains retain their semantics. Extension-owned resolvers remain authoritative and bypass this host guard.
+
 ## Caching and invalidation
 
 The host caches your results so it does not call you on every render, using `touchedVars` as the dependency key. When a variable changes, only cached entries that listed it are dropped. Mark a result `cacheable: false` if it depends on something that is not a variable (time, randomness).

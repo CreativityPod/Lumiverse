@@ -19,7 +19,7 @@ set -euo pipefail
 #   ./start.sh --upgrade-bun    Upgrade Bun to the latest stable release before running
 #   ./start.sh --upgrade-bun-canary  Upgrade Bun to the latest canary build before running
 #
-# Bun versions older than 1.3.13 are automatically upgraded to latest stable.
+# Bun versions older than 1.4.0 are automatically upgraded to latest stable.
 #
 # Environment overrides:
 #   FRONTEND_PATH   Path to frontend directory (default: ./frontend)
@@ -183,7 +183,7 @@ FORCE_BUILD=false
 AUTO_OPEN=false
 SAFE_THEME=false
 BUN_UPGRADE_CHANNEL=""  # "" | "stable" | "canary"
-MINIMUM_BUN_VERSION="1.3.13"
+MINIMUM_BUN_VERSION="1.4.0"
 for arg in "$@"; do
   case "$arg" in
     --build|-b)     FORCE_BUILD=true ;;
@@ -213,9 +213,11 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR"
 FRONTEND_DIR="${FRONTEND_PATH:-$SCRIPT_DIR/frontend}"
+# Keep these aligned with frontend/package.json overrides and optionalDependencies.
+# Rolldown 1.2.4 includes the Android ARMv8.0 SIGILL fix.
 TERMUX_FRONTEND_NATIVE_DEPS=(
-  "@rolldown/binding-android-arm64@1.0.2"
-  "lightningcss-android-arm64@1.32.0"
+  "@rolldown/binding-android-arm64@1.2.4"
+  "lightningcss-android-arm64@1.33.0"
 )
 
 # ─── Ensure Bun is installed ────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import { toast } from '@/lib/toast'
 import { formatTagLibraryImportToastMessage } from '@/lib/tagLibraryImportToast'
 import { useStore } from '@/store'
 import CharacterToolbar from './character-browser/CharacterToolbar'
+import ChubExpressionBackfillBanner from './character-browser/ChubExpressionBackfillBanner'
 import TagFilter from './character-browser/TagFilter'
 import BatchBar from './character-browser/BatchBar'
 import FavoritesSlider from './character-browser/FavoritesSlider'
@@ -332,6 +333,7 @@ export default function CharacterBrowser() {
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
+      <ChubExpressionBackfillBanner />
       <CharacterToolbar
         searchQuery={browser.searchQuery}
         onSearchChange={browser.setSearchQuery}

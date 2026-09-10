@@ -1,6 +1,8 @@
 import { useEffect, useRef, useSyncExternalStore, type ReactElement } from 'react'
+import { beginChatDisplayWork, endChatDisplayWork } from '@/lib/chatDisplaySettle'
 import { createSandboxFrame } from './sandbox-frame'
 import { scheduleSpindleDomTask } from './browser-scheduler'
+import { stampExtensionRoot } from './extension-root-stamp'
 import { dispatchMessageContentLayout } from '@/lib/message-content-layout'
 
 export interface SpindleMessageWidgetRenderOptions {
@@ -82,7 +84,7 @@ export function removeMessageWidgetsByExtension(extensionId: string): void {
   if (changed) notify()
 }
 
-export function SpindleMessageWidgets({ messageId }: { messageId?: string }): ReactElement | null {
+export function SpindleMessageWidgets({ messageId, chatId }: { messageId?: string; chatId?: string }): ReactElement | null {
   useSyncExternalStore(subscribeMessageWidgets, getMessageWidgetVersion, getMessageWidgetVersion)
   if (!messageId) return null
   const widgets = widgetsByMessage.get(messageId) || []
@@ -90,13 +92,13 @@ export function SpindleMessageWidgets({ messageId }: { messageId?: string }): Re
   return (
     <>
       {widgets.map((widget) => (
-        <MessageWidgetFrame key={`${widget.extensionId}:${widget.widgetId}`} widget={widget} />
+        <MessageWidgetFrame key={`${widget.extensionId}:${widget.widgetId}`} widget={widget} chatId={chatId} />
       ))}
     </>
   )
 }
 
-function MessageWidgetFrame({ widget }: { widget: MessageWidgetRecord }): ReactElement {
+function MessageWidgetFrame({ widget, chatId }: { widget: MessageWidgetRecord; chatId?: string }): ReactElement {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const widgetKey = `${widget.extensionId}:${widget.messageId}:${widget.widgetId}:${hashWidgetHtml(widget.html)}`
 
@@ -105,8 +107,18 @@ function MessageWidgetFrame({ widget }: { widget: MessageWidgetRecord }): ReactE
     if (!host) return
 
     let dispose: (() => void) | null = null
+    let workOpen = true
+    beginChatDisplayWork(chatId)
+    const finishWork = () => {
+      if (!workOpen) return
+      workOpen = false
+      endChatDisplayWork(chatId)
+    }
     const cancel = scheduleSpindleDomTask(() => {
-      if (!host.isConnected) return
+      if (!host.isConnected) {
+        finishWork()
+        return
+      }
 
       const cachedHeight = widgetHeightCache.get(widgetKey)
       const frame = createSandboxFrame(widget.extensionId, {
@@ -117,12 +129,13 @@ function MessageWidgetFrame({ widget }: { widget: MessageWidgetRecord }): ReactE
         ...(cachedHeight ? { initialHeight: cachedHeight } : {}),
       }, widget.corsProxy)
       frame.element.setAttribute('data-spindle-message-widget', widget.widgetId)
-      frame.element.setAttribute('data-spindle-extension-id', widget.extensionId)
+      stampExtensionRoot(frame.element, widget.extensionId, 'data-spindle-extension-id')
       frame.element.style.margin = '12px 0'
       const unsubscribe = frame.onMessage((payload) => widget.onMessage?.(payload))
       const resizeObserver = new ResizeObserver(() => {
         const height = Math.round(frame.element.getBoundingClientRect().height)
         if (height > 0) widgetHeightCache.set(widgetKey, height)
+        finishWork()
       })
       resizeObserver.observe(frame.element)
       // The scheduled insertion can happen well after the message row was
@@ -130,6 +143,7 @@ function MessageWidgetFrame({ widget }: { widget: MessageWidgetRecord }): ReactE
       // treats this as programmatic content expansion, not backward scrolling.
       dispatchMessageContentLayout(host, { preserveScrollAnchor: true })
       host.replaceChildren(frame.element)
+      if (cachedHeight) finishWork()
 
       dispose = () => {
         unsubscribe()
@@ -141,9 +155,10 @@ function MessageWidgetFrame({ widget }: { widget: MessageWidgetRecord }): ReactE
 
     return () => {
       cancel()
+      finishWork()
       dispose?.()
     }
-  }, [widget, widgetKey])
+  }, [chatId, widget, widgetKey])
 
   return <div ref={hostRef} data-spindle-message-widget-host={widget.widgetId} />
 }

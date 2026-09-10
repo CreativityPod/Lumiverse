@@ -1,5 +1,3 @@
-import type { LlmMessageDTO } from "lumiverse-spindle-types";
-
 const INTERNAL_SOURCE_MESSAGE_METADATA_KEY = "__sourceMessageMetadata";
 const INTERNAL_CHAT_HISTORY_KEY = "__chatHistorySource";
 const INTERNAL_SOURCE_MESSAGE_ID_KEY = "__sourceMessageId";
@@ -107,15 +105,15 @@ export function restoreSourceMessageMetadata(
   }
 }
 
-export function projectSourceMessageMetadata(
-  message: LlmMessageDTO,
+export function projectSourceMessageMetadata<T extends object>(
+  message: T,
   isChatHistory: boolean,
   allowed: boolean,
-): LlmMessageDTO & { sourceMessageMetadata?: SourceMessageMetadata } {
+): T & { sourceMessageMetadata?: SourceMessageMetadata } {
   const metadata = getSourceMessageMetadata(message);
   const projected = {
     ...message,
-  } as LlmMessageDTO & Record<string, unknown> & {
+  } as T & Record<string, unknown> & {
     sourceMessageMetadata?: SourceMessageMetadata;
   };
   delete projected[INTERNAL_SOURCE_MESSAGE_METADATA_KEY];

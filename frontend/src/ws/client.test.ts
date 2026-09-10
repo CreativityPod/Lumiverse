@@ -1,18 +1,18 @@
 /// <reference types="bun-types" />
 
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, jest, test } from 'bun:test'
 
 const originalWindow = (globalThis as any).window
 const originalDocument = (globalThis as any).document
 const originalWebSocket = (globalThis as any).WebSocket
 const originalWorker = (globalThis as any).Worker
 
-type Listener = EventListenerOrEventListenerObject
-
 function makeEventTarget() {
+  const target = new EventTarget()
   return {
-    addEventListener(_type: string, _listener: Listener) {},
-    removeEventListener(_type: string, _listener: Listener) {},
+    addEventListener: target.addEventListener.bind(target),
+    removeEventListener: target.removeEventListener.bind(target),
+    dispatchEvent: target.dispatchEvent.bind(target),
   }
 }
 
@@ -33,9 +33,10 @@ const windowMock = {
 class MockWebSocket {
   static readonly CONNECTING = 0
   static readonly OPEN = 1
+  static readonly CLOSED = 3
   static instances: MockWebSocket[] = []
 
-  readyState = MockWebSocket.OPEN
+  readyState = MockWebSocket.CONNECTING
   sent: string[] = []
   closeCalls = 0
 
@@ -43,7 +44,17 @@ class MockWebSocket {
     MockWebSocket.instances.push(this)
   }
 
+  open() {
+    this.readyState = MockWebSocket.OPEN
+    ;(this as any).onopen?.({} as Event)
+  }
+
+  receive(data: unknown) {
+    ;(this as any).onmessage?.({ data: JSON.stringify(data) })
+  }
+
   send(payload: string) {
+    if (this.readyState !== MockWebSocket.OPEN) throw new Error('Socket is not open')
     this.sent.push(payload)
   }
 
@@ -97,8 +108,109 @@ afterAll(() => {
 function makeClient() {
   const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
   client.ws = new MockWebSocket('ws://localhost:3000/api/ws')
+  client.ws.open()
   return client
 }
+
+describe('WebSocketClient push presence', () => {
+  test('reports current presence and stream focus after opening and after authentication', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws')
+    try {
+      client.setFocusedChat('chat-1')
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      expect(socket.sent).toEqual([])
+
+      socket.open()
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toEqual([
+        { type: 'visibility', visible: true },
+        { type: 'stream_focus', chatId: 'chat-1' },
+      ])
+
+      // The server authenticates asynchronously after the transport opens.
+      // Replay presence before application CONNECTED handlers can send work.
+      socket.sent = []
+      let framesAtConnected: unknown[] = []
+      client.on('CONNECTED', () => { framesAtConnected = socket.sent.map((frame) => JSON.parse(frame)) })
+      socket.receive({ event: 'CONNECTED', payload: { role: 'user' } })
+      expect(framesAtConnected).toEqual([
+        { type: 'visibility', visible: true },
+        { type: 'stream_focus', chatId: 'chat-1' },
+      ])
+    } finally {
+      client.disconnect()
+    }
+  })
+
+  test('reports hidden if the app backgrounds during connection or authentication', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws')
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      documentMock.visibilityState = 'hidden'
+      documentMock.dispatchEvent(new Event('visibilitychange'))
+      socket.open()
+      socket.receive({ event: 'CONNECTED', payload: { role: 'user' } })
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toEqual([
+        { type: 'visibility', visible: false },
+        { type: 'stream_focus', chatId: null },
+        { type: 'visibility', visible: false },
+        { type: 'stream_focus', chatId: null },
+      ])
+    } finally {
+      client.disconnect()
+      documentMock.visibilityState = 'visible'
+    }
+  })
+
+  test('restores foreground presence after repeated PWA suspension and reconnection', () => {
+    jest.useFakeTimers()
+    const client = new WebSocketClient('ws://localhost:3000/api/ws')
+    try {
+      client.connect()
+      MockWebSocket.instances.at(-1)!.open()
+      for (let cycle = 0; cycle < 3; cycle++) {
+        documentMock.visibilityState = 'hidden'
+        windowMock.dispatchEvent(new Event('pagehide'))
+        documentMock.visibilityState = 'visible'
+        windowMock.dispatchEvent(new Event('pageshow'))
+        jest.advanceTimersByTime(250)
+        const socket = MockWebSocket.instances.at(-1)!
+        expect(socket.readyState).toBe(MockWebSocket.CONNECTING)
+        expect(socket.sent).toEqual([])
+        socket.open()
+        socket.receive({ event: 'CONNECTED', payload: { role: 'user' } })
+        expect(socket.sent.map((frame) => JSON.parse(frame))).toContainEqual({ type: 'visibility', visible: true })
+      }
+    } finally {
+      client.disconnect()
+      documentMock.visibilityState = 'visible'
+      jest.useRealTimers()
+    }
+  })
+
+  test('repairs hidden presence when a PWA resumes without a visibility event', () => {
+    jest.useFakeTimers()
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      socket.open()
+      documentMock.visibilityState = 'hidden'
+      documentMock.dispatchEvent(new Event('visibilitychange'))
+      socket.sent = []
+      documentMock.visibilityState = 'visible'
+      client.lastLifecycleTick = Date.now() - 20_000
+      client.checkForWakeGap()
+      expect(socket.sent.map((frame) => JSON.parse(frame))).toContainEqual({ type: 'visibility', visible: true })
+      expect(client.lifecyclePaused).toBe(false)
+    } finally {
+      client.disconnect()
+      documentMock.visibilityState = 'visible'
+      jest.useRealTimers()
+    }
+  })
+})
 
 describe('WebSocketClient resume watchdog guard', () => {
   test('does not use a heartbeat worker on iOS or iPadOS', () => {
@@ -114,6 +226,14 @@ describe('WebSocketClient resume watchdog guard', () => {
     })).toBe(false)
   })
 
+  test('keeps the heartbeat worker available on Android', () => {
+    expect(shouldUseHeartbeatWorker({
+      userAgent: 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 Chrome/140 Mobile',
+      platform: 'Linux armv8l',
+      maxTouchPoints: 5,
+    })).toBe(true)
+  })
+
   test('sends the fast watchdog ping on an unsuppressed hidden-to-visible transition', () => {
     const client = makeClient()
     const pingTimeouts: number[] = []
@@ -125,7 +245,7 @@ describe('WebSocketClient resume watchdog guard', () => {
 
     client.sendVisibility()
 
-    expect(pingTimeouts).toEqual([3_000])
+    expect(pingTimeouts).toEqual([15_000])
   })
 
   test('suppresses the next fast watchdog ping once when a system modal is expected', () => {
@@ -143,7 +263,7 @@ describe('WebSocketClient resume watchdog guard', () => {
 
     client.wasVisible = false
     client.sendVisibility()
-    expect(pingTimeouts).toEqual([3_000])
+    expect(pingTimeouts).toEqual([15_000])
   })
 
   test('uses the worker to schedule and watch the primary socket heartbeat', () => {
@@ -153,14 +273,14 @@ describe('WebSocketClient resume watchdog guard', () => {
 
     const worker = MockWorker.instances.at(-1)!
     const start = worker.sent.find((message) => message.type === 'start')
-    expect(start).toMatchObject({ intervalMs: 30_000, timeoutMs: 10_000 })
+    expect(start).toMatchObject({ intervalMs: 30_000, timeoutMs: 15_000 })
 
-    worker.emit({ type: 'ping', generation: start.generation, timeoutMs: 10_000 })
+    worker.emit({ type: 'ping', generation: start.generation, timeoutMs: 15_000 })
     expect(socket.sent).toEqual([JSON.stringify({ type: 'ping' })])
     expect(worker.sent.at(-1)).toEqual({
       type: 'arm',
       generation: start.generation,
-      timeoutMs: 10_000,
+      timeoutMs: 15_000,
     })
 
     worker.emit({ type: 'timeout', generation: start.generation })
@@ -184,16 +304,151 @@ describe('WebSocketClient resume watchdog guard', () => {
     expect(client.ws).toBe(socket)
     client.disconnect()
   })
+
+  test('invalidates a heartbeat deadline while the PWA is backgrounded', () => {
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    client.startPing()
+    const worker = MockWorker.instances.at(-1)!
+    const start = worker.sent.find((message) => message.type === 'start')
+
+    client.pauseForBackground()
+    worker.emit({ type: 'timeout', generation: start.generation })
+
+    expect(socket.closeCalls).toBe(0)
+    expect(client.ws).toBe(socket)
+    client.disconnect()
+  })
+
+  test('requires an ID-correlated pong to complete foreground recovery', () => {
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    client.connect()
+    const socket = MockWebSocket.instances.at(-1)!
+    socket.open()
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+    client.on('__ws_resume_recovery_complete', () => events.push('complete'))
+
+    client.pauseForBackground()
+    client.resumeFromBackground()
+    const worker = MockWorker.instances.at(-1)!
+    const resumePing = worker.sent.find((message) => message.type === 'ping-now' && message.resumeProof)
+    expect(resumePing).toMatchObject({ timeoutMs: 15_000, resumeProof: true })
+
+    worker.emit({ type: 'ping', generation: resumePing.generation, timeoutMs: 15_000, resumeProof: true })
+    const frame = JSON.parse(socket.sent.at(-1)!)
+    expect(frame).toMatchObject({ type: 'ping' })
+    expect(typeof frame.id).toBe('string')
+
+    ;(socket as any).onmessage({ data: JSON.stringify({ type: 'pong', id: frame.id }) })
+    expect(events).toEqual(['start', 'complete'])
+    client.disconnect()
+  })
+
+  test('abandons a socket that remains CONNECTING beyond the handshake deadline', () => {
+    jest.useFakeTimers()
+    const client = new WebSocketClient('ws://localhost:3000/api/ws') as any
+    const closes: any[] = []
+    client.on('__ws_close', (payload: any) => closes.push(payload))
+
+    try {
+      client.connect()
+      const socket = MockWebSocket.instances.at(-1)!
+      socket.readyState = MockWebSocket.CONNECTING
+
+      jest.advanceTimersByTime(14_999)
+      expect(socket.closeCalls).toBe(0)
+
+      jest.advanceTimersByTime(1)
+      expect(socket.closeCalls).toBe(1)
+      expect(client.ws).toBeNull()
+      expect(closes).toEqual([{ code: 1006, reason: 'connection timeout' }])
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
+
+  test('releases the transport on freeze and starts a fresh foreground recovery', () => {
+    jest.useFakeTimers()
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+
+    try {
+      client.pauseForBackground()
+      client.suspendTransport('page frozen')
+
+      expect(socket.closeCalls).toBe(1)
+      expect(client.ws).toBeNull()
+
+      client.resumeFromBackground()
+      expect(events).toEqual(['start'])
+      jest.advanceTimersByTime(249)
+      expect(client.ws).toBeNull()
+      jest.advanceTimersByTime(1)
+      expect(client.ws).toBe(MockWebSocket.instances.at(-1))
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
+
+  test('starts recovery when foregrounding finds no socket even if a hidden event was missed', () => {
+    jest.useFakeTimers()
+    const client = makeClient()
+    const socket = client.ws as MockWebSocket
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+
+    try {
+      client.abandonSocket(socket)
+      client.recoverConnectionOnForeground('focus')
+      expect(events).toEqual(['start'])
+      jest.advanceTimersByTime(250)
+      expect(client.ws).toBe(MockWebSocket.instances.at(-1))
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
+
+  test('uses a timer gap to probe an OPEN socket when lifecycle events were missed', () => {
+    jest.useFakeTimers()
+    const client = makeClient()
+    const events: string[] = []
+    client.on('__ws_resume_recovery_start', () => events.push('start'))
+
+    try {
+      client.lastLifecycleTick = Date.now() - 20_000
+      client.checkForWakeGap()
+
+      expect(events).toEqual(['start'])
+      const worker = MockWorker.instances.at(-1)!
+      expect(worker.sent.some((message) => (
+        message.type === 'ping-now'
+        && message.timeoutMs === 15_000
+        && message.resumeProof === true
+      ))).toBe(true)
+    } finally {
+      client.disconnect()
+      jest.useRealTimers()
+    }
+  })
 })
 
 describe('WebSocketClient Spindle console logging', () => {
-  test('can suppress routine Spindle events without suppressing other WebSocket diagnostics', () => {
+  test('suppresses routine incoming WebSocket traces without suppressing event dispatch', () => {
     const client = new WebSocketClient('ws://localhost:3000/api/ws')
     const originalDebug = console.debug
     const logged: unknown[][] = []
+    const received: string[] = []
     console.debug = (...args: unknown[]) => { logged.push(args) }
 
     try {
+      client.on('SPINDLE_RUNTIME_STATS', () => received.push('spindle'))
+      client.on('MESSAGE_SENT', () => received.push('message'))
       client.setSpindleInfoLogging(false)
       client.connect()
       const socket = MockWebSocket.instances.at(-1)!
@@ -201,7 +456,14 @@ describe('WebSocketClient Spindle console logging', () => {
       ;(socket as any).onmessage({ data: JSON.stringify({ event: 'SPINDLE_RUNTIME_STATS', payload: {} }) })
       ;(socket as any).onmessage({ data: JSON.stringify({ event: 'MESSAGE_SENT', payload: {} }) })
 
+      expect(logged).toEqual([])
+      expect(received).toEqual(['spindle', 'message'])
+
+      client.setSpindleInfoLogging(true)
+      ;(socket as any).onmessage({ data: JSON.stringify({ event: 'MESSAGE_SENT', payload: {} }) })
+
       expect(logged).toEqual([['[WS] ←', 'MESSAGE_SENT', {}]])
+      expect(received).toEqual(['spindle', 'message', 'message'])
     } finally {
       console.debug = originalDebug
       client.disconnect()

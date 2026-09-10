@@ -2,7 +2,7 @@
 export type SummaryMode = 'disabled' | 'auto' | 'manual'
 
 /** Which connection profile to use for generation. */
-export type SummaryApiSource = 'active' | 'dedicated' | 'sidecar'
+export type SummaryApiSource = 'active' | 'dedicated'
 
 export interface SummarizationSettings {
   mode: SummaryMode
@@ -33,7 +33,7 @@ export const DEFAULT_SUMMARY_REQUEST_TIMEOUT_MS = 120_000
 
 export const DEFAULT_SUMMARIZATION_SETTINGS: SummarizationSettings = {
   mode: 'disabled',
-  apiSource: 'sidecar',
+  apiSource: 'active',
   dedicatedConnectionId: null,
   autoInterval: 10,
   autoMessageContext: 10,

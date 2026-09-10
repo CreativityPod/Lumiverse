@@ -24,6 +24,8 @@ Once a connection exists, open **Settings → Voice & Speech**, turn on **Enable
 
 ## Providers
 
+The built-in providers are listed below. Enabled [Spindle extensions](../extensions/index.md#extension-provided-ai-providers) can also register TTS providers; those appear in Lumiverse's voice provider and connection selectors after an operator approves the extension's privileged provider permission.
+
 ### OpenAI TTS
 
 - **API key:** Required.
@@ -52,6 +54,26 @@ Once a connection exists, open **Settings → Voice & Speech**, turn on **Enable
     | `language_code` | (auto) | Force a language code (`en`, `ja`, `de`, …) or leave blank for auto-detect. |
     | `output_format` | `mp3_44100_128` | Wide list including MP3 22–192 kbps, PCM 16–44 kHz, and µ-law 8 kHz. |
 
+- **Streaming:** Supported.
+
+### Google AI Studio TTS
+
+- **API key:** Required — plain API key, same as the Gemini text connection.
+- **Default URL:** `https://generativelanguage.googleapis.com`.
+- **Voices:** 30 mapped prebuilt voices (e.g. Kore, Charon, Puck, Zephyr, Fenrir, Leda), each with gender labels.
+- **Models:** Fetched live and filtered to TTS/speech models (currently `gemini-3.1-flash-tts-preview`, `gemini-2.5-pro-preview-tts`, `gemini-2.5-flash-preview-tts`), with a static fallback when the API is unreachable.
+- **Parameters:** `language_code` (optional BCP-47 code) and `temperature` (voice variation).
+- **Output format:** WAV (Gemini returns raw PCM; Lumiverse wraps it so browsers can play it).
+- **Streaming:** Supported.
+
+### Google Vertex TTS
+
+- **Credentials:** Required — upload your Google Cloud service account key JSON file (or paste it), same as the Vertex text connection.
+- **Region:** Choose your Google Cloud region (e.g. `us-central1` or `global`), matching the Vertex text connection profile.
+- **Voices:** Same 30 mapped prebuilt voices as AI Studio TTS.
+- **Models:** Same live-filtered TTS list with static fallback.
+- **Parameters:** Same as AI Studio TTS.
+- **Output format:** WAV.
 - **Streaming:** Supported.
 
 ### Kokoro TTS (self-hosted)

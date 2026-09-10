@@ -1,3 +1,4 @@
+import { unzipSync } from "fflate";
 import { decodeMulti } from "@msgpack/msgpack";
 import sharp from "../../utils/sharp-config";
 import type { ImageProvider } from "../provider";
@@ -91,6 +92,8 @@ export class NovelAIImageProvider implements ImageProvider {
     apiKeyRequired: true,
     modelListStyle: "static",
     staticModels: [
+      { id: "nai-diffusion-5-full", label: "NAI Diffusion V5 (Full)" },
+      { id: "nai-diffusion-5-curated", label: "NAI Diffusion V5 (Curated)" },
       { id: "nai-diffusion-4-5-full", label: "NAI Diffusion V4.5 (Full)" },
       { id: "nai-diffusion-4-5-curated", label: "NAI Diffusion V4.5 (Curated)" },
       { id: "nai-diffusion-4-full", label: "NAI Diffusion V4 (Full)" },
@@ -101,7 +104,8 @@ export class NovelAIImageProvider implements ImageProvider {
     defaultUrl: "https://image.novelai.net",
   };
 
-  async generate(apiKey: string, _apiUrl: string, request: ImageGenRequest): Promise<ImageGenResponse> {
+  async generate(apiKey: string, apiUrl: string, request: ImageGenRequest): Promise<ImageGenResponse> {
+    const nonStreaming = request.connectionOptions?.novelai?.nonStreaming === true;
     const params = request.parameters;
     const model = request.model || "nai-diffusion-4-5-full";
     const [width, height] = String(params.resolution || "1216x832").split("x").map(Number);
@@ -109,7 +113,7 @@ export class NovelAIImageProvider implements ImageProvider {
       params.negativePrompt ||
       "lowres, artistic error, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, blurry, bad anatomy, bad hands, missing fingers, extra digits, fewer digits, text, watermark, username, logo, signature, dithering, halftone, screentone, scan artifacts, multiple views, blank page";
     const seed = params.seed ?? Math.floor(Math.random() * 2147483647);
-    const isV4 = isNovelAIV4Model(model);
+    const usesStructuredPrompts = isNovelAIV4OrLaterModel(model);
 
     const naiParams: any = {
       params_version: 3,
@@ -138,13 +142,12 @@ export class NovelAIImageProvider implements ImageProvider {
       deliberate_euler_ancestral_bug: false,
       prefer_brownian: true,
       image_format: "png",
-      stream: "msgpack",
     };
 
     // Character tags from scene analysis (passed through parameters)
     const charTags: Array<{ tags: string }> = params.characterTags || [];
 
-    if (isV4) {
+    if (usesStructuredPrompts) {
       naiParams.autoSmea = params.smea ?? false;
       naiParams.characterPrompts = charTags.map((char) => ({
         prompt: char.tags,
@@ -211,7 +214,14 @@ export class NovelAIImageProvider implements ImageProvider {
     const outerBody = { input: request.prompt, model, action: "generate", parameters: naiParams };
     const finalBody = applyRawOverride(outerBody, params.rawRequestOverride);
 
-    const res = await fetchWithPreflightAbort("https://image.novelai.net/ai/generate-image-stream", {
+    // The saved connection controls transport, including when raw parameters are supplied.
+    if (finalBody.parameters && typeof finalBody.parameters === "object") {
+      if (nonStreaming) delete finalBody.parameters.stream;
+      else finalBody.parameters.stream = "msgpack";
+    }
+    const route = nonStreaming ? "/ai/generate-image" : "/ai/generate-image-stream";
+    const endpoint = `${this.baseUrl(apiUrl)}${route}`;
+    const res = await fetchWithPreflightAbort(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -226,9 +236,12 @@ export class NovelAIImageProvider implements ImageProvider {
     return { imageDataUrl, model, provider: this.name };
   }
 
-  async validateKey(apiKey: string, _apiUrl: string): Promise<boolean> {
+  async validateKey(apiKey: string, apiUrl: string): Promise<boolean> {
     try {
-      const res = await fetch("https://api.novelai.net/user/information", {
+      // Validate against the Image API itself. NovelAI documents this as an
+      // authenticated, non-generation endpoint and accepts persistent API
+      // tokens here; the Primary API is not the service this provider uses.
+      const res = await fetch(`${this.baseUrl(apiUrl)}/user/information`, {
         headers: { Authorization: `Bearer ${apiKey}` },
       });
       if (!res.ok) await throwProviderResponseError(this.displayName, "authentication", res);
@@ -242,12 +255,16 @@ export class NovelAIImageProvider implements ImageProvider {
   async listModels(_apiKey: string, _apiUrl: string): Promise<Array<{ id: string; label: string }>> {
     return this.capabilities.staticModels || [];
   }
+
+  private baseUrl(apiUrl: string): string {
+    return (apiUrl.trim() || this.capabilities.defaultUrl).replace(/\/+$/, "");
+  }
 }
 
 // --- Helper functions extracted from image-gen.service.ts ---
 
-function isNovelAIV4Model(model: string): boolean {
-  return model.startsWith("nai-diffusion-4");
+function isNovelAIV4OrLaterModel(model: string): boolean {
+  return model.startsWith("nai-diffusion-4") || model.startsWith("nai-diffusion-5");
 }
 
 // Sanity ceiling on the streamed image payload so a misbehaving upstream can't
@@ -291,50 +308,119 @@ async function extractImageFromResponse(res: Response, signal?: AbortSignal): Pr
     fullBuffer = new Uint8Array(await res.arrayBuffer());
   }
 
+  // Decode archives before scanning for PNG signatures: DEFLATE stored blocks
+  // can contain PNG bytes interrupted by block headers that are not image data.
+  if (fullBuffer[0] === 0x50 && fullBuffer[1] === 0x4b && fullBuffer[2] === 0x03 && fullBuffer[3] === 0x04) {
+    let selectedImage = false;
+    const images = unzipSync(fullBuffer, {
+      filter: (file) => {
+        if (selectedImage || !/\.png$/i.test(file.name) || file.originalSize > NOVELAI_MAX_IMAGE_BYTES) return false;
+        selectedImage = true;
+        return true;
+      },
+    });
+    for (const bytes of Object.values(images)) {
+      const imageBytes = extractPngFromBuffer(bytes.buffer.slice(
+        bytes.byteOffset, bytes.byteOffset + bytes.byteLength,
+      ) as ArrayBuffer);
+      if (imageBytes) return `data:image/png;base64,${uint8ToBase64(imageBytes)}`;
+    }
+    throw new Error("NovelAI ZIP response did not contain a supported PNG image");
+  }
+
   const primaryBuffer = fullBuffer.buffer.slice(
     fullBuffer.byteOffset,
     fullBuffer.byteOffset + fullBuffer.byteLength
   ) as ArrayBuffer;
-
-  // Strategy 1: Direct PNG scan
-  let imageBytes = extractPngFromBuffer(primaryBuffer);
+  const imageBytes = extractPngFromBuffer(primaryBuffer);
   if (imageBytes) return `data:image/png;base64,${uint8ToBase64(imageBytes)}`;
 
-  // Strategy 2: ZIP archive scan
-  const pkIndex = findBytes(fullBuffer, [0x50, 0x4b, 0x03, 0x04]);
-  if (pkIndex !== -1) {
-    const zipSlice = fullBuffer.slice(pkIndex);
-    const zipBuffer = zipSlice.buffer.slice(
-      zipSlice.byteOffset,
-      zipSlice.byteOffset + zipSlice.byteLength
-    ) as ArrayBuffer;
-    imageBytes = extractPngFromBuffer(zipBuffer);
-    if (imageBytes) return `data:image/png;base64,${uint8ToBase64(imageBytes)}`;
-  }
-
-  // Strategy 3: MessagePack decode
+  // Streaming endpoints can return a sequence of MessagePack events.
   let largestBinary: Uint8Array | null = null;
   let largestSize = 0;
+  let streamError: string | null = null;
   try {
     for (const obj of decodeMulti(fullBuffer)) {
-      if (obj instanceof Uint8Array && obj.length > largestSize) {
-        largestBinary = obj;
-        largestSize = obj.length;
-      } else if (obj && typeof obj === "object") {
-        for (const val of Object.values(obj as Record<string, unknown>)) {
-          if (val instanceof Uint8Array && val.length > largestSize) {
-            largestBinary = val;
-            largestSize = val.length;
-          }
-        }
+      streamError ??= findNovelAIStreamError(obj);
+      const binary = findLargestBinary(obj);
+      if (binary && binary.length > largestSize) {
+        largestBinary = binary;
+        largestSize = binary.length;
       }
     }
   } catch {
     // fallthrough
   }
 
+  // NovelAI can report generation failures as a small MessagePack event while
+  // keeping the HTTP response at 200. Surface that upstream message instead of
+  // misreporting the event bytes as an unextractable image.
+  if (streamError) {
+    throw new ProviderRequestError({
+      provider: "NovelAI",
+      operation: "image generate",
+      detail: streamError,
+      retryable: false,
+    });
+  }
+
   if (largestBinary) return `data:image/png;base64,${uint8ToBase64(largestBinary)}`;
   throw new Error(`Could not extract image from ${fullBuffer.length} byte NovelAI response`);
+}
+
+function findLargestBinary(value: unknown, depth = 0): Uint8Array | null {
+  if (value instanceof Uint8Array) return value;
+  if (!value || typeof value !== "object" || depth >= 4) return null;
+
+  let largest: Uint8Array | null = null;
+  const values = Array.isArray(value)
+    ? value
+    : Object.values(value as Record<string, unknown>);
+  for (const child of values) {
+    const candidate = findLargestBinary(child, depth + 1);
+    if (candidate && (!largest || candidate.length > largest.length)) largest = candidate;
+  }
+  return largest;
+}
+
+function findNovelAIStreamError(value: unknown, depth = 0): string | null {
+  if (!value || typeof value !== "object" || depth >= 4) return null;
+  const record = value as Record<string, unknown>;
+  const eventType = String(record.event_type ?? record.type ?? record.status ?? "").toLowerCase();
+  const isErrorEvent = eventType === "error" || eventType === "failed" || eventType === "failure";
+
+  const directError = readableErrorValue(record.error);
+  if (directError) return directError;
+
+  if (isErrorEvent) {
+    for (const field of [record.message, record.detail, record.data]) {
+      const detail = readableErrorValue(field);
+      if (detail) return detail;
+    }
+    return "NovelAI returned an error event without a message";
+  }
+
+  for (const field of [record.data, record.event]) {
+    const nested = findNovelAIStreamError(field, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function readableErrorValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim().slice(0, 1000);
+  if (value instanceof Uint8Array) {
+    const decoded = new TextDecoder().decode(value).trim();
+    return decoded ? decoded.slice(0, 1000) : null;
+  }
+  if (!value || typeof value !== "object") return null;
+
+  const record = value as Record<string, unknown>;
+  for (const field of [record.message, record.detail, record.error]) {
+    const nested = readableErrorValue(field);
+    if (nested) return nested;
+  }
+  return null;
 }
 
 function extractPngFromBuffer(buffer: ArrayBuffer): Uint8Array | null {
@@ -358,13 +444,6 @@ function extractPngFromBuffer(buffer: ArrayBuffer): Uint8Array | null {
   }
   if (end === -1) return null;
   return bytes.slice(start, end);
-}
-
-function findBytes(haystack: Uint8Array, needle: number[]): number {
-  for (let i = 0; i <= haystack.length - needle.length; i++) {
-    if (needle.every((b, j) => haystack[i + j] === b)) return i;
-  }
-  return -1;
 }
 
 async function padDirectorRefImage(base64Data: string): Promise<string> {

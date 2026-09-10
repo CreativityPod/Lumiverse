@@ -18,3 +18,51 @@ describe('ExpandedTextEditor Markdown preview', () => {
     expect(previewBlock).toMatch(/min-height:\s*0/)
   })
 })
+
+describe('ExpandedTextEditor mobile editing stability', () => {
+  test('focuses programmatically without allowing keyboard presentation to scroll the page', () => {
+    expect(componentSource).toContain('textarea.focus({ preventScroll: true })')
+    // reset.css already clips the document. Do not turn it back into a
+    // programmatically scrollable overflow:hidden element while editing.
+    expect(componentSource).not.toContain('document.documentElement.style.overflow =')
+  })
+
+  test('keeps syntax highlighting enabled on touch-only devices', () => {
+    const touchBlock = cssSource.match(/@media \(any-hover: none\)\s*\{([\s\S]*)\n\}/)?.[1] ?? ''
+    expect(touchBlock).not.toMatch(/\.highlightPre\s*\{[\s\S]*?display:\s*none/)
+    expect(touchBlock).not.toMatch(/\.textareaHighlighted\s*\{[\s\S]*?-webkit-text-fill-color:\s*var\(--lumiverse-text\)/)
+
+    const highlightedTextareaBlock = cssSource.match(/\.textareaHighlighted\s*\{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(highlightedTextareaBlock).toMatch(/-webkit-text-fill-color:\s*transparent/)
+  })
+
+  test('bounds the shared grid while the textarea owns scrolling', () => {
+    const innerBlock = cssSource.match(/\.highlightInner\s*\{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(innerBlock).toMatch(/grid-template-rows:\s*minmax\(0, 1fr\)/)
+    const textareaBlock = cssSource.match(/\n\.textareaHighlighted\s*\{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(textareaBlock).toMatch(/overflow-y:\s*auto/)
+    expect(cssSource).toContain('scrollbar-gutter: stable')
+  })
+
+  test('auto-focuses desktop editors but waits for an explicit tap on touch-only devices', () => {
+    expect(componentSource).toContain("window.matchMedia?.('(any-hover: none)').matches")
+    expect(componentSource).toContain('if (autoFocus) pendingSelectionRef.current =')
+  })
+
+  test('does not use tap-coordinate recovery, viewport timers, or ancestor scrollIntoView', () => {
+    expect(componentSource).not.toContain('mobileTapRef')
+    expect(componentSource).not.toContain('recoverTappedCaret')
+    expect(componentSource).not.toContain('setTimeout')
+    expect(componentSource).not.toContain('scrollIntoView')
+  })
+
+  test('masks only the source textarea while preserving the contextual backdrop', () => {
+    expect(componentSource).toContain("source.style.visibility = 'hidden'")
+    expect(componentSource).toContain('source.style.visibility = visibility')
+    expect(componentSource).toContain('sourceRef={textareaRef}')
+
+    const glassOverlayBlock = cssSource.match(/:global\(\[data-glass\]\) \.overlay\s*\{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(glassOverlayBlock).toMatch(/background:\s*var\(--lumiverse-modal-backdrop/)
+    expect(glassOverlayBlock).toMatch(/backdrop-filter:/)
+  })
+})

@@ -184,7 +184,7 @@ export interface PromptBehavior {
 
 export interface CompletionSettings {
   assistantPrefill: string;
-  /** Moonshot/Kimi Partial Mode prefix for the model's reasoning_content. */
+  /** Provider-native prefix for the model's reasoning_content. */
   reasoningPrefill?: string;
   assistantImpersonation: string;
   continuePrefill: boolean;
@@ -230,6 +230,7 @@ export interface AdvancedSettings {
 export interface AuthorsNote {
   content: string;
   position: number;
+  /** Chat messages back from the latest; 0 inserts after the latest message. */
   depth: number;
   role: 'system' | 'user' | 'assistant';
 }

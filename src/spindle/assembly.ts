@@ -115,7 +115,9 @@ export async function assembleSpindleBlocks(
   return {
     messages: assembled.messages.map((message) => ({
       role: message.role,
-      content: message.content,
+      // Runtime DTOs are structurally extensible; the published Spindle type
+      // package has not added the new video part discriminant yet.
+      content: message.content as unknown as LlmMessageDTO["content"],
       ...(message.name ? { name: message.name } : {}),
     })),
     breakdown: assembled.breakdown,

@@ -9,13 +9,28 @@ import * as tagLibrarySvc from "../services/tag-library-import.service";
 import * as wbSvc from "../services/world-books.service";
 import * as regexSvc from "../services/regex-scripts.service";
 import * as gallerySvc from "../services/character-gallery.service";
-import { fetchChubGalleryUrls, fetchChubJson } from "../services/chub-api.service";
+import {
+  extractChubExpressionAssets,
+  fetchChubGalleryUrls,
+  fetchChubJson,
+  readChubFullPath,
+  type ChubExpressionAsset,
+} from "../services/chub-api.service";
+import * as exprSvc from "../services/expressions.service";
+import { markChubExpressionsChecked, queueChubExpressionImport } from "../services/chub-expression-import.service";
+import * as settingsSvc from "../services/settings.service";
+import { fetchBotBooruGalleryUrls } from "../services/botbooru-api.service";
 import { parsePagination } from "../services/pagination";
 import { safeFetch, SSRFError, validateHost } from "../utils/safe-fetch";
-import { rewriteBotBooruUrl } from "../utils/botbooru";
+import { parseBotBooruId, rewriteBotBooruUrl } from "../utils/botbooru";
 import { createAvatarResolverResponse } from "../utils/avatar-cache";
 import { buildSlug } from "../lumihub/manifest";
 import { applyCharxModulesAndAssets, autoImportEmbeddedWorldbook } from "../services/charx-import.service";
+import { importCharacterFile } from "../services/character-import.service";
+import {
+  characterImportJobs,
+  CharacterImportJobError,
+} from "../services/character-import-jobs.service";
 import { mapWithConcurrency } from "../utils/concurrency";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
@@ -45,6 +60,14 @@ function respondImportError(c: any, err: any, fallbackMessage: string) {
   return c.json({ error: err?.message || fallbackMessage }, 400);
 }
 
+function respondImportJobError(c: any, err: unknown) {
+  if (err instanceof CharacterImportJobError) {
+    return c.json({ error: err.message, code: err.code }, err.status as any);
+  }
+  console.error("[character import job] failed:", err);
+  return c.json({ error: err instanceof Error ? err.message : "Character import job failed" }, 500);
+}
+
 // Bind any card-embedded regex scripts (Lumiverse bundle or SillyTavern) to a
 // freshly-imported character. Best-effort: the character already exists, so a
 // regex failure must not fail the import. CHARX imports bind their own bundle
@@ -70,6 +93,8 @@ const LOCAL_CHARACTER_EXTENSION_KEYS = new Set([
   "avatar_crop_image_id",
   "original_image_id",
   "risu_asset_map",
+  "gallery_reference_sequence",
+  "gallery_reference_names",
   "landing_perspective_layers",
   "ttsVoice",
 ]);
@@ -221,7 +246,7 @@ async function importGalleryFromUrls(userId: string, characterId: string, urls: 
       const buf = await res.arrayBuffer();
       const contentType = res.headers.get("content-type") || "image/webp";
       const ext = contentType.includes("png") ? "png" : contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "webp";
-      return new File([buf], `chub_gallery_${crypto.randomUUID()}.${ext}`, { type: contentType });
+      return new File([buf], `remote_gallery_${crypto.randomUUID()}.${ext}`, { type: contentType });
     } catch {
       return null;
     }
@@ -236,6 +261,41 @@ async function importGalleryFromUrls(userId: string, characterId: string, urls: 
   for (const file of files) {
     try { await gallerySvc.uploadToGallery(userId, characterId, file); } catch { /* skip */ }
   }
+}
+
+/**
+ * Opt out of pulling expression packs during a Chub import.
+ *
+ * Defaults to on: a pack is part of what the card advertises, and gallery
+ * images already import unconditionally, so this matches existing behaviour
+ * rather than introducing a new prompt. The key is read here so the preference
+ * is honoured the moment a UI toggle exists.
+ */
+const CHUB_IMPORT_EXPRESSIONS_KEY = "importChubExpressions";
+
+function chubExpressionImportEnabled(userId: string): boolean {
+  try {
+    const setting = settingsSvc.getSetting(userId, CHUB_IMPORT_EXPRESSIONS_KEY);
+    return setting?.value === false ? false : true;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Download a Chub expression pack and register it as the character's
+ * expressions, keyed by the pack's own labels.
+ *
+ * Mirrors importGalleryFromUrls, but the label is the whole point: these
+ * images previously had no route into the expressions surface at all, and any
+ * that reached the gallery arrived as unidentifiable files.
+ */
+async function importChubExpressions(
+  userId: string,
+  characterId: string,
+  assets: ChubExpressionAsset[],
+): Promise<void> {
+  await queueChubExpressionImport(userId, characterId, assets);
 }
 
 async function fetchChubCharacter(chubPath: string, userId: string, libraryScope: CharacterLibraryScope) {
@@ -327,6 +387,19 @@ async function fetchChubCharacter(chubPath: string, userId: string, libraryScope
   const galleryUrls = await fetchChubGalleryUrls(node.id);
   if (galleryUrls.length > 0) {
     await importGalleryFromUrls(userId, character.id, galleryUrls);
+  }
+
+  // Best-effort, like the gallery above: a card that imported successfully
+  // must not be rolled back because its expression images were unreachable.
+  if (chubExpressionImportEnabled(userId)) {
+    const expressionAssets = extractChubExpressionAssets(node);
+    if (expressionAssets.length > 0) {
+      try {
+        await importChubExpressions(userId, character.id, expressionAssets);
+      } catch (err) {
+        console.warn("[character import] Chub expression import failed:", err);
+      }
+    }
   }
 
   return svc.getCharacter(userId, character.id)!;
@@ -559,6 +632,17 @@ app.post("/bulk-update", async (c) => {
   return c.json({ updated, count: updated.length });
 });
 
+app.post("/batch-delete", async (c) => {
+  const userId = c.get("userId");
+  const body: { ids?: unknown } = await c.req.json<{ ids?: unknown }>().catch(() => ({}));
+  if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 1000) {
+    return c.json({ error: "ids must be a non-empty array with at most 1000 items" }, 400);
+  }
+  const ids = body.ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+  if (ids.length === 0) return c.json({ error: "ids must contain character ids" }, 400);
+  return c.json(await svc.batchDeleteCharacters(userId, ids));
+});
+
 app.post("/", async (c) => {
   const userId = c.get("userId");
   const body = await c.req.json();
@@ -595,9 +679,18 @@ app.post("/import-url", async (c) => {
 
     // Check for BotBooru URL → rewrite to the PNG download, which embeds a
     // SillyTavern-compatible card *and* an avatar, then reuse the generic importer.
+    const botBooruId = parseBotBooruId(url);
     const botBooruPngUrl = rewriteBotBooruUrl(url, "png");
-    if (botBooruPngUrl) {
+    if (botBooruId && botBooruPngUrl) {
       character = await fetchGenericCharacter(botBooruPngUrl, userId, libraryScope || "mine");
+      try {
+        const galleryUrls = await fetchBotBooruGalleryUrls(botBooruId);
+        if (galleryUrls.length > 0) {
+          await importGalleryFromUrls(userId, character.id, galleryUrls);
+        }
+      } catch (err) {
+        console.warn("[character import] BotBooru gallery import failed:", err);
+      }
       return c.json({ character, ...loraSurface(character) }, 201);
     }
 
@@ -652,6 +745,99 @@ app.post("/:id/replace-card", async (c) => {
     return c.json(updated);
   } catch (err: any) {
     return respondImportError(c, err, "Failed to replace character card data");
+  }
+});
+
+// ─── Chub expression backfill ─────────────────────────────────────────────
+// Registered above `/:id`: Hono matches in order, and `/:id` would otherwise
+// capture "chub-expression-candidates" as a character id.
+
+/** Labels already mapped for this character, so a backfill can skip them. */
+function existingExpressionLabels(userId: string, characterId: string): Set<string> {
+  const config = exprSvc.getExpressionConfig(userId, characterId);
+  return new Set(Object.keys(config?.mappings ?? {}));
+}
+
+async function chubExpressionAssetsFor(slug: string): Promise<ChubExpressionAsset[]> {
+  const data = await fetchChubJson(`characters/${slug}?full=true`);
+  const node = data?.node;
+  if (!node) throw new Error("Invalid Chub API response: missing node");
+  return extractChubExpressionAssets(node);
+}
+
+/**
+ * Which cards could gain expressions, without downloading anything.
+ *
+ * Only reports cards that trace back to Chub and have no expressions yet, so
+ * the count is what a backfill would actually change rather than how many
+ * Chub cards exist.
+ */
+app.get("/chub-expression-candidates", (c) => {
+  const userId = c.get("userId");
+  const candidates = svc
+    .listCharacterExtensions(userId)
+    .filter((row) => readChubFullPath(row.extensions) !== null)
+    .filter((row) => !row.extensions?._lumiverse_chub_expressions_checked)
+    .filter((row) => existingExpressionLabels(userId, row.id).size === 0)
+    .map((row) => ({ id: row.id, name: row.name }));
+  return c.json({ candidates, count: candidates.length });
+});
+
+/**
+ * Pull this character's expression pack from the source it was imported from.
+ *
+ * Expressions only: the card's own fields are never re-read, so local edits
+ * survive a backfill. Labels already mapped are skipped rather than replaced,
+ * so hand-assigned expressions are never clobbered.
+ */
+app.post("/:id/chub-expressions", async (c) => {
+  const userId = c.get("userId");
+  const characterId = c.req.param("id");
+  const character = svc.getCharacter(userId, characterId);
+  if (!character) return c.json({ error: "Not found" }, 404);
+
+  const slug = readChubFullPath(character.extensions);
+  if (!slug) return c.json({ error: "This character was not imported from Chub" }, 400);
+
+  try {
+    let available: ChubExpressionAsset[];
+    try {
+      available = await chubExpressionAssetsFor(slug);
+    } catch (err: any) {
+      // A card whose source has been removed or renamed is a normal outcome,
+      // not a failure to report as an error. Treat it as "nothing to fetch" so
+      // the caller can say so plainly, and stamp it so it stops being offered.
+      if (typeof err?.message === "string" && err.message.includes("404")) {
+        markChubExpressionsChecked(userId, characterId);
+        return c.json({ imported: 0, skipped: 0, available: 0, sourceMissing: true });
+      }
+      throw err;
+    }
+
+    if (available.length === 0) {
+      markChubExpressionsChecked(userId, characterId);
+      return c.json({ imported: 0, skipped: 0, available: 0 });
+    }
+
+    const existing = existingExpressionLabels(userId, characterId);
+    const missing = available.filter((asset) => !existing.has(asset.label));
+    if (missing.length === 0) {
+      markChubExpressionsChecked(userId, characterId);
+      return c.json({ imported: 0, skipped: available.length, available: available.length });
+    }
+
+    await importChubExpressions(userId, characterId, missing);
+    const after = existingExpressionLabels(userId, characterId);
+    const imported = missing.filter((asset) => after.has(asset.label)).length;
+    markChubExpressionsChecked(userId, characterId);
+    return c.json({
+      imported,
+      skipped: available.length - missing.length,
+      available: available.length,
+    });
+  } catch (err: any) {
+    if (err instanceof SSRFError) return c.json({ error: err.message }, 400);
+    return c.json({ error: err.message || "Failed to fetch expressions from Chub" }, 502);
   }
 });
 
@@ -940,6 +1126,72 @@ app.delete("/:id/perspective-layers/:layer", (c) => {
   return c.json(updated);
 });
 
+app.post("/import-jobs", async (c) => {
+  const userId = c.get("userId");
+  try {
+    const body = await c.req.json<{ total?: unknown; skip_duplicates?: unknown }>().catch(() => null);
+    if (!body) return c.json({ error: "Invalid JSON request body", code: "invalid_request" }, 400);
+    const total = Number(body?.total);
+    return c.json(characterImportJobs.create(userId, total, body?.skip_duplicates === true), 201);
+  } catch (err) {
+    return respondImportJobError(c, err);
+  }
+});
+
+app.put("/import-jobs/:jobId/files/:index", async (c) => {
+  const userId = c.get("userId");
+  const requestBody = c.req.raw.body;
+  if (!requestBody) return c.json({ error: "Request body is empty", code: "empty_file" }, 400);
+
+  const contentType = c.req.header("content-type") || "application/octet-stream";
+  if (contentType.toLowerCase().startsWith("multipart/form-data")) {
+    return c.json({
+      error: "Multipart uploads are not supported for character import jobs; send the file as the raw request body",
+      code: "multipart_not_supported",
+    }, 415);
+  }
+
+  const contentLengthHeader = c.req.header("content-length");
+  const declaredSize = contentLengthHeader == null ? null : Number(contentLengthHeader);
+  const filename = c.req.query("filename") || "character-card";
+  try {
+    const snapshot = await characterImportJobs.upload(
+      userId,
+      c.req.param("jobId"),
+      Number(c.req.param("index")),
+      filename,
+      contentType,
+      requestBody,
+      declaredSize,
+    );
+    return c.json(snapshot, 201);
+  } catch (err) {
+    return respondImportJobError(c, err);
+  }
+});
+
+app.post("/import-jobs/:jobId/start", (c) => {
+  try {
+    return c.json(characterImportJobs.start(c.get("userId"), c.req.param("jobId")), 202);
+  } catch (err) {
+    return respondImportJobError(c, err);
+  }
+});
+
+app.get("/import-jobs/:jobId/status", (c) => {
+  const snapshot = characterImportJobs.get(c.get("userId"), c.req.param("jobId"));
+  if (!snapshot) return c.json({ error: "Character import job not found", code: "job_not_found" }, 404);
+  return c.json(snapshot);
+});
+
+app.post("/import-jobs/:jobId/cancel", (c) => {
+  try {
+    return c.json(characterImportJobs.cancel(c.get("userId"), c.req.param("jobId")));
+  } catch (err) {
+    return respondImportJobError(c, err);
+  }
+});
+
 app.post("/import-bulk", async (c) => {
   const userId = c.get("userId");
 
@@ -951,97 +1203,12 @@ app.post("/import-bulk", async (c) => {
 
     const skipDuplicates = formData.get("skip_duplicates") === "true";
 
-    const results: Array<{
-      filename: string;
-      success: boolean;
-      character?: any;
-      lorebook?: { name: string; entryCount: number };
-      lumiverse_lora?: characterLoraSvc.PortableLoraReference;
-      error?: string;
-      skipped?: boolean;
-    }> = [];
+    const results: Awaited<ReturnType<typeof importCharacterFile>>[] = [];
 
     for (const file of files) {
       const filename = file.name || "unknown";
       try {
-        let cardInput;
-        let pngAvatar: File | null = null;
-        let charxResult: cardSvc.CharxResult | null = null;
-
-        const detectedFormat = await cardSvc.detectCharacterImportFormat(file);
-
-        if (detectedFormat === "png") {
-          cardInput = await cardSvc.extractCardFromPng(file);
-          pngAvatar = file;
-        } else if (detectedFormat === "charx" || detectedFormat === "jpeg_polyglot") {
-          charxResult = await cardSvc.extractCardFromCharx(file);
-          cardInput = charxResult.card;
-        } else if (detectedFormat === "jpeg") {
-          // Plain JPEG with no embedded data — skip
-          results.push({ filename, success: false, error: "JPEG file does not contain embedded character card data" });
-          continue;
-        } else {
-          const text = await file.text();
-          const json = JSON.parse(text);
-          cardInput = cardSvc.parseCardJson(json);
-        }
-
-        // Deduplication check
-        if (skipDuplicates) {
-          const hasRealFilename = filename && filename !== "unknown" && filename !== "";
-          const existingByFile = hasRealFilename
-            ? svc.findCharacterBySourceFilename(userId, filename)
-            : null;
-
-          if (existingByFile) {
-            results.push({ filename, success: true, skipped: true, character: existingByFile });
-            continue;
-          }
-
-          // No filename match — fall back to name-based check only when filename is absent
-          if (!hasRealFilename && svc.characterExistsByName(userId, cardInput.name)) {
-            const existing = svc.findCharactersByName(userId, cardInput.name);
-            results.push({ filename, success: true, skipped: true, character: existing[0] });
-            continue;
-          }
-        }
-
-        const character = svc.createCharacter(userId, cardInput);
-
-        // Store source filename so re-imports can deduplicate by file identity
-        if (filename && filename !== "unknown" && filename !== "") {
-          svc.setCharacterSourceFilename(userId, character.id, filename);
-        }
-
-        if (charxResult) {
-          // Full CHARX processing (lumiverse_modules, gallery, inline assets,
-          // RisuAI module/expressions) shared with single & URL import so the
-          // bulk path keeps parity with the exporter.
-          await applyCharxModulesAndAssets(userId, character, charxResult);
-        } else {
-          if (pngAvatar) {
-            const image = await images.uploadImage(userId, pngAvatar);
-            svc.setCharacterImage(userId, character.id, image.id);
-            svc.setCharacterAvatar(userId, character.id, image.filename);
-          }
-          importCardRegexBestEffort(userId, character.id, cardInput.extensions);
-          autoImportEmbeddedWorldbook(userId, character.id);
-        }
-
-        const imported = svc.getCharacter(userId, character.id)!;
-
-        // Check for embedded lorebook
-        let lorebook: { name: string; entryCount: number } | undefined;
-        const charBook = imported.extensions?.character_book;
-        const entryCount = wbSvc.countImportedWorldBookEntries(charBook?.entries);
-        if (entryCount > 0) {
-          lorebook = {
-            name: charBook.name || `${imported.name}'s Lorebook`,
-            entryCount,
-          };
-        }
-
-        results.push({ filename, success: true, character: imported, lorebook, ...loraSurface(imported) });
+        results.push(await importCharacterFile(userId, file, { skipDuplicates, emitEvent: false }));
       } catch (err: any) {
         results.push({
           filename,
@@ -1054,6 +1221,13 @@ app.post("/import-bulk", async (c) => {
     const imported = results.filter((r) => r.success && !r.skipped && r.character).length;
     const skipped = results.filter((r) => r.skipped).length;
     const failed = results.filter((r) => !r.success).length;
+
+    if (imported > 0) {
+      eventBus.emit(EventType.CHARACTER_LIBRARY_CHANGED, {
+        reason: "legacy_bulk_import",
+        imported,
+      }, userId);
+    }
 
     return c.json({ results, summary: { total: files.length, imported, skipped, failed } }, 201);
   } catch (err: any) {

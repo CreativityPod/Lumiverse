@@ -6,6 +6,7 @@ import { serveStatic } from "hono/bun";
 import { websocket } from "hono/bun";
 import { env } from "./env";
 import { auth } from "./auth";
+import { rewriteLegacySsoCallbackPath } from "./auth/callback-compat";
 import { requireAuth } from "./auth/middleware";
 import { settingsRoutes } from "./routes/settings.routes";
 import { charactersRoutes } from "./routes/characters.routes";
@@ -36,6 +37,7 @@ import { embeddingsRoutes } from "./routes/embeddings.routes";
 import { tokenizersRoutes } from "./routes/tokenizers.routes";
 import { spindleOAuthRoutes } from "./routes/spindle-oauth.routes";
 import { lumihubCallbackRoute, lumihubRoutes } from "./routes/lumihub.routes";
+import { illarinRoutes } from "./routes/illarin.routes";
 import { systemRoutes } from "./routes/system.routes";
 import { migrateRoutes } from "./routes/migrate.routes";
 import { stMigrationRoutes } from "./routes/st-migration.routes";
@@ -75,6 +77,8 @@ import {
 import { authLockoutService } from "./services/auth-lockout.service";
 import { getClientIp } from "./utils/client-ip";
 import { listSsoLoginOptions } from "./services/sso-providers.service";
+import { userMediaServingHeaders } from "./utils/user-media-headers";
+import { getImageFilePathPublic } from "./services/images.service";
 
 const app = new Hono();
 const SIGN_IN_AUTH_PATTERN = /^\/api\/auth\/sign-in(?:\/|$)/;
@@ -305,9 +309,11 @@ const betterAuthHandler: Handler = (c) => {
   }
   const host = c.req.header("x-forwarded-host") || c.req.header("host");
   const proto = c.req.header("x-forwarded-proto") || "http";
-  if (host) {
-    const url = new URL(c.req.url);
-    const rewritten = new URL(url.pathname + url.search, `${proto}://${host}`);
+  const url = new URL(c.req.url);
+  const pathname = rewriteLegacySsoCallbackPath(url.pathname);
+  if (host || pathname !== url.pathname) {
+    const origin = host ? `${proto}://${host}` : url.origin;
+    const rewritten = new URL(pathname + url.search, origin);
     return auth.handler(new Request(rewritten.toString(), c.req.raw));
   }
   return auth.handler(c.req.raw);
@@ -430,14 +436,19 @@ if (error) {
 
 // Image gen results — unauthenticated, public access for push notifications and embeds
 app.get("/api/v1/image-gen/results/:id", async (c) => {
-  const { getImageFilePathPublic } = await import("./services/images.service");
   const id = c.req.param("id");
   const size = c.req.query("size") as "sm" | "lg" | undefined;
   const tier = size === "sm" || size === "lg" ? size : undefined;
   const filepath = await getImageFilePathPublic(id, tier);
   if (!filepath) return c.json({ error: "Not found" }, 404);
-  const response = new Response(Bun.file(filepath));
+  const file = Bun.file(filepath);
+  const response = new Response(file);
   response.headers.set("Cache-Control", "public, max-age=86400");
+  // This route is unauthenticated: apply the stored-XSS boundary (sandbox CSP,
+  // nosniff, active-content demotion) before the bytes reach any browser.
+  for (const [key, value] of Object.entries(userMediaServingHeaders(file.type))) {
+    response.headers.set(key, value);
+  }
   return response;
 });
 
@@ -503,6 +514,7 @@ app.route("/api/v1/regex-scripts", regexScriptsRoutes);
 app.route("/api/v1/characters/:characterId/expressions", expressionsRoutes);
 app.route("/api/v1/push", pushRoutes);
 app.route("/api/v1/lumihub", lumihubRoutes);
+app.route("/api/v1/illarin", illarinRoutes);
 app.route("/api/v1/memory-cortex", memoryCortexRoutes);
 app.route("/api/v1/operator", operatorRoutes);
 app.route("/api/v1/tts-connections", ttsConnectionsRoutes);
