@@ -230,6 +230,7 @@ export interface AdvancedSettings {
 export interface AuthorsNote {
   content: string;
   position: number;
+  /** Chat messages back from the latest; 0 inserts after the latest message. */
   depth: number;
   role: 'system' | 'user' | 'assistant';
 }

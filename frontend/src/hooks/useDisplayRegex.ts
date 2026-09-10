@@ -609,7 +609,7 @@ export function useDisplayRegex(
   return useDisplayRegexState(...args).content
 }
 
-/** Expose provisional first-pass content so virtual rows can reserve their height. */
+/** `pending` means provisional first-pass content, not a refresh of visible output. */
 export function useDisplayRegexState(
   rawContent: string,
   isUser: boolean,
@@ -922,6 +922,7 @@ export function useDisplayRegexState(
 
   const messageId = preprocessOpts?.messageId ?? null
   const carry = useRef<ResolvedContentState | null>(null)
+  const settledDisplay = useRef<{ rawContent: string; value: string } | null>(null)
   const seenState = useRef(resolvedContentState)
   const lifecycle = useRef({ chatId: scopedChatId, messageId, isStreaming, finishing: false })
   if (
@@ -929,6 +930,7 @@ export function useDisplayRegexState(
     || (!lifecycle.current.isStreaming && isStreaming)
   ) {
     carry.current = null
+    settledDisplay.current = null
     lifecycle.current.finishing = false
   } else if (lifecycle.current.isStreaming && !isStreaming) {
     lifecycle.current.finishing = true
@@ -941,14 +943,24 @@ export function useDisplayRegexState(
     seenState.current = resolvedContentState
     if (resolvedContentState?.version === version) carry.current = resolvedContentState
   }
-  const live = passthrough ? content : cachedResolvedContent
+  const live = passthrough || (displayScripts.length === 0 && preprocessSettled) ? content : cachedResolvedContent
     ?? (resolvedContentState?.key === contentCacheKey && resolvedContentState.version === version
       ? resolvedContentState.value : undefined)
   const pending = !preprocessSettled || (
     templateCacheKey !== null && !cachedTemplates && resolvedTemplatesState?.key !== templateCacheKey
   )
+  const resolutionPending = pending || (contentCacheKey !== null && live === undefined)
+  // Appending messages changes the depth of every mounted row and restarts
+  // preprocessing. Its provisional raw output can differ from both the prior
+  // preprocessed text and the final HTML, so the streaming carry cannot cover
+  // this gap. Retain a completed display of the same source through ALL stages
+  // of the refresh; cold mounts still reserve their height and stay hidden.
+  if (!isStreaming && resolutionPending && settledDisplay.current?.rawContent === rawContent) {
+    return { content: settledDisplay.current.value, pending: false }
+  }
   if (live !== undefined) {
     carry.current = { key: contentCacheKey ?? '', version, content, value: live }
+    if (!resolutionPending) settledDisplay.current = { rawContent, value: live }
     // Finalization may still need a second pass after preprocessing settles.
     if (!isStreaming && preprocessSettled) lifecycle.current.finishing = false
     return { content: live, pending }
@@ -957,5 +969,6 @@ export function useDisplayRegexState(
     isStreaming || lifecycle.current.finishing
     || carry.current.content === content || RAW_MACRO_RE.test(content)
   )) return { content: carry.current.value, pending: false }
+  if (!resolutionPending) settledDisplay.current = { rawContent, value: content }
   return { content, pending: pending || contentCacheKey !== null }
 }

@@ -1,9 +1,7 @@
-import { getProvider } from "../llm/registry";
 import { describeGenerationStop } from "../llm/generation-stop";
 import type { LlmProvider } from "../llm/provider";
 import { eventBus } from "../ws/bus";
 import { EventType } from "../ws/events";
-import * as secretsSvc from "./secrets.service";
 import * as connectionsSvc from "./connections.service";
 import * as chatsSvc from "./chats.service";
 import * as presetsSvc from "./presets.service";
@@ -11,24 +9,17 @@ import * as settingsSvc from "./settings.service";
 import * as personasSvc from "./personas.service";
 import {
   assemblePrompt,
-  applyCustomBodyParameters,
-  applyProviderReasoningOffSwitch,
-  injectReasoningParams,
   collectVectorActivatedWorldInfo,
   mergeActivatedWorldInfoEntries,
-  getSourceMessageId,
   isChatHistoryMessage,
   resolveContinuePostfix,
-  shouldPreserveDisplayReasoningDelimiters,
   type VectorActivatedEntry,
 } from "./prompt-assembly.service";
 import * as charactersSvc from "./characters.service";
 import { getEffectiveCharacterName } from "../types/character";
 import { isNoPresetChatMetadata, isTemporaryChatMetadata } from "../types/chat";
 import {
-  describeContentForDisplay,
   getTextContent,
-  type DisplayContentPartSummary,
   type LlmMessage,
   type GenerationParameters,
   type GenerationRequest,
@@ -60,7 +51,6 @@ import {
 import { getWebSearchSettings } from "./web-search-settings.service";
 import type { Message } from "../types/message";
 import type { ConnectionProfile } from "../types/connection-profile";
-import type { CustomBody } from "../types/preset";
 import {
   interceptorPipeline,
   type InterceptorBreakdownEntry,
@@ -82,7 +72,6 @@ import {
 import type {
   CachedCouncilResult,
   CouncilMember,
-  GenerationReasoningOverrideDTO,
 } from "lumiverse-spindle-types";
 import {
   getCouncilSettings,
@@ -112,11 +101,7 @@ import {
   getExpressionGroups,
 } from "./expressions.service";
 import { getSidecarSettings } from "./sidecar-settings.service";
-import {
-  abortChatBackground,
-  abortUserBackgrounds,
-  abortAllBackgrounds,
-} from "./chat-background.service";
+import { abortChatBackground } from "./chat-background.service";
 import {
   createCooperativeYielder,
   yieldToEventLoop,
@@ -143,11 +128,8 @@ import {
 import * as packsSvc from "./packs.service";
 import {
   GuidedReasoningStreamParser,
-  closeUnterminatedDelimitedReasoning,
   extractDelimitedReasoning,
   resolveReasoningDelimiters,
-  separateDelimitedReasoning,
-  wrapDelimitedReasoningStream,
 } from "../utils/reasoning-strip";
 import {
   persistMacroVariableState,
@@ -161,7 +143,64 @@ import {
 } from "./prompt-assembly-worker-client";
 import { isPromptRegexChatOwned } from "../spindle/prompt-regex-ownership";
 import { isRunning as isExtensionRunning } from "../spindle/lifecycle";
-import { clampErrorMessage, ConnectionCredentialError, describeProviderError, ProviderRequestError } from "../utils/provider-errors";
+import { clampErrorMessage, describeProviderError, ProviderRequestError } from "../utils/provider-errors";
+import {
+  resolveChatGenerationConnection,
+  resolveConnection,
+  resolveProviderAndKey,
+} from "./generation/connection-resolution";
+import { injectConnectionMetadataFlags } from "./generation/connection-metadata";
+import {
+  clearActiveChatGeneration,
+  clearActiveChatGenerationById,
+  getActiveChatGeneration,
+  getActiveGeneration,
+  registerActiveGeneration,
+  removeActiveGeneration,
+  setActiveChatGeneration,
+  touchActiveGeneration,
+} from "./generation/active-generation-registry";
+import {
+  clearCouncilRetry,
+  waitForCouncilRetryDecision,
+} from "./generation/council-retry";
+import {
+  applyDelimitedReasoningParsing,
+  applyEffectiveReasoningSettings,
+  buildDryRunDisplayMessages,
+  closeUnterminatedReasoningTags,
+  extractReasoningDetailsText,
+  extractThinkingBlockText,
+  resolveDryRunMessageReasoning,
+  type DryRunDisplayMessage,
+} from "./generation/reasoning";
+import {
+  rawGenerate,
+  type RawGenerateInput,
+} from "./generation/direct-generation";
+
+export {
+  getActiveChatGeneration,
+  getActiveGenerationCount,
+  stopAllGenerations,
+  stopChatGenerations,
+  stopGeneration,
+  stopGenerationSweep,
+  stopUserGenerations,
+  sweepInactiveGenerations,
+} from "./generation/active-generation-registry";
+export { resolveCouncilRetry } from "./generation/council-retry";
+export type { DryRunDisplayMessage } from "./generation/reasoning";
+export {
+  quietGenerate,
+  quietGenerateStream,
+  rawGenerate,
+  rawGenerateStream,
+} from "./generation/direct-generation";
+export type {
+  QuietGenerateInput,
+  RawGenerateInput,
+} from "./generation/direct-generation";
 
 interface GenerateInput {
   userId: string;
@@ -194,150 +233,6 @@ interface GenerateInput {
   signal?: AbortSignal;
   /** Deterministic id for edit-and-send replay; when set, skip minting a new UUID. */
   generationId?: string;
-}
-
-/**
- * Resolve the connection used by a chat generation. A chat-scoped binding is
- * authoritative over the caller's active/global connection. If the bound
- * profile was deleted, fall back to the requested/default profile so an old
- * metadata reference cannot make the chat unusable.
- *
- * When no `connection_id` was supplied by the caller — i.e. the generation was
- * triggered server-side (Edit-and-Send outbox dispatch, multiplayer host,
- * spindle sends that forward an `undefined` id) — the fallback is the ACTING
- * connection (`resolveActingConnectionId`: validated `activeProfileId` → the
- * `is_default` profile → any owned profile) rather than `is_default` alone.
- * `is_default` alone is the 401 defect: it is a different piece of state from
- * the `activeProfileId` the UI sends, so the dispatched generation could run on
- * a connection the user never selected. A supplied-but-stale id still throws
- * rather than silently retargeting.
- *
- * `opts.preferActiveConnection` is the `editAndSendAlwaysUseActiveConnection`
- * opt-in, and it is set only for Edit-and-Send dispatches. See below.
- *
- * `opts.authoritativeConnectionId` is the connection an Edit-and-Send request was
- * COMMITTED against, read off `generation_outbox.connection_id`. It is the FIRST
- * rung, ahead of the opt-in and ahead of the chat pin, because the whole point of
- * recording it is that no live state re-read may retarget a request the user
- * already committed. See the rung itself.
- */
-function resolveChatGenerationConnection(
-  userId: string,
-  metadata: Record<string, any> | null | undefined,
-  requestedConnectionId?: string,
-  opts?: { preferActiveConnection?: boolean; authoritativeConnectionId?: string },
-): ConnectionProfile {
-  // An empty/whitespace-only id already fell through to the default profile
-  // today; normalizing here keeps that outcome while letting the acting
-  // fallback below see "no id was supplied".
-  const requestedId = requestedConnectionId?.trim() || undefined;
-
-  // Rung 0 — the durably COMMITTED connection. Set only for Edit-and-Send
-  // dispatches, and only for rows that actually recorded one.
-  //
-  // This rung exists because an outbox row's dispatch is not a single event: the
-  // same row is dispatched from the POST handler, again from the periodic retry
-  // tick after a backoff, and again from startup crash recovery, potentially
-  // hours apart. Every rung below reads LIVE state (`activeProfileId`, the
-  // opt-in, the chat's `connection_profile_id` pin), so without this rung
-  // switching the active profile between those ticks silently retargets a
-  // request the user already committed. Ahead of `preferActiveConnection` on
-  // purpose: the recorded value ALREADY baked in the opt-in's answer at commit
-  // time (see `connections.service.resolveEditAndSendConnectionId`, which
-  // mirrors this ladder rung for rung), so consulting the opt-in again could
-  // only re-introduce the drift.
-  //
-  // Returning from here bypasses the `connection_model` metadata override at the
-  // bottom of this function, so that override is re-applied inline — but ONLY
-  // when the committed connection IS the chat's live pin. That condition is
-  // exactly the existing `boundConnection && metadata.connection_model` gate, so
-  // a pinned chat keeps its pinned model bit-for-bit. When the committed id came
-  // from the active-profile opt-in instead (i.e. it is NOT the pinned profile),
-  // the override is dropped, matching the reasoning already documented for the
-  // active-profile rung: a pinned model belongs to the pinned profile and is
-  // very often not a model the other endpoint serves, so carrying it over would
-  // produce a second, subtler failure of exactly the kind this fix removes.
-  // Blanket-dropping the override on this rung was the rejected alternative; it
-  // silently changed the MODEL of every pinned chat, which is a behaviour change
-  // this finding never asked for (and which
-  // `edit-and-send-active-connection-optin.integration.test.ts`'s
-  // "binding live, activeProfileId deleted" case pins).
-  //
-  // MISS POLICY: if the recorded id no longer resolves — the profile was deleted
-  // between commit and dispatch — FALL THROUGH to the unchanged ladder rather
-  // than throwing. A deleted profile is unrecoverable: no amount of retrying
-  // brings it back, so throwing would only strand the user's committed edit with
-  // no output at all, which is strictly worse than running it on their current
-  // selection. This mirrors the precedent already documented on this function
-  // for the chat-scoped binding ("If the bound profile was deleted, fall back ...
-  // so an old metadata reference cannot make the chat unusable"). The rejected
-  // alternative was failing the row terminally; that trades a rare wrong-profile
-  // dispatch for a guaranteed lost request.
-  const authoritativeId = opts?.authoritativeConnectionId?.trim() || undefined;
-  if (authoritativeId) {
-    const committed = connectionsSvc.resolveConnection(userId, authoritativeId);
-    if (committed) {
-      const pinnedId = typeof metadata?.connection_profile_id === "string"
-        ? metadata.connection_profile_id.trim()
-        : "";
-      const committedIsPinned = pinnedId !== "" && pinnedId === committed.id;
-      const pinnedModel = committedIsPinned && typeof metadata?.connection_model === "string"
-        ? metadata.connection_model.trim()
-        : "";
-      return pinnedModel ? { ...committed, model: pinnedModel } : committed;
-    }
-  }
-
-  // The opt-in: the user's STRICT active profile wins over a live chat-scoped
-  // binding, for Edit-and-Send only, and only when no explicit id was supplied
-  // (so every interactive path stays bit-identical). The binding's
-  // `connection_model` override is deliberately NOT carried across: the pinned
-  // model belongs to the pinned profile and is very often not a model the
-  // active profile's endpoint serves, so carrying it over would produce a
-  // second, subtler failure of exactly the kind this fix exists to remove.
-  // When the strict rung resolves nothing, control falls through to the
-  // unchanged ladder below — the prescribed safe degradation, structural rather
-  // than defensive: this branch only ever replaces the FIRST choice.
-  if (opts?.preferActiveConnection && !requestedId) {
-    const activeId = connectionsSvc.resolveActiveConnectionId(userId);
-    if (activeId) {
-      const activeConnection = connectionsSvc.resolveConnection(userId, activeId);
-      if (activeConnection) return activeConnection;
-    }
-  }
-
-  const boundId = typeof metadata?.connection_profile_id === "string"
-    ? metadata.connection_profile_id.trim()
-    : "";
-  const boundConnection = boundId
-    ? connectionsSvc.resolveConnection(userId, boundId)
-    : null;
-  // The acting chain (active → is_default → any owned) is evaluated in stages
-  // rather than as one `resolveActingConnectionId` call so that the rungs beyond
-  // `is_default` are only reached when the earlier ones actually came up empty.
-  // `resolveConnection` is the seam every caller and test harness already stubs;
-  // `getDefaultConnection` / `listConnections` are not, and eagerly calling them
-  // would make every generation start touch the database. The staged form is
-  // equivalent to `resolveConnection(userId, resolveActingConnectionId(userId))`
-  // rung for rung — `resolveActingConnectionId` remains the single owner of the
-  // chain and is what the last stage delegates to.
-  const connection = boundConnection
-    ?? connectionsSvc.resolveConnection(
-      userId,
-      requestedId ?? connectionsSvc.resolveActiveConnectionId(userId),
-    )
-    ?? (requestedId
-      ? null
-      : connectionsSvc.resolveConnection(userId, connectionsSvc.resolveActingConnectionId(userId)));
-
-  if (!connection) {
-    throw new Error("No connection profile found. Configure a default connection or select one for this chat.");
-  }
-
-  const modelOverride = boundConnection && typeof metadata?.connection_model === "string"
-    ? metadata.connection_model.trim()
-    : "";
-  return modelOverride ? { ...connection, model: modelOverride } : connection;
 }
 
 /**
@@ -424,29 +319,6 @@ function collectTrailingUserMessageIds(userId: string, chatId: string): string[]
   return chatsSvc.getTrailingVisibleUserMessageIds(userId, chatId);
 }
 
-function injectConnectionMetadataFlags(
-  connection: { provider: string; metadata?: Record<string, any> },
-  params: GenerationParameters,
-  chatId?: string,
-): void {
-  if (connection.metadata?.use_responses_api) {
-    params.use_responses_api = true;
-  }
-
-  if (connection.provider === "openrouter") {
-    if (connection.metadata?.openrouter) {
-      params._openrouter = connection.metadata.openrouter;
-    }
-    // OpenRouter documents `session_id` as the explicit sticky-routing key.
-    // Keep it scoped to a Lumiverse chat and never replace a caller-provided
-    // session or cache key. The provider then reuses the same upstream cache
-    // across normal turns, swipes, and retries without forcing no-fallback.
-    if (chatId && params.session_id === undefined && params.prompt_cache_key === undefined) {
-      params.session_id = `lumiverse:${chatId}`;
-    }
-  }
-}
-
 function omitChatHistoryBreakdownEntries<
   T extends { type: string },
 >(entries: T[]): T[] {
@@ -472,123 +344,6 @@ function omitChatHistoryTokenBreakdown(
   };
 }
 
-function normalizeReasoningText(reasoning: unknown): string | undefined {
-  return typeof reasoning === "string" && reasoning.trim().length > 0
-    ? reasoning
-    : undefined;
-}
-
-function extractThinkingBlockText(
-  blocks: LlmThinkingBlock[] | undefined,
-): string | undefined {
-  if (!Array.isArray(blocks) || blocks.length === 0) return undefined;
-  const combined = blocks
-    .map((block) =>
-      block.type === "thinking" && typeof block.thinking === "string"
-        ? block.thinking
-        : "",
-    )
-    .filter((text) => text.trim().length > 0)
-    .join("\n");
-  return combined.trim().length > 0 ? combined : undefined;
-}
-
-function extractReasoningDetailsText(
-  details: Record<string, unknown>[] | undefined,
-): string | undefined {
-  if (!Array.isArray(details) || details.length === 0) return undefined;
-  const combined = details
-    .map((detail) => {
-      if (!detail || typeof detail !== "object") return "";
-      if (typeof detail.text === "string") return detail.text;
-      if (typeof detail.summary === "string") return detail.summary;
-      return "";
-    })
-    .filter((text) => text.trim().length > 0)
-    .join("\n");
-  return combined.trim().length > 0 ? combined : undefined;
-}
-
-function resolveDryRunMessageReasoning(
-  message: LlmMessage,
-  sourceMessage?: Message,
-): string | undefined {
-  return (
-    normalizeReasoningText(sourceMessage?.extra?.reasoning) ??
-    normalizeReasoningText(message.reasoning_content) ??
-    extractThinkingBlockText(message.thinking_blocks) ??
-    extractReasoningDetailsText(message.reasoning_details)
-  );
-}
-
-function shouldExtractDisplayReasoningFromContent(message: LlmMessage): boolean {
-  return (
-    message.role === "assistant" &&
-    isChatHistoryMessage(message) &&
-    !shouldPreserveDisplayReasoningDelimiters(message)
-  );
-}
-
-function buildDryRunDisplayMessages(
-  messages: LlmMessage[],
-  sourceMessagesById?: Map<string, Message>,
-  reasoningSettings?: {
-    prefix?: string;
-    suffix?: string;
-    keepInHistory?: number;
-  } | null,
-): DryRunDisplayMessage[] {
-  const delimiters = resolveReasoningDelimiters(reasoningSettings);
-
-  const displayMessages = messages.map((message) => {
-    const described = describeContentForDisplay(message.content);
-    const extractedReasoning = shouldExtractDisplayReasoningFromContent(message)
-      ? extractDelimitedReasoning(described.text, delimiters)
-      : { cleaned: described.text, reasoning: "" };
-    const sourceMessageId = getSourceMessageId(message);
-    const sourceMessage = sourceMessageId
-      ? sourceMessagesById?.get(sourceMessageId)
-      : undefined;
-    const reasoning =
-      normalizeReasoningText(extractedReasoning.reasoning) ??
-      resolveDryRunMessageReasoning(message, sourceMessage);
-
-    const displayMessage: DryRunDisplayMessage = {
-      ...(message as any),
-      content: extractedReasoning.cleaned,
-    };
-    if (described.contentParts.length > 0) {
-      displayMessage.contentParts = described.contentParts;
-    }
-
-    if (
-      reasoning &&
-      extractedReasoning.cleaned.trim() !== reasoning.trim()
-    ) {
-      displayMessage.reasoning = reasoning;
-    }
-
-    return displayMessage;
-  });
-
-  const keepInHistory = reasoningSettings?.keepInHistory ?? -1;
-  if (keepInHistory !== -1) {
-    let keptReasoningMessages = 0;
-    for (let i = displayMessages.length - 1; i >= 0; i--) {
-      if (!isChatHistoryMessage(messages[i]) || messages[i].role !== "assistant") {
-        continue;
-      }
-      if (!displayMessages[i].reasoning) continue;
-      keptReasoningMessages++;
-      if (keptReasoningMessages > keepInHistory) {
-        delete displayMessages[i].reasoning;
-      }
-    }
-  }
-
-  return displayMessages;
-}
-
 export const __test__ = {
   buildDryRunDisplayMessages,
   extractReasoningDetailsText,
@@ -602,48 +357,6 @@ export const __test__ = {
   resolveProviderAndKey,
   sumChatHistoryBreakdownTokens,
 };
-
-export interface RawGenerateInput {
-  provider: string;
-  model: string;
-  messages: LlmMessage[];
-  parameters?: GenerationParameters;
-  api_url?: string;
-  /** Optional: resolve key from a connection instead of global lookup */
-  connection_id?: string;
-  /** Optional: use this key directly (for extension endpoints) */
-  api_key?: string;
-  /** Optional tool/function definitions for inline function calling. */
-  tools?: ToolDefinition[];
-  /**
-   * Optional per-request reasoning override. When omitted (or `source: "inherit"`),
-   * the connection's bound reasoning settings are applied, falling back to
-   * the user's global `reasoningSettings`. See `GenerationReasoningOverrideDTO`.
-   */
-  reasoning?: GenerationReasoningOverrideDTO;
-}
-
-export interface QuietGenerateInput {
-  messages: LlmMessage[];
-  connection_id?: string;
-  parameters?: GenerationParameters;
-  /** Optional tool/function definitions for inline function calling. */
-  tools?: ToolDefinition[];
-  /** Optional abort signal — when fired, cancels the in-flight HTTP request. */
-  signal?: AbortSignal;
-  /**
-   * Optional chat id. Currently used by the summarize path to track in-flight
-   * jobs in the summarize pool so frontends can recover state on reconnect or
-   * chat-switch. Ignored by `quietGenerate`.
-   */
-  chat_id?: string;
-  /**
-   * Optional per-request reasoning override. When omitted (or `source: "inherit"`),
-   * the connection's bound reasoning settings are applied, falling back to
-   * the user's global `reasoningSettings`. See `GenerationReasoningOverrideDTO`.
-   */
-  reasoning?: GenerationReasoningOverrideDTO;
-}
 
 /** Input for the /summarize endpoint — backend fetches messages and builds the prompt. */
 export interface SummarizeGenerateInput {
@@ -724,16 +437,6 @@ export interface DryRunResult {
   contextClipStats?: import("../llm/types").ContextClipStats;
 }
 
-export interface DryRunDisplayMessage
-  extends Omit<LlmMessage, "content"> {
-  content: string;
-  reasoning?: string;
-  contentParts?: DisplayContentPartSummary[];
-  __chatHistorySource?: boolean;
-  __sourceMessageId?: string;
-  __sourceIndexInChat?: number;
-}
-
 export interface BatchGenerateInput {
   requests: RawGenerateInput[];
   concurrent?: boolean;
@@ -811,35 +514,6 @@ interface PromptPipelineResult {
   trimIncompleteWords?: boolean;
 }
 
-/**
- * If the generated content contains an unclosed reasoning/thinking tag
- * (e.g. generation was interrupted mid-thought), append the closing tag
- * so the frontend can properly collapse the reasoning block.
- */
-function closeUnterminatedReasoningTags(
-  userId: string,
-  content: string,
-): string {
-  if (!content) return content;
-
-  const reasoningSetting = settingsSvc.getSetting(userId, "reasoningSettings");
-  return closeUnterminatedDelimitedReasoning(
-    content,
-    resolveReasoningDelimiters(reasoningSetting?.value),
-  );
-}
-
-function getReasoningParseConfig(userId: string): {
-  enabled: boolean;
-  delimiters: ReturnType<typeof resolveReasoningDelimiters>;
-} {
-  const reasoningSetting = settingsSvc.getSetting(userId, "reasoningSettings");
-  return {
-    enabled: reasoningSetting?.value?.autoParse === true,
-    delimiters: resolveReasoningDelimiters(reasoningSetting?.value),
-  };
-}
-
 function appendInterceptorBreakdownEntries(
   breakdown: AssemblyBreakdownEntry[] | undefined,
   interceptorBreakdown: InterceptorBreakdownEntry[] | undefined,
@@ -858,32 +532,6 @@ function appendInterceptorBreakdownEntries(
       extensionName: entry.extensionName,
     }));
   return [...breakdown, ...injected];
-}
-
-function applyDelimitedReasoningParsing(
-  userId: string,
-  response: GenerationResponse,
-): GenerationResponse {
-  const { enabled, delimiters } = getReasoningParseConfig(userId);
-  const parsed = separateDelimitedReasoning(
-    response.content,
-    response.reasoning,
-    delimiters,
-    enabled,
-  );
-  return {
-    ...response,
-    content: parsed.content,
-    ...(parsed.reasoning ? { reasoning: parsed.reasoning } : {}),
-  };
-}
-
-function wrapDelimitedReasoningForUser(
-  userId: string,
-  stream: AsyncGenerator<StreamChunk, void, unknown>,
-): AsyncGenerator<StreamChunk, void, unknown> {
-  const { enabled, delimiters } = getReasoningParseConfig(userId);
-  return wrapDelimitedReasoningStream(stream, delimiters, enabled);
 }
 
 /**
@@ -1236,82 +884,6 @@ function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-// Track active generations for stop support
-const activeGenerations = new Map<
-  string,
-  {
-    controller: AbortController;
-    userId: string;
-    chatId: string;
-    startedAt: number;
-    /** Timestamp of the most recently received content or reasoning token. */
-    lastTokenAt: number;
-    /** Resolves when the generation's streaming continuation finishes
-     *  (success, error, or abort). Used by the per-chat lock to wait for
-     *  teardown before starting a replacement generation — this prevents
-     *  two HTTP operations (the old cancel and the new connect) from
-     *  overlapping on Bun's HTTPThread, which has a known null-callback
-     *  race on concurrent cancel+start.
-     *  Created up-front as a deferred promise so it's always present — even
-     *  during the setup phase before the streaming IIFE starts. */
-    completion: Promise<void>;
-  }
->();
-
-// Per-chat generation lock: prevents concurrent generations (including council) in the same chat.
-// Keyed by `${userId}:${chatId}` → generationId. Registered BEFORE council execution so that
-// a second request for the same chat will abort the in-flight one (including its council tools).
-const activeChatGenerations = new Map<string, string>();
-
-// Pending council retry decisions: when council tools partially fail, the generation
-// pauses and waits for the user to decide whether to continue or retry. Keyed by
-// generationId → { resolve, timeout }. The user responds via POST /generate/council-retry.
-/** Safety cap: auto-continue after 10 minutes to prevent permanent resource hangs */
-const COUNCIL_RETRY_SAFETY_CAP_MS = 10 * 60 * 1000;
-
-const pendingCouncilRetries = new Map<
-  string,
-  {
-    userId: string;
-    resolve: (decision: "continue" | "retry") => void;
-    timeout: ReturnType<typeof setTimeout>;
-  }
->();
-
-/**
- * Called from the council-retry route to resolve a pending decision. Verifies
- * the generation belongs to the caller — without this check, any authenticated
- * user could approve/retry another user's pending generation by guessing IDs.
- */
-export function resolveCouncilRetry(
-  userId: string,
-  generationId: string,
-  decision: "continue" | "retry",
-): boolean {
-  const pending = pendingCouncilRetries.get(generationId);
-  if (!pending) return false;
-  if (pending.userId !== userId) return false;
-  clearTimeout(pending.timeout);
-  pendingCouncilRetries.delete(generationId);
-  // Clear the pool flag
-  const poolEntry = pool.getPoolEntry(generationId);
-  if (poolEntry) {
-    poolEntry.councilRetryPending = false;
-    delete poolEntry.councilToolsFailure;
-  }
-  pending.resolve(decision);
-  return true;
-}
-
-/** Resolve connection profile by ID or fall back to the user's default. */
-function resolveConnection(userId: string, connectionId?: string) {
-  const connection = connectionsSvc.resolveConnection(userId, connectionId);
-  if (!connection) {
-    throw new Error("No connection profile found. Create one first.");
-  }
-  return connection;
-}
-
 function resolveActivePresetId(userId: string): string | undefined {
   const activePresetSetting = settingsSvc.getSetting(
     userId,
@@ -1321,15 +893,6 @@ function resolveActivePresetId(userId: string): string | undefined {
     ? activePresetSetting.value
     : undefined;
 }
-
-type ReasoningSettingsSnapshot = {
-  apiReasoning?: boolean;
-  reasoningEffort?: string;
-  thinkingDisplay?: string;
-  clearThinking?: boolean;
-  replayThoughtSignatures?: boolean;
-  customBody?: CustomBody;
-} | null;
 
 type CouncilResultCache = CachedCouncilResult & {
   fingerprint?: string;
@@ -1439,144 +1002,6 @@ function isReusableCouncilCache(
   return true;
 }
 
-function getEffectiveReasoningSettings(
-  userId: string,
-  connection?: { metadata?: Record<string, any> | null } | null,
-): ReasoningSettingsSnapshot {
-  const boundSettings = connection?.metadata?.reasoningBindings?.settings;
-  if (boundSettings && typeof boundSettings === "object") {
-    return boundSettings as ReasoningSettingsSnapshot;
-  }
-
-  const reasoningSetting = settingsSvc.getSetting(userId, "reasoningSettings");
-  return (reasoningSetting?.value as ReasoningSettingsSnapshot | undefined) ?? null;
-}
-
-/**
- * Resolve a per-request reasoning override down to a `ReasoningSettingsSnapshot`
- * that the existing inject/off-switch helpers can consume. Returns `undefined`
- * to mean "no override — use the inherited settings".
- */
-function resolveReasoningOverride(
-  override: GenerationReasoningOverrideDTO | undefined,
-): ReasoningSettingsSnapshot | undefined {
-  if (!override) return undefined;
-  const source = override.source ?? "inherit";
-  if (source === "inherit") return undefined;
-  if (source === "off") {
-    return { apiReasoning: false };
-  }
-  // source === "custom"
-  return {
-    apiReasoning: override.apiReasoning ?? true,
-    reasoningEffort: override.effort ?? "auto",
-    thinkingDisplay: override.thinkingDisplay ?? "auto",
-  };
-}
-
-function applyEffectiveReasoningSettings(
-  userId: string,
-  connection: { metadata?: Record<string, any> | null },
-  providerName: string,
-  modelName: string | undefined,
-  params: GenerationParameters,
-  override?: GenerationReasoningOverrideDTO,
-  includeCustomBody = false,
-): void {
-  const resolvedOverride = resolveReasoningOverride(override);
-  const reasoningSettings =
-    resolvedOverride !== undefined
-      ? resolvedOverride
-      : getEffectiveReasoningSettings(userId, connection);
-
-  if (includeCustomBody) {
-    applyCustomBodyParameters(params, reasoningSettings?.customBody);
-  }
-
-  if (reasoningSettings?.apiReasoning) {
-    const effort = reasoningSettings.reasoningEffort || "auto";
-    const requiresExplicitOnSwitch =
-      providerName === "moonshot" || providerName === "zai";
-    if (effort !== "auto" || requiresExplicitOnSwitch) {
-      injectReasoningParams(
-        params,
-        providerName,
-        effort,
-        modelName,
-        reasoningSettings.thinkingDisplay,
-        reasoningSettings.clearThinking,
-      );
-    }
-    if (
-      reasoningSettings.replayThoughtSignatures === true &&
-      (providerName === "google" || providerName === "google_vertex")
-    ) {
-      params._replay_thought_signatures = true;
-    }
-    return;
-  }
-
-  if (reasoningSettings?.apiReasoning !== false) return;
-
-  applyProviderReasoningOffSwitch(params as any, providerName, modelName);
-}
-
-/** Resolve provider and API key from a connection profile. */
-async function resolveProviderAndKey(
-  userId: string,
-  connectionId: string,
-): Promise<{ provider: LlmProvider; apiKey: string; apiUrl: string; connection: ConnectionProfile }> {
-  const connection = connectionsSvc.resolveConnection(userId, connectionId);
-  if (!connection) {
-    throw new Error(`Connection not found: ${connectionId}`);
-  }
-
-  const provider = getProvider(connection.provider);
-  if (!provider) {
-    throw new Error(`Unknown provider: ${connection.provider}`);
-  }
-
-  const secretKeyName = connectionsSvc.connectionSecretKey(connection.id);
-  const apiKey = await secretsSvc.getSecret(userId, secretKeyName);
-  if (!apiKey && provider.capabilities.apiKeyRequired) {
-    throw new Error(
-      `No API key found for connection "${connection.name}". Add one via the connection settings.`,
-    );
-  }
-  // Credential preflight. `apiKeyRequired` cannot carry this decision: it is a
-  // per-provider constant, and `Custom (OpenAI-compatible)` legitimately serves
-  // both a keyless llama.cpp on loopback and a keyed remote gateway. The signal
-  // that IS per-connection and already durable is `has_api_key`, which the user
-  // sets by storing a key and clears by removing one. Classification on the pair
-  // (has_api_key, resolved secret):
-  //   any   + non-empty          → authenticated, proceed (unchanged)
-  //   false + empty, required    → existing descriptive error above, unchanged
-  //   true  + empty/unreadable   → MISCONFIGURED: fail before any outbound call
-  //   false + empty, not required→ intentionally keyless, proceed (unchanged)
-  // The last row stays permissive on purpose: hard-failing it would break every
-  // working keyless local endpoint. The `has_api_key = true` + empty row is
-  // unambiguous — the profile asserts a credential exists and it cannot be
-  // produced (deleted secret row, failed decrypt, profile duplicated without its
-  // secret) — and it is exactly the case that would otherwise reach a provider
-  // unauthenticated. Key NAME only; no credential value is read into the
-  // message, logged, or persisted.
-  if (!apiKey && connection.has_api_key) {
-    throw new ConnectionCredentialError({
-      connectionId: connection.id,
-      connectionName: connection.name,
-      provider: provider.displayName,
-      secretKeyName,
-    });
-  }
-
-  return {
-    provider,
-    apiKey: apiKey || "",
-    apiUrl: connectionsSvc.resolveEffectiveApiUrl(connection),
-    connection,
-  };
-}
-
 /**
  * Shared prompt pipeline: build spindle context, assemble prompt, run
  * interceptors, apply post-processing, and merge parameters.
@@ -1677,6 +1102,7 @@ async function runPromptPipeline(opts: {
       personaId: opts.personaId,
       personaAddonStates: opts.personaAddonStates,
       generationType: opts.generationType as GenerationType,
+      macroCommit: opts.isDryRun !== true,
       impersonateMode: opts.impersonateMode,
       impersonateInput: opts.impersonateInput,
       userInput: opts.userInput,
@@ -2002,37 +1428,6 @@ async function runPromptPipeline(opts: {
   };
 }
 
-/** Resolve provider and key for raw generate: supports connection_id, direct api_key, or provider-name lookup. */
-async function resolveRawProviderAndKey(
-  userId: string,
-  input: RawGenerateInput,
-): Promise<{ provider: LlmProvider; apiKey: string; apiUrl: string; connection: ConnectionProfile | null }> {
-  // If a connection_id is provided, use per-connection key
-  if (input.connection_id) {
-    return resolveProviderAndKey(userId, input.connection_id);
-  }
-
-  // If a direct api_key is provided, use it
-  if (input.api_key) {
-    const provider = getProvider(input.provider);
-    if (!provider) throw new Error(`Unknown provider: ${input.provider}`);
-    return { provider, apiKey: input.api_key, apiUrl: input.api_url || "", connection: null };
-  }
-
-  // Fallback: look up provider by name, but there's no global key anymore.
-  // For backward compat with extensions that pass provider+api_key inline, require api_key.
-  const provider = getProvider(input.provider);
-  if (!provider) throw new Error(`Unknown provider: ${input.provider}`);
-
-  if (provider.capabilities.apiKeyRequired) {
-    throw new Error(
-      `No API key provided. Pass api_key or connection_id in the request.`,
-    );
-  }
-
-  return { provider, apiKey: "", apiUrl: input.api_url || "", connection: null };
-}
-
 function resolveStartGenerationId(input: GenerateInput): string {
   const requested = typeof input.generationId === "string" ? input.generationId.trim() : "";
   return requested || crypto.randomUUID();
@@ -2082,7 +1477,7 @@ export async function startGeneration(
   let genType = input.generation_type || "normal";
 
   if (requestedGenerationId) {
-    const existing = activeGenerations.get(generationId);
+    const existing = getActiveGeneration(generationId);
     if (existing && existing.userId === input.userId && existing.chatId === input.chat_id) {
       return { generationId, status: "streaming" };
     }
@@ -2112,10 +1507,12 @@ export async function startGeneration(
   // --- Per-chat generation lock ---
   // Stop any existing generation for this chat (including in-flight council tools)
   // before proceeding. This prevents council re-firing and generation interruption.
-  const chatKey = `${input.userId}:${input.chat_id}`;
-  const existingGenId = activeChatGenerations.get(chatKey);
+  const existingGenId = getActiveChatGeneration(
+    input.userId,
+    input.chat_id,
+  );
   if (existingGenId) {
-    const existing = activeGenerations.get(existingGenId);
+    const existing = getActiveGeneration(existingGenId);
     if (existing) {
       console.debug(
         "[generate] Aborting existing generation %s for chat %s before starting new one",
@@ -2133,8 +1530,8 @@ export async function startGeneration(
         new Promise<void>((r) => setTimeout(r, 2000)),
       ]);
     }
-    activeGenerations.delete(existingGenId);
-    activeChatGenerations.delete(chatKey);
+    removeActiveGeneration(existingGenId);
+    clearActiveChatGeneration(input.userId, input.chat_id, existingGenId);
   }
 
   // Register this generation early (before council) so it can be tracked and aborted.
@@ -2145,7 +1542,7 @@ export async function startGeneration(
   let resolveCompletion!: () => void;
   const completion = new Promise<void>((r) => { resolveCompletion = r; });
   const generationStartedAt = Date.now();
-  activeGenerations.set(generationId, {
+  registerActiveGeneration(generationId, {
     controller: abortController,
     userId: input.userId,
     chatId: input.chat_id,
@@ -2156,7 +1553,7 @@ export async function startGeneration(
     lastTokenAt: generationStartedAt,
     completion,
   });
-  activeChatGenerations.set(chatKey, generationId);
+  setActiveChatGeneration(input.userId, input.chat_id, generationId);
 
   // Helper: bail out cleanly if aborted during the setup phase.
   // Throws the same DOMException shape that fetch / AbortSignal.any use so
@@ -2868,26 +2265,9 @@ export async function startGeneration(
                   // Pause indefinitely — no short timer. The frontend controls when to
                   // show the modal (only when the user navigates to this chat). A 10-minute
                   // safety cap prevents permanent resource hangs if the user never responds.
-                  const decision = await new Promise<"continue" | "retry">(
-                    (resolve) => {
-                      const timeout = setTimeout(() => {
-                        console.debug(
-                          "[council] Safety cap reached for %s — auto-continuing",
-                          generationId,
-                        );
-                        pendingCouncilRetries.delete(generationId);
-                        if (poolEntry) {
-                          poolEntry.councilRetryPending = false;
-                          delete poolEntry.councilToolsFailure;
-                        }
-                        resolve("continue");
-                      }, COUNCIL_RETRY_SAFETY_CAP_MS);
-                      pendingCouncilRetries.set(generationId, {
-                        userId: input.userId,
-                        resolve,
-                        timeout,
-                      });
-                    },
+                  const decision = await waitForCouncilRetryDecision(
+                    input.userId,
+                    generationId,
                   );
 
                   checkAborted();
@@ -3380,18 +2760,12 @@ export async function startGeneration(
         // Clean up tracking maps if setup (council, assembly, etc.) fails or is aborted.
         // Only clear the per-chat mapping if it still points at THIS generation —
         // a newer startGeneration on the same chat may have already taken over the
-        // chatKey (see line 590), and wiping it would strand the new generation.
-        activeGenerations.delete(generationId);
-        if (activeChatGenerations.get(chatKey) === generationId) {
-          activeChatGenerations.delete(chatKey);
-        }
+        // chat lock, and wiping it would strand the new generation.
+        removeActiveGeneration(generationId);
+        clearActiveChatGeneration(input.userId, input.chat_id, generationId);
 
         // Clean up any pending council retry decision
-        const pendingRetry = pendingCouncilRetries.get(generationId);
-        if (pendingRetry) {
-          clearTimeout(pendingRetry.timeout);
-          pendingCouncilRetries.delete(generationId);
-        }
+        clearCouncilRetry(generationId);
 
         // User aborts and extension-requested cancels both emit stop events so
         // the frontend resets its streaming state.
@@ -3468,10 +2842,8 @@ export async function startGeneration(
         /* best-effort cleanup */
       }
     }
-    activeGenerations.delete(generationId);
-    if (activeChatGenerations.get(chatKey) === generationId) {
-      activeChatGenerations.delete(chatKey);
-    }
+    removeActiveGeneration(generationId);
+    clearActiveChatGeneration(input.userId, input.chat_id, generationId);
     resolveCompletion();
     pool.errorPool(generationId, errorMessage(err));
     throw err;
@@ -4239,8 +3611,7 @@ async function runGeneration(
         // total request age. Count reasoning as well as visible content: both
         // are streamed model output and demonstrate the provider is healthy.
         if (chunk.reasoning || chunk.token) {
-          const entry = activeGenerations.get(generationId);
-          if (entry) entry.lastTokenAt = Date.now();
+          touchActiveGeneration(generationId);
         }
 
         // Emit reasoning tokens (provider thinking/extended thinking)
@@ -4912,15 +4283,10 @@ async function runGeneration(
     }
   } finally {
     flushPendingStreamSegments();
-    activeGenerations.delete(generationId);
+    removeActiveGeneration(generationId);
     // Clean up per-chat lock (only if this generation still owns it — a newer
     // generation may have already replaced it via startGeneration).
-    for (const [key, id] of activeChatGenerations) {
-      if (id === generationId) {
-        activeChatGenerations.delete(key);
-        break;
-      }
-    }
+    clearActiveChatGenerationById(generationId);
   }
 }
 
@@ -5093,337 +4459,6 @@ function emitExpressionChanged(
       expressionGroup,
     },
     userId,
-  );
-}
-
-export function stopGeneration(userId: string, generationId: string): boolean {
-  const entry = activeGenerations.get(generationId);
-  // User scoping: a generationId is unguessable, but never let one user's
-  // stop request abort another user's generation.
-  if (!entry || entry.userId !== userId) return false;
-  entry.controller.abort();
-  // Tear down any fire-and-forget background work for this chat too —
-  // the user asked to stop, so cache-warming cortex/databank queries
-  // should die with the visible generation.
-  abortChatBackground(entry.userId, entry.chatId);
-  return true;
-}
-
-export function stopUserGenerations(userId: string): void {
-  for (const [id, entry] of activeGenerations) {
-    if (entry.userId === userId) {
-      entry.controller.abort();
-    }
-  }
-  abortUserBackgrounds(userId);
-}
-
-export function stopChatGenerations(userId: string, chatId: string): boolean {
-  const chatKey = `${userId}:${chatId}`;
-  const genId = activeChatGenerations.get(chatKey);
-  let stopped = false;
-  if (genId) {
-    const entry = activeGenerations.get(genId);
-    if (entry) {
-      entry.controller.abort();
-      stopped = true;
-    }
-  }
-  abortChatBackground(userId, chatId);
-  return stopped;
-}
-
-export function stopAllGenerations(): void {
-  for (const [id, entry] of activeGenerations) {
-    entry.controller.abort();
-  }
-  activeGenerations.clear();
-  activeChatGenerations.clear();
-  abortAllBackgrounds();
-}
-
-/** Returns the active generationId for a chat, if any. */
-export function getActiveChatGeneration(
-  userId: string,
-  chatId: string,
-): string | undefined {
-  return activeChatGenerations.get(`${userId}:${chatId}`);
-}
-
-export function getActiveGenerationCount(): number {
-  return activeGenerations.size;
-}
-
-// Abort only stalled generations. A slow model may legitimately stream for
-// longer than ten minutes; a provider that has sent no tokens for this long is
-// presumed hung or disconnected. Before the first token arrives, registration
-// time acts as the initial activity timestamp.
-const GENERATION_IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-const GENERATION_IDLE_SWEEP_INTERVAL_MS = 60_000;
-
-export function sweepInactiveGenerations(now = Date.now()): void {
-  for (const [id, entry] of activeGenerations) {
-    const idleForMs = now - entry.lastTokenAt;
-    if (idleForMs > GENERATION_IDLE_TIMEOUT_MS) {
-      console.warn(
-        `[generate] Aborting inactive generation ${id} (no tokens for ${Math.round(idleForMs / 1000)}s; age: ${Math.round((now - entry.startedAt) / 1000)}s)`,
-      );
-      entry.controller.abort();
-    }
-  }
-}
-
-let _generationSweepTimer: ReturnType<typeof setInterval> | null = setInterval(
-  sweepInactiveGenerations,
-  GENERATION_IDLE_SWEEP_INTERVAL_MS,
-);
-
-export function stopGenerationSweep(): void {
-  if (_generationSweepTimer) {
-    clearInterval(_generationSweepTimer);
-    _generationSweepTimer = null;
-  }
-}
-
-// --- Stream-to-response helper ---
-// Some providers (especially with tool calling) work better with streaming.
-// This helper consumes a stream and produces a full GenerationResponse,
-// properly accumulating tool call deltas.
-
-async function consumeStream(
-  stream: AsyncGenerator<StreamChunk, void, unknown>,
-  userId?: string,
-): Promise<GenerationResponse> {
-  let content = "";
-  let reasoning = "";
-  let finishReason = "stop";
-  let stopDetails: GenerationResponse["stop_details"];
-  let stopSequence: string | null | undefined;
-  let toolCalls: import("../llm/types").ToolCallResult[] | undefined;
-  let usage: GenerationResponse["usage"];
-
-  const source = userId
-    ? wrapDelimitedReasoningForUser(userId, stream)
-    : stream;
-  for await (const chunk of source) {
-    if (chunk.token) content += chunk.token;
-    if (chunk.reasoning) reasoning += chunk.reasoning;
-    if (chunk.usage) usage = chunk.usage;
-    if (chunk.finish_reason) finishReason = chunk.finish_reason;
-    if (chunk.stop_details !== undefined) stopDetails = chunk.stop_details;
-    if (chunk.stop_sequence !== undefined) stopSequence = chunk.stop_sequence;
-    if (chunk.tool_calls) toolCalls = chunk.tool_calls;
-  }
-
-  return {
-    content,
-    reasoning: reasoning || undefined,
-    finish_reason: finishReason,
-    stop_details: stopDetails,
-    stop_sequence: stopSequence,
-    tool_calls: toolCalls,
-    usage,
-  };
-}
-
-// --- Extension generation (stateless, synchronous, no WS events) ---
-
-interface PreparedGenerationCall {
-  provider: LlmProvider;
-  apiKey: string;
-  apiUrl: string;
-  request: GenerationRequest;
-}
-
-async function prepareRawCall(
-  userId: string,
-  input: RawGenerateInput & { signal?: AbortSignal },
-): Promise<PreparedGenerationCall> {
-  const { provider, apiKey, apiUrl, connection } = await resolveRawProviderAndKey(
-    userId,
-    input,
-  );
-  const parameters: GenerationParameters = { ...(input.parameters || {}) };
-  const reasoningConnection = connection;
-  applyEffectiveReasoningSettings(
-    userId,
-    reasoningConnection || {},
-    provider.name,
-    input.model,
-    parameters,
-    input.reasoning,
-    true,
-  );
-  if (reasoningConnection) injectConnectionMetadataFlags(reasoningConnection, parameters);
-
-  const cached = applyPromptCaching(
-    {
-      provider: provider.name,
-      model: input.model,
-      metadata: reasoningConnection?.metadata,
-    },
-    { params: parameters, messages: input.messages, tools: input.tools },
-  );
-
-  const request: GenerationRequest = {
-    messages: cached.messages,
-    model: input.model,
-    parameters: cached.params,
-    tools: cached.tools,
-    signal: input.signal,
-  };
-  return { provider, apiKey, apiUrl, request };
-}
-
-async function prepareQuietCall(
-  userId: string,
-  input: QuietGenerateInput,
-): Promise<PreparedGenerationCall> {
-  const connection = resolveConnection(userId, input.connection_id);
-  const { provider, apiKey, apiUrl } = await resolveProviderAndKey(
-    userId,
-    connection.id,
-  );
-
-  // Merge preset parameters with request overrides
-  let mergedParams: GenerationParameters = input.parameters || {};
-  if (connection.preset_id) {
-    const preset = presetsSvc.getPreset(userId, connection.preset_id);
-    if (preset) {
-      mergedParams = { ...preset.parameters, ...mergedParams };
-    }
-  }
-
-  applyEffectiveReasoningSettings(
-    userId,
-    connection,
-    provider.name,
-    connection.model || undefined,
-    mergedParams,
-    input.reasoning,
-    true,
-  );
-
-  // Allow callers (e.g. Memory Cortex sidecar) to override the model without
-  // swapping connection profiles. Strip the key from parameters so it doesn't
-  // leak into provider-specific request bodies as an unknown field. Resolved
-  // before caching dispatch so model-gated strategies see the actual model
-  // that will be sent.
-  const paramModel =
-    typeof (mergedParams as any).model === "string"
-      ? (mergedParams as any).model.trim()
-      : "";
-  if ("model" in mergedParams) delete (mergedParams as any).model;
-
-  injectConnectionMetadataFlags(connection, mergedParams);
-
-  const resolvedModel = paramModel || connection.model;
-  const cached = applyPromptCaching(
-    {
-      provider: provider.name,
-      model: resolvedModel,
-      metadata: connection.metadata,
-    },
-    { params: mergedParams, messages: input.messages, tools: input.tools },
-  );
-
-  const request: GenerationRequest = {
-    messages: cached.messages,
-    model: resolvedModel,
-    parameters: cached.params,
-    tools: cached.tools,
-    signal: input.signal,
-  };
-
-  return { provider, apiKey, apiUrl, request };
-}
-
-export async function rawGenerate(
-  userId: string,
-  input: RawGenerateInput & { signal?: AbortSignal },
-): Promise<GenerationResponse> {
-  const { provider, apiKey, apiUrl, request } = await prepareRawCall(
-    userId,
-    input,
-  );
-
-  // Use streaming when tools are present — some providers only emit tool call
-  // deltas correctly via the streaming path. Consume the stream internally to
-  // produce a complete response.
-  if (input.tools && input.tools.length > 0) {
-    return consumeStream(
-      provider.generateStream(apiKey, apiUrl, { ...request, stream: true }),
-      userId,
-    );
-  }
-
-  return applyDelimitedReasoningParsing(
-    userId,
-    await provider.generate(apiKey, apiUrl, { ...request, stream: false }),
-  );
-}
-
-export async function quietGenerate(
-  userId: string,
-  input: QuietGenerateInput,
-): Promise<GenerationResponse> {
-  const { provider, apiKey, apiUrl, request } = await prepareQuietCall(
-    userId,
-    input,
-  );
-
-  // Use streaming when tools are present — some providers only emit tool call
-  // deltas correctly via the streaming path.
-  if (request.tools && request.tools.length > 0) {
-    return consumeStream(
-      provider.generateStream(apiKey, apiUrl, { ...request, stream: true }),
-      userId,
-    );
-  }
-
-  return applyDelimitedReasoningParsing(
-    userId,
-    await provider.generate(apiKey, apiUrl, { ...request, stream: false }),
-  );
-}
-
-/**
- * Streaming variant of {@link rawGenerate}. Returns the raw provider stream
- * iterator with the caller's `AbortSignal` already wired in. Used by
- * Spindle's `request_generation_stream` RPC to pipe chunks back to the
- * extension worker.
- */
-export async function rawGenerateStream(
-  userId: string,
-  input: RawGenerateInput & { signal?: AbortSignal },
-): Promise<AsyncGenerator<StreamChunk, void, unknown>> {
-  const { provider, apiKey, apiUrl, request } = await prepareRawCall(
-    userId,
-    input,
-  );
-  return wrapDelimitedReasoningForUser(
-    userId,
-    provider.generateStream(apiKey, apiUrl, { ...request, stream: true }),
-  );
-}
-
-/**
- * Streaming variant of {@link quietGenerate}. Same parameter resolution as
- * `quietGenerate` (preset merge, reasoning injection, connection metadata)
- * but returns the underlying provider stream iterator instead of an
- * aggregated response.
- */
-export async function quietGenerateStream(
-  userId: string,
-  input: QuietGenerateInput,
-): Promise<AsyncGenerator<StreamChunk, void, unknown>> {
-  const { provider, apiKey, apiUrl, request } = await prepareQuietCall(
-    userId,
-    input,
-  );
-  return wrapDelimitedReasoningForUser(
-    userId,
-    provider.generateStream(apiKey, apiUrl, { ...request, stream: true }),
   );
 }
 

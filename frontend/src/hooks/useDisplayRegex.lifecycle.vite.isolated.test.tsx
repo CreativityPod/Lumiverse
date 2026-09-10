@@ -17,6 +17,7 @@ interface Identity {
 
 interface HarnessProps {
   content: string
+  depth?: number
   identity?: Identity
   isStreaming: boolean
   onCommit?: (state: { content: string; pending: boolean }) => void
@@ -58,7 +59,7 @@ const storeState = {
     flags: 'g',
     placement: ['ai_output'],
     min_depth: null,
-    max_depth: null,
+    max_depth: null as number | null,
     trim_strings: [],
     substitute_macros: 'none',
     metadata: {},
@@ -143,11 +144,11 @@ const {
 const { act, createElement, StrictMode, useLayoutEffect } = await import('react')
 const { createRoot } = await import('react-dom/client')
 
-function Harness({ content, identity, isStreaming, onCommit }: HarnessProps) {
+function Harness({ content, depth = 0, identity, isStreaming, onCommit }: HarnessProps) {
   const rendered = useDisplayRegexState(
     content,
     false,
-    0,
+    depth,
     undefined,
     identity
       ? {
@@ -205,13 +206,13 @@ function holdPreprocess(content: string): void {
   heldPreprocess.add(content)
 }
 
-async function releasePreprocess(content: string): Promise<void> {
+async function releasePreprocess(content: string, result = content): Promise<void> {
   heldPreprocess.delete(content)
   const resolvePreprocess = pendingPreprocess.get(content)
   if (!resolvePreprocess) throw new Error(`No held preprocess for ${content}`)
   pendingPreprocess.delete(content)
   await act(async () => {
-    resolvePreprocess({ content, cacheable: true })
+    resolvePreprocess({ content: result, cacheable: true })
     await Promise.resolve()
   })
 }
@@ -313,6 +314,143 @@ describe('useDisplayRegex resolver lifecycle', () => {
       await destroyHarness(host, root)
     }
   })
+
+  test('sending a message keeps existing HTML visible through depth-dependent preprocessing and regex work', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'chunk source',
+      identity: { chatId: 'chat-depth', messageId: 'message-depth' },
+      isStreaming: false,
+    }
+    const html = '<div style="height:800px">Existing island</div>'
+    try {
+      holdPreprocess(props.content)
+      await renderWhilePreprocessPending(root, props)
+      await releasePreprocess(props.content, 'chunk preprocessed')
+      await waitForPending('chunk preprocessed')
+      await settle('chunk preprocessed', html)
+
+      // Appending a message changes every existing row's depth, even though
+      // its source and identity are unchanged. Observe every commit: an
+      // immediate resolver would conceal the provisional blank frame.
+      const commits: Array<{ content: string; pending: boolean }> = []
+      holdPreprocess(props.content)
+      await renderWhilePreprocessPending(root, {
+        ...props, depth: 1, onCommit: (state) => commits.push(state),
+      })
+      expect(pendingPreprocess.has(props.content)).toBe(true)
+      expect(commits.length).toBeGreaterThan(0)
+      expect(commits.every((state) => state.content === html && !state.pending)).toBe(true)
+
+      await releasePreprocess(props.content, 'chunk refreshed')
+      await waitForPending('chunk refreshed')
+      expect(commits.every((state) => state.content === html && !state.pending)).toBe(true)
+      await settle('chunk refreshed', '<div>Updated island</div>')
+      expect(readRendered(host)).toBe('<div>Updated island</div>')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('a backend preprocess refresh retains visible passthrough content until its depth update settles', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'Plain message',
+      identity: { chatId: 'chat-passthrough-depth', messageId: 'message-passthrough-depth' },
+      isStreaming: false,
+    }
+    isDisplayChatOwnedMock.mockImplementation(() => false)
+    try {
+      await renderWhilePreprocessPending(root, props)
+      await act(async () => { await new Promise<void>((resolve) => domWindow.setTimeout(resolve, 12)) })
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+
+      const commits: Array<{ content: string; pending: boolean }> = []
+      heldRemotePreprocess.add(props.content)
+      await renderWhilePreprocessPending(root, {
+        ...props, depth: 1, onCommit: (state) => commits.push(state),
+      })
+      await act(async () => { await new Promise<void>((resolve) => domWindow.setTimeout(resolve, 12)) })
+      expect(pendingRemotePreprocess.has(props.content)).toBe(true)
+      expect(commits.length).toBeGreaterThan(0)
+      expect(commits.every((state) => state.content === props.content && !state.pending)).toBe(true)
+
+      await act(async () => {
+        pendingRemotePreprocess.get(props.content)!(remotePreprocessResponse(['Updated plain message']))
+      })
+      expect(readRendered(host)).toBe('Updated plain message')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(applyDisplayRegexTiered).not.toHaveBeenCalled()
+    } finally {
+      await destroyHarness(host, root)
+    }
+  })
+
+  test('a regex that expires at the new depth replaces retained HTML once preprocessing settles', async () => {
+    const { host, root } = await createHarness()
+    const props = {
+      content: 'chunk depth-limited',
+      identity: { chatId: 'chat-depth-limit', messageId: 'message-depth-limit' },
+      isStreaming: false,
+    }
+    const originalScripts = storeState.regexScripts
+    storeState.regexScripts = originalScripts.map((script) => ({ ...script, max_depth: 0 }))
+    try {
+      await render(root, props)
+      await settle(props.content, '<div>Depth-limited island</div>')
+
+      holdPreprocess(props.content)
+      await renderWhilePreprocessPending(root, { ...props, depth: 1 })
+      expect(readRendered(host)).toBe('<div>Depth-limited island</div>')
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+
+      await releasePreprocess(props.content)
+      expect(readRendered(host)).toBe(props.content)
+      expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      expect(applyDisplayRegexTiered).toHaveBeenCalledTimes(1)
+    } finally {
+      storeState.regexScripts = originalScripts
+      await destroyHarness(host, root)
+    }
+  })
+
+  test.each(['chat', 'message', 'source', 'remount'] as const)(
+    'a %s change cannot reuse the prior visible display during preprocessing',
+    async (change) => {
+      const { host, root } = await createHarness()
+      const props = {
+        content: 'chunk original',
+        identity: { chatId: 'chat-retention', messageId: 'message-retention' },
+        isStreaming: false,
+      }
+      try {
+        await render(root, props)
+        await settle(props.content, '<div>Original island</div>')
+        if (change === 'remount') await act(async () => { root.render(null) })
+        const next = {
+          ...props,
+          depth: 1,
+          content: change === 'source' ? 'chunk edited' : props.content,
+          identity: {
+            chatId: change === 'chat' ? 'chat-next' : props.identity.chatId,
+            messageId: change === 'message' ? 'message-next' : props.identity.messageId,
+          },
+        }
+        holdPreprocess(next.content)
+        await renderWhilePreprocessPending(root, next)
+        expect(readRendered(host)).toBe(next.content)
+        expect(host.querySelector('output')?.dataset.pending).toBe('true')
+        await releasePreprocess(next.content)
+        await waitForPending(next.content)
+        await settle(next.content, '<div>Next island</div>')
+        expect(readRendered(host)).toBe('<div>Next island</div>')
+        expect(host.querySelector('output')?.dataset.pending).toBe('false')
+      } finally {
+        await destroyHarness(host, root)
+      }
+    },
+  )
 
   test('a failed regex pass releases the reserved row with fallback text', async () => {
     const { host, root } = await createHarness()

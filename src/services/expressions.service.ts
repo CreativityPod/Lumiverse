@@ -1,5 +1,5 @@
 import { unzipSync } from "fflate";
-import { getCharacter, updateCharacter } from "./characters.service";
+import { getCharacter, updateCharacter, type UpdateCharacterOptions } from "./characters.service";
 import { uploadImage, uploadImages } from "./images.service";
 import type { Character } from "../types/character";
 
@@ -59,11 +59,16 @@ export function getExpressionConfig(userId: string, characterId: string): Expres
   };
 }
 
-function saveConfig(userId: string, characterId: string, config: ExpressionConfig): ExpressionConfig {
+function saveConfig(
+  userId: string,
+  characterId: string,
+  config: ExpressionConfig,
+  options: UpdateCharacterOptions = {},
+): ExpressionConfig {
   const character = getCharacter(userId, characterId);
   if (!character) throw new Error("Character not found");
   const extensions = { ...getExtensions(character), expressions: config };
-  updateCharacter(userId, characterId, { extensions });
+  updateCharacter(userId, characterId, { extensions }, options);
   return config;
 }
 
@@ -216,6 +221,7 @@ export async function importFromImageData(
   userId: string,
   characterId: string,
   assets: readonly ExpressionImageData[],
+  options: UpdateCharacterOptions = {},
 ): Promise<ExpressionImageDataImportResult> {
   const existing = getExpressionConfig(userId, characterId) ?? { ...EMPTY_CONFIG };
   if (assets.length === 0) {
@@ -262,7 +268,7 @@ export async function importFromImageData(
     mappings: newMappings,
   };
   return {
-    config: saveConfig(userId, characterId, config),
+    config: saveConfig(userId, characterId, config, options),
     importedLabels,
     failed,
   };

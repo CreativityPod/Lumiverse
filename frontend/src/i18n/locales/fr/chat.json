@@ -235,7 +235,8 @@
     "active": "· Actif",
     "ariaLabel": "Note de l'auteur",
     "placeholder": "Écrire des instructions ou un contexte pour l'IA...",
-    "depth": "Profondeur",
+    "depth": "Profondeur depuis le dernier message",
+    "depthHint": "0 = après le dernier message ; 1 = avant. Une valeur plus élevée place la note plus loin dans l’historique de la conversation.",
     "role": "Rôle",
     "roleAria": "Rôle"
   },

@@ -1,5 +1,9 @@
+import { getDb } from "../db/connection";
 import { mapWithConcurrency } from "../utils/concurrency";
 import { safeFetch } from "../utils/safe-fetch";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
+import { getCharacter } from "./characters.service";
 import type { ChubExpressionAsset } from "./chub-api.service";
 import { importFromImageData, type ExpressionImageData } from "./expressions.service";
 
@@ -224,8 +228,42 @@ export function queueChubExpressionImport(
   characterId: string,
   assets: readonly ChubExpressionAsset[],
 ): Promise<ChubExpressionImportResult> {
-  return importQueue.enqueue(`${userId}:${characterId}`, () =>
-    importChubExpressionAssetsBatched(userId, characterId, assets));
+  return importQueue.enqueue(`${userId}:${characterId}`, async () => {
+    let changed = false;
+    try {
+      return await importChubExpressionAssetsBatched(userId, characterId, assets, {
+        storeBatch: async (batchUserId, batchCharacterId, batchAssets) => {
+          const result = await importFromImageData(batchUserId, batchCharacterId, batchAssets, {
+            preserveUpdatedAt: true,
+            emitEvent: false,
+          });
+          changed ||= result.importedLabels.length > 0;
+          return result;
+        },
+      });
+    } finally {
+      // Keep open expression panels in sync once per pack, including partial
+      // imports if a later batch fails. Read fresh so concurrent edits survive.
+      if (changed) {
+        const character = getCharacter(userId, characterId);
+        if (character) eventBus.emit(EventType.CHARACTER_EDITED, { id: characterId, character }, userId);
+      }
+    }
+  });
+}
+
+/** Remember checked sources, including those without packs, without editing the card's recency. */
+export function markChubExpressionsChecked(userId: string, characterId: string): void {
+  try {
+    // Patch only the bookkeeping key; checking Chub must not rewrite local
+    // metadata or trigger a full gallery refresh for every candidate.
+    getDb().query(`UPDATE characters
+      SET extensions = json_set(extensions, '$._lumiverse_chub_expressions_checked', ?)
+      WHERE id = ? AND user_id = ? AND deleting = 0`)
+      .run(Date.now(), characterId, userId);
+  } catch {
+    // Losing the stamp only means the card is offered again later.
+  }
 }
 
 export function getChubExpressionImportQueueStatus(): { active: number; queued: number } {

@@ -2682,6 +2682,7 @@ export class WorkerHost {
       category: definition.category || `extension:${this.manifest.identifier}`,
       description: definition.description || "",
       returnType: definition.returnType || "string",
+      volatile: definition.volatile === true,
       args: Array.isArray(definition.args)
         ? definition.args.map((arg: any) => ({
             name: String(arg.name || "arg"),
@@ -2775,6 +2776,7 @@ export class WorkerHost {
                   args: ctx.args,
                   flags: ctx.flags,
                   commit: ctx.commit !== false,
+                  chatId: typeof chatId === "string" && chatId ? chatId : undefined,
                   isScoped: ctx.isScoped,
                   body: ctx.body,
                   offset: ctx.offset,

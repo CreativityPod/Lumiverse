@@ -235,7 +235,8 @@
     "active": "· Attivo",
     "ariaLabel": "Nota dell'autore",
     "placeholder": "Scrivi istruzioni o contesto per l'IA...",
-    "depth": "Profondità",
+    "depth": "Profondità dall’ultimo messaggio",
+    "depthHint": "0 = dopo l’ultimo messaggio; 1 = prima. Valori più alti inseriscono la nota più indietro nella cronologia della chat.",
     "role": "Ruolo",
     "roleAria": "Ruolo"
   },

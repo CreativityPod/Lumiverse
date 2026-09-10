@@ -3706,7 +3706,12 @@ export async function assemblePrompt(
     const resolvedAN = (await evaluate(authorsNote.content, macroEnv, registry))
       .text;
     if (resolvedAN) {
-      const insertAt = Math.max(0, result.length - (authorsNote.depth || 4));
+      // Count backward from the latest chat message, ignoring other prompt
+      // content. Depth 0 belongs immediately after the latest chat message.
+      const insertAt = resolveChatHistoryInsertionIndex(
+        result,
+        authorsNote.depth ?? 4,
+      );
       result.splice(insertAt, 0, {
         role: authorsNote.role || "system",
         content: resolvedAN,

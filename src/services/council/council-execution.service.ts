@@ -7,7 +7,7 @@ import type {
 import type { LlmMessage } from "../../llm/types";
 import { eventBus } from "../../ws/bus";
 import { EventType } from "../../ws/events";
-import { rawGenerate } from "../generate.service";
+import { rawGenerate } from "../generation/direct-generation";
 import * as chatsSvc from "../chats.service";
 import * as charactersSvc from "../characters.service";
 import * as personasSvc from "../personas.service";

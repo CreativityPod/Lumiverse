@@ -987,7 +987,19 @@ export function createCharacter(
   return character;
 }
 
-export function updateCharacter(userId: string, id: string, input: UpdateCharacterInput): Character | null {
+export interface UpdateCharacterOptions {
+  /** Background enrichment must not reorder the character library. */
+  preserveUpdatedAt?: boolean;
+  /** Batched workflows publish one update after saving their changes. */
+  emitEvent?: boolean;
+}
+
+export function updateCharacter(
+  userId: string,
+  id: string,
+  input: UpdateCharacterInput,
+  options: UpdateCharacterOptions = {},
+): Character | null {
   const existing = getCharacter(userId, id);
   if (!existing) return null;
   const oldImageIds = collectCharacterImageIds(existing);
@@ -1029,8 +1041,10 @@ export function updateCharacter(userId: string, id: string, input: UpdateCharact
 
   if (fields.length === 0) return existing;
 
-  fields.push("updated_at = ?");
-  values.push(now);
+  if (!options.preserveUpdatedAt) {
+    fields.push("updated_at = ?");
+    values.push(now);
+  }
   values.push(id);
   values.push(userId);
 
@@ -1042,7 +1056,9 @@ export function updateCharacter(userId: string, id: string, input: UpdateCharact
     clearRemovedChatAvatarReferences(userId, removedImageIds);
     cleanupUnreferencedImageIds(userId, removedImageIds);
   }
-  eventBus.emit(EventType.CHARACTER_EDITED, { id, character: updated }, userId);
+  if (options.emitEvent !== false) {
+    eventBus.emit(EventType.CHARACTER_EDITED, { id, character: updated }, userId);
+  }
   return updated;
 }
 
