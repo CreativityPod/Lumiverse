@@ -66,6 +66,11 @@ for (const fixture of cases) {
     const { event, generationId } = await run(fixture.provider, fixture.body, fixture);
     expect(event.finish_reason).toBe(fixture.reason);
     expect(event.error).toContain(fixture.error);
+    expect(event.errorMessage).toBe(event.error);
+    expect(event.connectionName).toBe("Mock");
+    expect(event.errorCode).toBe(
+      fixture.name === "Responses failure" ? "server_error" : fixture.reason,
+    );
     expect(pool.getPoolEntry(generationId)?.status).toBe("error");
     const saved = chats.getMessage(userId, event.messageId)!;
     expect(saved.extra.reasoning).toBe("A thought.");

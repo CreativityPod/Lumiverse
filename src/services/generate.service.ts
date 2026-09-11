@@ -561,6 +561,44 @@ function errorMessage(err: unknown): string {
 }
 
 /**
+ * Preserve a stable, machine-readable code alongside the human-facing error.
+ * Provider failures normally expose their upstream code; local/setup failures
+ * use a generic code so every terminal error notification has one.
+ */
+function generationErrorCode(err: unknown): string {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "string" && code.trim()) {
+      return clampErrorMessage(code.trim()).slice(0, 120);
+    }
+    if (typeof code === "number" && Number.isFinite(code)) return String(code);
+  }
+  if (err instanceof ProviderRequestError && err.status) {
+    return `http_${err.status}`;
+  }
+  return "generation_failed";
+}
+
+function generationFailurePayload(
+  err: unknown,
+  message: string,
+  connectionName?: string,
+): {
+  error: string;
+  errorCode: string;
+  errorMessage: string;
+  connectionName?: string;
+} {
+  const name = connectionName?.trim();
+  return {
+    error: message,
+    errorCode: generationErrorCode(err),
+    errorMessage: message,
+    ...(name ? { connectionName: name } : {}),
+  };
+}
+
+/**
  * The residual keyless case the credential preflight deliberately leaves
  * permissive: a connection with `has_api_key = 0` on a provider that does not
  * declare a key as required sends no `Authorization` header at all (see
@@ -1894,6 +1932,7 @@ export async function startGeneration(
       characterName,
       characterId: targetCharId,
       model: connection.model,
+      connectionName: connection.name,
       targetMessageId: lifecycle.targetMessageId,
       targetSwipeId,
     });
@@ -2802,13 +2841,14 @@ export async function startGeneration(
         abortChatBackground(input.userId, input.chat_id);
 
         const msg = errorMessage(err);
-        pool.errorPool(generationId, msg);
+        const failure = generationFailurePayload(err, msg, lifecycle.connectionName);
+        pool.errorPool(generationId, msg, failure);
         eventBus.emit(
           EventType.GENERATION_ENDED,
           {
             generationId,
             chatId: input.chat_id,
-            error: msg,
+            ...failure,
             generationType: lifecycle.generationType,
           },
           input.userId,
@@ -3679,7 +3719,9 @@ async function runGeneration(
         throw new ProviderRequestError({
           provider: provider.displayName,
           operation: "generation",
-          code: finishReason,
+          code: stopDetails?.type === "failed"
+            ? stopDetails.category || finishReason
+            : finishReason,
           detail: stopError,
           retryable: false,
         });
@@ -4246,6 +4288,7 @@ async function runGeneration(
         apiKey,
         connectionName: lifecycle.connectionName,
       });
+      const failure = generationFailurePayload(err, msg, lifecycle.connectionName);
       abortChatBackground(userId, chatId);
       // Socket drops, provider 5xx mid-stream, etc. — persist whatever was
       // already streamed so the user keeps the visible content rather than
@@ -4265,7 +4308,7 @@ async function runGeneration(
         /* best-effort; never let save failure shadow the original error */
       }
       flushPendingStreamSegments();
-      pool.errorPool(generationId, msg);
+      pool.errorPool(generationId, msg, failure);
       eventBus.emit(
         EventType.GENERATION_ENDED,
         {
@@ -4273,7 +4316,7 @@ async function runGeneration(
           chatId,
           messageId: savedMessageId,
           content: savedContent,
-          error: msg,
+          ...failure,
           ...stopMetadata(),
           usage: streamUsage,
           generationType: lifecycle.generationType,
