@@ -762,6 +762,7 @@ export const createSettingsSlice: StateCreator<AppStore, [], [], SettingsSlice> 
     ttsSpeed: 1.0,
     ttsVolume: 0.8,
     speechDetectionRules: {
+      skipHtmlComments: true,
       asterisked: 'skip' as const,
       quoted: 'speech' as const,
       undecorated: 'narration' as const,

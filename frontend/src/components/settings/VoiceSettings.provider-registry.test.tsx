@@ -24,6 +24,7 @@ const voiceSettings = {
   ttsSpeed: 1.0,
   ttsVolume: 0.8,
   speechDetectionRules: {
+    skipHtmlComments: true,
     asterisked: 'skip' as const,
     quoted: 'speech' as const,
     undecorated: 'narration' as const,
@@ -74,7 +75,25 @@ mock.module('@/api/tts-connections', () => ({
   ttsConnectionsApi: { providers: async () => ({ providers: [] }) },
 }))
 mock.module('@/components/shared/Toggle', () => ({
-  Toggle: { Checkbox: () => createElement('div') },
+  Toggle: {
+    Checkbox: ({ checked, onChange, label, hint }: {
+      checked: boolean
+      onChange: (checked: boolean) => void
+      label?: string
+      hint?: string
+    }) => createElement(
+      'label',
+      null,
+      createElement('input', {
+        type: 'checkbox',
+        checked,
+        'data-checkbox-label': label,
+        onChange: () => onChange(!checked),
+      }),
+      label,
+      hint,
+    ),
+  },
 }))
 mock.module('@/components/shared/ConnectionSelect', () => ({
   default: () => createElement('div'),
@@ -182,6 +201,20 @@ describe('VoiceSettings provider registry', () => {
     })
     await flush()
     expect(host?.querySelector('[data-registry-provider="ext-tts"]')).toBeNull()
+  })
+
+  test('renders the HTML comment exclusion checkbox and persists its choice', async () => {
+    mount()
+    await flush()
+    const checkbox = host?.querySelector(
+      '[data-checkbox-label="voice.skipHtmlComments"]',
+    ) as HTMLInputElement | null
+
+    expect(checkbox?.checked).toBe(true)
+    act(() => { checkbox?.click() })
+    await flush()
+    expect(voiceSettings.speechDetectionRules.skipHtmlComments).toBe(false)
+    voiceSettings.speechDetectionRules.skipHtmlComments = true
   })
 
   test('removes embedding TTS STT and sidecar options after unload without page reload', async () => {

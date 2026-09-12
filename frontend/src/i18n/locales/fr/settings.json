@@ -293,6 +293,8 @@
     "separateNarratorSpeedHint": "Parler la narration à son propre rythme au lieu d'hériter du paramètre de vitesse ci-dessus.",
     "narratorSpeed": "Vitesse du narrateur ({{value}}x)",
     "speechDetection": "Détection vocale",
+    "skipHtmlComments": "Exclure les commentaires HTML",
+    "skipHtmlCommentsHint": "Supprime les blocs masqués <!-- ... --> avant l’envoi du texte au fournisseur TTS.",
     "asterisked": "Texte avec astérisques",
     "asteriskedHint": "Contenu entouré d'*astérisques*",
     "quoted": "Texte cité",

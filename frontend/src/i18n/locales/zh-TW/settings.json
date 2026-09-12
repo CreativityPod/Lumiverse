@@ -293,6 +293,8 @@
     "separateNarratorSpeedHint": "旁白使用獨立語速，不繼承上方的語速設置。",
     "narratorSpeed": "旁白語速 ({{value}}x)",
     "speechDetection": "語音檢測",
+    "skipHtmlComments": "排除 HTML 註解",
+    "skipHtmlCommentsHint": "在將文字傳送給 TTS 供應商之前移除隱藏的 <!-- ... --> 區塊。",
     "asterisked": "星號包裹文本",
     "asteriskedHint": "*星號* 包裹的內容",
     "quoted": "引號包裹文本",

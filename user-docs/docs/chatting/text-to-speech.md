@@ -138,6 +138,8 @@ Each segment type has its own playback rule under **Voice & Speech → Speech De
 | **Quoted** | _Read as Speech_ · _Read as Narration_ · _Skip_ | Speech | Default keeps dialogue voiced; switch to Skip if you only want narration spoken. |
 | **Undecorated** | _Read as Narration_ · _Read as Speech_ · _Skip_ | Narration | Use Speech mode for chat-style messages without quotation marks. Use Skip if you only want explicitly quoted dialogue voiced. |
 
+**Exclude HTML comments** is enabled by default. It removes hidden `<!-- ... -->` blocks before speech detection and before any text is sent to the TTS provider. Turn it off only if you intentionally want comment contents included.
+
 The segments tagged _Skip_ are dropped before the request hits the provider, which keeps you from paying for tokens you'd never hear.
 
 !!! tip "Mismatched delimiters fall back gracefully"

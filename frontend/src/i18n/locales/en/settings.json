@@ -307,6 +307,8 @@
     "separateNarratorSpeedHint": "Speak narration at its own pace instead of inheriting the Speed setting above.",
     "narratorSpeed": "Narrator speed ({{value}}x)",
     "speechDetection": "Speech Detection",
+    "skipHtmlComments": "Exclude HTML comments",
+    "skipHtmlCommentsHint": "Remove hidden <!-- ... --> blocks before text is sent to the TTS provider.",
     "asterisked": "Asterisked text",
     "asteriskedHint": "Content wrapped in *asterisks*",
     "quoted": "Quoted text",

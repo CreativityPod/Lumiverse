@@ -293,6 +293,8 @@
     "separateNarratorSpeedHint": "上記の速度設定を継承するのではなく、独自のペースでナレーションを話します。",
     "narratorSpeed": "ナレーター速度 ({{value}}x)",
     "speechDetection": "音声検出",
+    "skipHtmlComments": "HTML コメントを除外",
+    "skipHtmlCommentsHint": "テキストを TTS プロバイダーに送信する前に、非表示の <!-- ... --> ブロックを削除します。",
     "asterisked": "アスタリスク付きテキスト",
     "asteriskedHint": "*アスタリスク*で囲まれたコンテンツ",
     "quoted": "引用符付きテキスト",

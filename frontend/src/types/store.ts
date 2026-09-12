@@ -1739,6 +1739,7 @@ export interface TtsConnectionsSlice {
 
 // ---- Voice Settings ----
 export interface SpeechDetectionRules {
+  skipHtmlComments: boolean
   asterisked: 'skip' | 'narration' | 'thought'
   quoted: 'speech' | 'narration' | 'skip'
   undecorated: 'narration' | 'speech' | 'skip'

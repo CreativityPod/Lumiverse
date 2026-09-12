@@ -62,6 +62,7 @@ const ANY_TAG_MARKER_RE = /<\/?[a-z][\w-]*(?:\s[^>]*)?\s*\/?>/gi
 
 const FENCED_CODE_RE = /```[\s\S]*?```/g
 const INLINE_CODE_RE = /`[^`\n]*`/g
+const HTML_COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g
 const MD_IMAGE_RE = /!\[[^\]]*]\([^)]*\)/g
 const MD_LINK_RE = /\[([^\]]+)]\([^)]+\)/g
 
@@ -140,31 +141,45 @@ function stripStrayNonProseClosings(text: string): string {
  * the tag to end-of-input. Finally, allowlisted tag markers are stripped so
  * their inner text is preserved.
  */
-export function sanitizeForTts(text: string): string {
+export interface TtsSanitizationOptions {
+  /** Remove complete and trailing unclosed HTML comments before synthesis. */
+  skipHtmlComments?: boolean
+}
+
+export function sanitizeForTts(
+  text: string,
+  options: TtsSanitizationOptions = {},
+): string {
   let out = text
 
   // 1. Strip code first so `<` inside code can't be misread as tag syntax.
   out = out.replace(FENCED_CODE_RE, ' ')
   out = out.replace(INLINE_CODE_RE, ' ')
 
-  // 2. Tag sweeps. Paired → self-closing → unclosed trailing → stray closings.
+  // 2. HTML comments are hidden metadata, not prose. This defaults to on so
+  //    callers that do not expose the setting still avoid leaking them to TTS.
+  if (options.skipHtmlComments !== false) {
+    out = out.replace(HTML_COMMENT_RE, ' ')
+  }
+
+  // 3. Tag sweeps. Paired → self-closing → unclosed trailing → stray closings.
   out = stripNonProsePairedTags(out)
   out = stripNonProseSelfClosingTags(out)
   out = stripTrailingUnclosedNonProseTag(out)
   out = stripStrayNonProseClosings(out)
 
-  // 3. Markdown: images dropped entirely, links reduced to their label text.
+  // 4. Markdown: images dropped entirely, links reduced to their label text.
   out = out.replace(MD_IMAGE_RE, ' ')
   out = out.replace(MD_LINK_RE, '$1')
 
-  // 4. Strip any remaining tag markers (only prose tags at this point); the
+  // 5. Strip any remaining tag markers (only prose tags at this point); the
   //    inner text survives because only the marker is removed.
   out = out.replace(ANY_TAG_MARKER_RE, ' ')
 
-  // 5. Decode a handful of common HTML entities so they're pronounced, not spelled.
+  // 6. Decode a handful of common HTML entities so they're pronounced, not spelled.
   out = out.replace(HTML_ENTITY_RE, (m) => HTML_ENTITY_MAP[m] ?? m)
 
-  // 6. Collapse whitespace (including newlines) into single spaces.
+  // 7. Collapse whitespace (including newlines) into single spaces.
   out = out.replace(/\s+/g, ' ').trim()
 
   return out
@@ -245,7 +260,9 @@ export function parseSegments(text: string, rules: SpeechDetectionRules): TextSe
  * etc. removed) so the segment parser only sees prose.
  */
 export function getSpokenText(text: string, rules: SpeechDetectionRules): string | null {
-  const cleaned = sanitizeForTts(text)
+  const cleaned = sanitizeForTts(text, {
+    skipHtmlComments: rules.skipHtmlComments,
+  })
   if (!cleaned) return null
   const segments = parseSegments(cleaned, rules)
   const spoken = segments

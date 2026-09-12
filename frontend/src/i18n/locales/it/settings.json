@@ -209,6 +209,8 @@
     "separateNarratorSpeedHint": "Leggi la narrazione al suo ritmo invece di ereditare l'impostazione Velocità sopra.",
     "narratorSpeed": "Velocità del narratore ({{value}}x)",
     "speechDetection": "Rilevamento vocale",
+    "skipHtmlComments": "Escludi i commenti HTML",
+    "skipHtmlCommentsHint": "Rimuove i blocchi nascosti <!-- ... --> prima di inviare il testo al provider TTS.",
     "asterisked": "Testo con asterischi",
     "asteriskedHint": "Contenuto racchiuso tra *asterischi*",
     "quoted": "Testo tra virgolette",

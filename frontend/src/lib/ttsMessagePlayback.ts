@@ -70,7 +70,9 @@ export function planMessagePlayback(args: {
     ? characters.find((c) => c.id === speaker.characterId) ?? null
     : null
 
-  const cleaned = sanitizeForTts(args.messageContent)
+  const cleaned = sanitizeForTts(args.messageContent, {
+    skipHtmlComments: voiceSettings.speechDetectionRules.skipHtmlComments,
+  })
   if (!cleaned) return []
   const segments = parseSegments(cleaned, voiceSettings.speechDetectionRules)
 

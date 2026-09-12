@@ -390,6 +390,20 @@ export default function VoiceSettings() {
         {/* ── Speech Detection Rules ────────────────────────────────── */}
         <div className={styles.subHeader}>{t('voice.speechDetection')}</div>
 
+        <div className={styles.toggleRow}>
+          <Toggle.Checkbox
+            checked={voiceSettings.speechDetectionRules.skipHtmlComments !== false}
+            onChange={(v) => setVoiceSettings({
+              speechDetectionRules: {
+                ...voiceSettings.speechDetectionRules,
+                skipHtmlComments: v,
+              },
+            })}
+            label={t('voice.skipHtmlComments')}
+            hint={t('voice.skipHtmlCommentsHint')}
+          />
+        </div>
+
         <div className={styles.row}>
           <div>
             <span className={styles.label}>{t('voice.asterisked')}</span>
