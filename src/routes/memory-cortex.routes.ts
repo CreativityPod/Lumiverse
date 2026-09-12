@@ -415,6 +415,7 @@ function launchTrackedCortexRebuild(
       eventBus.emit(EventType.CORTEX_REBUILD_PROGRESS, {
         chatId,
         status: "error",
+        updatedAt: Date.now(),
         ...(source ? { source } : {}),
         error: err?.message || (source === "warmup" ? "Warmup failed" : "Rebuild failed"),
       }, userId);

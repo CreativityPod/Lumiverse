@@ -226,6 +226,13 @@ export interface CortexIngestionTelemetry {
 
 export type CortexSidecarVisibilityState = "ok" | "unavailable" | "timeout" | "aborted";
 
+export interface CortexIngestionErrorSnapshot {
+  message: string;
+  sidecarState: CortexSidecarVisibilityState | null;
+  occurredAt: number;
+  chunkId: string | null;
+}
+
 export interface CortexIngestionStatus {
   chatId: string;
   status: "idle" | "processing" | "complete" | "error";
@@ -236,6 +243,8 @@ export interface CortexIngestionStatus {
   pendingJobs: number;
   error?: string;
   sidecarState?: CortexSidecarVisibilityState | null;
+  /** Most recent failure retained for diagnostics after the active error state expires. */
+  lastError?: CortexIngestionErrorSnapshot | null;
   timings?: CortexIngestionTimings | null;
 }
 
@@ -640,6 +649,10 @@ export function primeLinkedCortexCache(
 // ─── Ingestion Status / Telemetry ──────────────────────────────
 
 const cortexIngestionStatus = new Map<string, CortexIngestionStatus>();
+/** Terminal failures are active UI status only briefly. The diagnostic snapshot
+ *  remains on CortexIngestionStatus.lastError until a later failure replaces it
+ *  or the chat is deleted. */
+export const CORTEX_INGESTION_ERROR_STATUS_TTL_MS = 60_000;
 const cortexIngestionSamples = new Map<string, {
   samples: number;
   fontMsTotal: number;
@@ -719,6 +732,7 @@ function beginIngestionTracking(userId: string, chatId: string, chunkId: string)
     startedAt: current.startedAt ?? Date.now(),
     pendingJobs,
     error: undefined,
+    sidecarState: null,
   });
   return pendingJobs;
 }
@@ -738,6 +752,7 @@ function completeIngestionTracking(
     startedAt: pendingJobs > 0 ? current.startedAt : null,
     pendingJobs,
     error: undefined,
+    sidecarState: null,
     timings,
   });
 
@@ -770,6 +785,7 @@ function failIngestionTracking(
 ): void {
   const current = getOrCreateIngestionStatus(chatId);
   const pendingJobs = Math.max(0, current.pendingJobs - 1);
+  const occurredAt = Date.now();
   updateIngestionStatus(userId, chatId, {
     status: "error",
     phase: "error",
@@ -777,11 +793,45 @@ function failIngestionTracking(
     pendingJobs,
     error,
     sidecarState: sidecarState ?? current.sidecarState ?? null,
+    lastError: {
+      message: error,
+      sidecarState: sidecarState ?? current.sidecarState ?? null,
+      occurredAt,
+      chunkId: current.chunkId,
+    },
   });
 }
 
+/** Convert an old terminal failure into idle status while preserving its
+ *  diagnostic snapshot. This keeps status consumers from treating historical
+ *  failures as work that is still active. */
+export function normalizeCortexIngestionStatusForRead(
+  status: CortexIngestionStatus,
+  now = Date.now(),
+): CortexIngestionStatus {
+  if (status.status !== "error" || now - status.updatedAt < CORTEX_INGESTION_ERROR_STATUS_TTL_MS) {
+    return status;
+  }
+
+  return {
+    ...status,
+    status: "idle",
+    phase: "complete",
+    chunkId: null,
+    startedAt: null,
+    updatedAt: now,
+    pendingJobs: 0,
+    error: undefined,
+    sidecarState: null,
+  };
+}
+
 export function getIngestionStatus(chatId: string): CortexIngestionStatus | null {
-  return cortexIngestionStatus.get(chatId) ?? null;
+  const status = cortexIngestionStatus.get(chatId);
+  if (!status) return null;
+  const normalized = normalizeCortexIngestionStatusForRead(status);
+  if (normalized !== status) cortexIngestionStatus.set(chatId, normalized);
+  return normalized;
 }
 
 export function getIngestionTelemetry(chatId: string): CortexIngestionTelemetry {

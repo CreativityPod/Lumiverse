@@ -1060,6 +1060,8 @@ export interface ImageGenSettings {
   promptMode?: 'scene' | 'custom' | 'parsed_custom'
   customPrompt?: string
   customNegativePrompt?: string
+  /** Last prompt entered in the Image Captioner modal. */
+  captionPrompt?: string
   activePromptPresetId?: string | null
   promptPresets?: ImageGenPromptPreset[]
   loraPresets?: LoraPreset[]
