@@ -43,7 +43,7 @@ area? See the optional [Experimental Lumiverse Desktop](getting-started/desktop-
 | [Lorebook](world-books/index.md) | Build lorebooks that inject context based on keywords |
 | [Council](council/index.md) | Set up multi-persona AI deliberation |
 | [Pack Browser](packs/index.md) | Install and manage content packs (Lumias, Looms, Tools) |
-| [Image Generation](image-generation/index.md) | Generate scene illustrations from your chats |
+| [Image & Video Generation](image-generation/index.md) | Generate scene illustrations, MP4 clips, and chat backgrounds |
 | [Sovereign Hand](presets/sovereign-hand.md) | Direct the scene as an author instead of playing a character |
 | [Summary](chatting/loom-summary.md) | Automatic story summarization for long conversations |
 | [Long-Term Memory](chatting/memory.md) | Vector-based recall of relevant past moments |

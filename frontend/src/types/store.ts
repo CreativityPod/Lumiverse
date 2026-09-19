@@ -1055,9 +1055,10 @@ export interface GenerationSlice {
   /** User edits made before the full settings row has hydrated. */
   pendingImageGenerationPatch?: Partial<ImageGenSettings>
   sceneBackground: string | null
+  sceneBackgroundType: 'image' | 'video'
   sceneGenerating: boolean
   setImageGenSettings: (settings: Partial<ImageGenSettings>) => void
-  setSceneBackground: (url: string | null) => void
+  setSceneBackground: (url: string | null, type?: 'image' | 'video') => void
   setSceneGenerating: (generating: boolean) => void
 }
 
@@ -1096,6 +1097,8 @@ export interface ImageGenSettings {
   forceGeneration: boolean
   recycleGeneratedImages: boolean
   recycledImageLimit: number
+  recycleGeneratedVideos: boolean
+  recycledVideoLimit: number
   /** When true, generated images are linked into the active chat's character gallery. */
   addToGallery?: boolean
   backgroundOpacity: number

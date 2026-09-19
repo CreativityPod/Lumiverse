@@ -983,16 +983,19 @@ function attachmentCacheKey(attachment: Pick<MessageAttachment, "type" | "image_
   return `${attachment.type}:${attachment.image_id}`;
 }
 
-interface GeneratedImageContextPolicy {
+export interface GeneratedMediaContextPolicy {
   recycleGeneratedImages: boolean;
   recycledImageLimit: number;
   allowedGeneratedImageIds: Set<string>;
+  recycleGeneratedVideos: boolean;
+  recycledVideoLimit: number;
+  allowedGeneratedVideoIds: Set<string>;
 }
 
-function resolveGeneratedImageContextPolicy(
+export function resolveGeneratedMediaContextPolicy(
   settings: any,
   messages: Message[],
-): GeneratedImageContextPolicy {
+): GeneratedMediaContextPolicy {
   const recycleGeneratedImages = settings?.recycleGeneratedImages === true;
   const rawLimit = Number(settings?.recycledImageLimit ?? 1);
   const recycledImageLimit = Math.max(
@@ -1000,25 +1003,54 @@ function resolveGeneratedImageContextPolicy(
     Math.min(20, Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 1),
   );
   const allowedGeneratedImageIds = new Set<string>();
+  const recycleGeneratedVideos = settings?.recycleGeneratedVideos === true;
+  const rawVideoLimit = Number(settings?.recycledVideoLimit ?? 1);
+  const recycledVideoLimit = Math.max(
+    1,
+    Math.min(20, Number.isFinite(rawVideoLimit) ? Math.floor(rawVideoLimit) : 1),
+  );
+  const allowedGeneratedVideoIds = new Set<string>();
 
-  if (!recycleGeneratedImages) {
-    return { recycleGeneratedImages, recycledImageLimit, allowedGeneratedImageIds };
-  }
-
-  for (let i = messages.length - 1; i >= 0 && allowedGeneratedImageIds.size < recycledImageLimit; i--) {
+  for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.extra?.hidden === true || !msg.extra?.image_gen) continue;
     const attachments = Array.isArray(msg.extra?.attachments) ? msg.extra.attachments : [];
-    for (let j = attachments.length - 1; j >= 0 && allowedGeneratedImageIds.size < recycledImageLimit; j--) {
+    for (let j = attachments.length - 1; j >= 0; j--) {
       const att = attachments[j];
-      if (att?.type === "image" && att.image_id) allowedGeneratedImageIds.add(att.image_id);
+      if (
+        recycleGeneratedImages
+        && allowedGeneratedImageIds.size < recycledImageLimit
+        && att?.type === "image"
+        && att.image_id
+      ) {
+        allowedGeneratedImageIds.add(att.image_id);
+      }
+      if (
+        recycleGeneratedVideos
+        && allowedGeneratedVideoIds.size < recycledVideoLimit
+        && att?.type === "video"
+        && att.image_id
+      ) {
+        allowedGeneratedVideoIds.add(att.image_id);
+      }
     }
+    if (
+      (!recycleGeneratedImages || allowedGeneratedImageIds.size >= recycledImageLimit)
+      && (!recycleGeneratedVideos || allowedGeneratedVideoIds.size >= recycledVideoLimit)
+    ) break;
   }
 
-  return { recycleGeneratedImages, recycledImageLimit, allowedGeneratedImageIds };
+  return {
+    recycleGeneratedImages,
+    recycledImageLimit,
+    allowedGeneratedImageIds,
+    recycleGeneratedVideos,
+    recycledVideoLimit,
+    allowedGeneratedVideoIds,
+  };
 }
 
-function attachmentsForContext(msg: Message, policy: GeneratedImageContextPolicy): MessageAttachment[] {
+export function attachmentsForContext(msg: Message, policy: GeneratedMediaContextPolicy): MessageAttachment[] {
   const attachments = Array.isArray(msg.extra?.attachments)
     ? (msg.extra.attachments as MessageAttachment[])
     : [];
@@ -1029,7 +1061,11 @@ function attachmentsForContext(msg: Message, policy: GeneratedImageContextPolicy
   );
   if (!msg.extra?.image_gen) return contextualAttachments;
   return contextualAttachments.filter(
-    (att) => att?.type !== "image" || policy.allowedGeneratedImageIds.has(att.image_id),
+    (att) => {
+      if (att?.type === "image") return policy.allowedGeneratedImageIds.has(att.image_id);
+      if (att?.type === "video") return policy.allowedGeneratedVideoIds.has(att.image_id);
+      return true;
+    },
   );
 }
 
@@ -3218,7 +3254,7 @@ export async function assemblePrompt(
           : requestedStart;
         effectiveMessages = messages.slice(start);
       }
-      const generatedImageContextPolicy = resolveGeneratedImageContextPolicy(
+      const generatedMediaContextPolicy = resolveGeneratedMediaContextPolicy(
         settingsMap.get("imageGeneration"),
         effectiveMessages,
       );
@@ -3231,7 +3267,7 @@ export async function assemblePrompt(
       const attachmentSources = new Map<string, MessageAttachment>();
       for (const msg of effectiveMessages) {
         if (msg.extra?.hidden === true) continue;
-        const atts = attachmentsForContext(msg, generatedImageContextPolicy);
+        const atts = attachmentsForContext(msg, generatedMediaContextPolicy);
         for (const att of atts) {
           if (att.image_id) attachmentSources.set(attachmentCacheKey(att), att);
         }
@@ -3280,7 +3316,7 @@ export async function assemblePrompt(
             )
           : rawContent;
         const resolvedContent = appendAssociativeRegexContext(visibleResolvedContent, msg);
-        const attachments = attachmentsForContext(msg, generatedImageContextPolicy);
+        const attachments = attachmentsForContext(msg, generatedMediaContextPolicy);
         if (msg.extra?.image_gen && resolvedContent.trim().length === 0 && attachments.length === 0) {
           continue;
         }
@@ -8226,14 +8262,14 @@ async function legacyAssembly(
   // Chat history — evaluate macros in each message
   // Skip messages marked as hidden drafts (extra.hidden === true)
   // Pre-resolve all attachment files in parallel (same pattern as main assembly)
-  const legacyGeneratedImageContextPolicy = resolveGeneratedImageContextPolicy(
+  const legacyGeneratedMediaContextPolicy = resolveGeneratedMediaContextPolicy(
     userId ? settingsSvc.getSetting(userId, "imageGeneration")?.value : null,
     messages,
   );
   const legacyAttachmentSources = new Map<string, MessageAttachment>();
   for (const m of messages) {
     if (m.extra?.hidden === true) continue;
-    const atts = attachmentsForContext(m, legacyGeneratedImageContextPolicy);
+    const atts = attachmentsForContext(m, legacyGeneratedMediaContextPolicy);
     for (const att of atts) {
       if (att.image_id) legacyAttachmentSources.set(attachmentCacheKey(att), att);
     }
@@ -8260,7 +8296,7 @@ async function legacyAssembly(
     }
     const visibleResolved = healFormattingArtifacts(await resolveMacros(m.content));
     const resolved = appendAssociativeRegexContext(visibleResolved, m);
-    const attachments = attachmentsForContext(m, legacyGeneratedImageContextPolicy);
+    const attachments = attachmentsForContext(m, legacyGeneratedMediaContextPolicy);
     if (m.extra?.image_gen && resolved.trim().length === 0 && attachments.length === 0) {
       continue;
     }

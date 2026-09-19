@@ -2,6 +2,7 @@ import { getImageProvider, getImageProviderList } from "../image-gen/registry";
 import "../image-gen/index";
 import type { ImageProvider } from "../image-gen/provider";
 import type { ImageGenRequest, ImageGenResponse } from "../image-gen/types";
+import { resolveGeneratedMedia } from "../image-gen/generated-media";
 import * as imageGenConnSvc from "../services/image-gen-connections.service";
 import { applyActiveComfyUIWorkflowConfig } from "../services/image-gen.service";
 import * as nativeImageGenSvc from "../services/image-gen.service";
@@ -176,34 +177,77 @@ export class WorkerHostImageGenApi {
   ): Promise<Record<string, unknown>> {
     let imageId: string | undefined;
     let imageUrl: string | undefined;
+    let mediaType: "image" | "video" | undefined;
+    let mediaId: string | undefined;
+    let mediaUrl: string | undefined;
+    let mimeType: string | undefined;
+    let posterUrl: string | undefined;
 
-    if (result.imageDataUrl) {
+    const generatedMedia = resolveGeneratedMedia(
+      result,
+      `image-gen-${generation.connection.provider}-${Date.now()}`,
+    );
+    // Keep compatibility with providers/extensions that deliberately return an
+    // empty image payload. There is simply no asset to persist in that case.
+    if (generatedMedia) {
+      mediaType = generatedMedia.type;
+      mimeType = generatedMedia.mimeType;
       try {
-        const { saveImageFromDataUrl } = await import("../services/images.service");
-        const image = await saveImageFromDataUrl(
-          generation.userId,
-          result.imageDataUrl,
-          `image-gen-${generation.connection.provider}-${Date.now()}.png`,
-          {
-            owner_extension_identifier: this.context.extensionIdentifier,
-            owner_character_id: typeof input?.owner_character_id === "string" && input.owner_character_id.trim()
-              ? input.owner_character_id.trim()
-              : undefined,
-            owner_chat_id: typeof input?.owner_chat_id === "string" && input.owner_chat_id.trim()
-              ? input.owner_chat_id.trim()
-              : undefined,
-          },
-        );
-        imageId = image.id;
-        imageUrl = `/api/v1/image-gen/results/${image.id}`;
-      } catch {
-        // Persisting a generated image is best effort; the data URL is still usable.
+        const imagesSvc = await import("../services/images.service");
+        const ownership = {
+          owner_extension_identifier: this.context.extensionIdentifier,
+          owner_character_id: typeof input?.owner_character_id === "string" && input.owner_character_id.trim()
+            ? input.owner_character_id.trim()
+            : undefined,
+          owner_chat_id: typeof input?.owner_chat_id === "string" && input.owner_chat_id.trim()
+            ? input.owner_chat_id.trim()
+            : undefined,
+        };
+        const generatedVideoBytes = generatedMedia.data
+          ? Uint8Array.from(generatedMedia.data).buffer
+          : undefined;
+        const image = generatedMedia.type === "video"
+          ? await imagesSvc.uploadImage(
+              generation.userId,
+              new File([generatedVideoBytes!], generatedMedia.filename, { type: generatedMedia.mimeType }),
+              { ...ownership, transcode_video_codec: "h264" },
+            )
+          : await imagesSvc.saveImageFromDataUrl(
+              generation.userId,
+              generatedMedia.imageDataUrl!,
+              generatedMedia.filename,
+              ownership,
+            );
+        mediaId = image.id;
+        mediaUrl = `/api/v1/image-gen/results/${image.id}`;
+        mimeType = image.mime_type;
+        posterUrl = generatedMedia.type === "video" && image.has_thumbnail
+          ? `${mediaUrl}?size=lg`
+          : undefined;
+        if (generatedMedia.type === "image") {
+          imageId = image.id;
+          imageUrl = mediaUrl;
+        }
+      } catch (err) {
+        // Persisting generated media is best effort. Legacy image callers can
+        // still use imageDataUrl; binary video is deliberately never returned.
+        if (generatedMedia.type === "video") {
+          throw new Error("Generated video could not be persisted", { cause: err });
+        }
       }
     }
 
-    // Persisting already consumed the data URL; the extension-facing result
-    // can drop it when the caller opts out of the base64 payload.
-    return applyDataUrlInclusion({ ...result, imageId, imageUrl }, input?.includeDataUrl !== false);
+    const { mediaData: _mediaData, filename: _filename, ...safeResult } = result;
+    return applyDataUrlInclusion({
+      ...safeResult,
+      imageId,
+      imageUrl,
+      mediaType,
+      mediaId,
+      mediaUrl,
+      mimeType,
+      posterUrl,
+    }, input?.includeDataUrl !== false);
   }
 
   async handleGenerate(requestId: string, input: any): Promise<void> {
@@ -319,6 +363,11 @@ export class WorkerHostImageGenApi {
         imageDataUrl: result.imageDataUrl,
         imageId: result.imageId,
         imageUrl: result.imageUrl,
+        mediaType: result.mediaType,
+        mediaId: result.mediaId,
+        mediaUrl: result.mediaUrl,
+        mimeType: result.mimeType,
+        posterUrl: result.posterUrl,
         jobId: result.jobId,
       };
       this.postResponse(
@@ -433,7 +482,7 @@ export class WorkerHostImageGenApi {
       const aborted = abortController.signal.aborted || err?.name === "AbortError";
       this.postStreamError(
         requestId,
-        aborted ? "AbortError: Image generation aborted" : err?.message ?? String(err),
+        aborted ? "AbortError: Media generation aborted" : err?.message ?? String(err),
       );
     } finally {
       this.streamAbortControllers.delete(requestId);

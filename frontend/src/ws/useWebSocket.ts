@@ -1193,8 +1193,10 @@ export function useWebSocket() {
                   promptGenerationTimeoutSeconds: ig.promptGenerationTimeoutSeconds,
                   generationTimeoutSeconds: ig.generationTimeoutSeconds,
                 }).then((res) => {
-                  if (outputTarget === 'background' && res.generated && res.imageDataUrl) {
-                    store.getState().setSceneBackground(res.imageDataUrl)
+                  const mediaType = res.mediaType ?? 'image'
+                  const mediaUrl = mediaType === 'video' ? res.mediaUrl : (res.imageDataUrl || res.mediaUrl)
+                  if (outputTarget === 'background' && res.generated && mediaUrl) {
+                    store.getState().setSceneBackground(mediaUrl, mediaType)
                   }
                 }).catch((err) => {
                   console.warn('[ImageGen] Auto-generate failed:', err)

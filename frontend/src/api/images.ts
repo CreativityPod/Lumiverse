@@ -44,10 +44,14 @@ export const imagesApi = {
   upload(file: File, onProgress?: (percent: number) => void) {
     const form = new FormData()
     form.append('image', file)
+    const isVideo = file.type.startsWith('video/') || /\.(?:mp4|mpeg|mpg|mov|m4v|avi|flv|webm|wmv|3gp)$/i.test(file.name)
+    const path = isVideo ? '/images?video_codec=h264' : '/images'
     if (onProgress) {
-      return uploadWithProgress<Image>('/images', form, onProgress)
+      return uploadWithProgress<Image>(path, form, onProgress)
     }
-    return upload<Image>('/images', form)
+    // Video persistence includes server-side transcoding and poster extraction,
+    // so it must not inherit the ordinary 30-second API request timeout.
+    return upload<Image>(path, form, isVideo ? { timeout: 0 } : undefined)
   },
 
   uploadWallpaper(file: File, kind: 'image' | 'video', options?: WallpaperUploadOptions) {

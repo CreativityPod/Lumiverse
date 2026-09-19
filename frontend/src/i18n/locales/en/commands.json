@@ -143,8 +143,8 @@
       "description": "View currently activated world info entries"
     },
     "panel-imagegen": {
-      "label": "Image Generation",
-      "description": "Configure and control AI scene generation"
+      "label": "Image & Video Generation",
+      "description": "Configure and control AI scene media generation"
     },
     "panel-wallpaper": {
       "label": "Wallpaper",

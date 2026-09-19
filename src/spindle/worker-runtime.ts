@@ -732,7 +732,7 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen" | "world_books"
     /**
      * Generate through a provider that explicitly supports WebSocket preview
      * images and status updates. The terminal `done` event contains the saved
-     * image result. Breaking out of the iterator aborts the upstream job.
+     * image or video result. Breaking out of the iterator aborts the upstream job.
      */
     generateStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void>;
   };

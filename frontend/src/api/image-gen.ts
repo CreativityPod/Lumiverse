@@ -52,6 +52,11 @@ export interface ImageGenResponse {
   imageDataUrl?: string
   imageId?: string
   imageUrl?: string
+  mediaType?: 'image' | 'video'
+  mediaId?: string
+  mediaUrl?: string
+  mimeType?: string
+  posterUrl?: string
   message?: import('@/types/api').Message
   jobId?: string
 }

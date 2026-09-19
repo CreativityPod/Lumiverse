@@ -30,20 +30,20 @@ Pick where the result goes under **Prompt Mode → Output**.
 | Target | What happens |
 |--------|--------------|
 | **Set as background** | Replaces the chat background. Honours the configured opacity and fade duration. |
-| **Insert into chat** | Posts a new chat message owned by you, with the image as an attachment. Useful when you want the image to live in the chat history. |
-| **Attach to last message** | Appends the image to the latest existing message's attachments. Best for adding a visual to the assistant's last reply without inserting a whole new turn. |
-| **Preview only** | Generates the image but doesn't place it anywhere. The provider still runs — use this when you're tuning a preset and don't want the chat to fill up. |
+| **Insert into chat** | Posts a new chat message with the generated image or video as an attachment. |
+| **Attach to last message** | Appends the generated result to the latest existing message's attachments. |
+| **Preview only** | Generates the result but doesn't place it anywhere. The provider still runs — use this when you're tuning a preset and don't want the chat to fill up. |
 
 ### Background display
 
-Two settings control how a background image is shown:
+Two settings control how a generated background is shown:
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | **Opacity** | 35% | Background transparency behind the chat. |
 | **Fade Duration** | 800ms | Crossfade duration when the background swaps. |
 
-The Image Generation panel also has a **Use as Background** shortcut after generating, plus a **Clear** button to remove the current background.
+The Image & Video Generation panel also has a **Use as Background** shortcut after generating, plus a **Clear** button to remove the current background. Video backgrounds are muted, looped, paused while the app is hidden, and held on a still frame when reduced motion is enabled.
 
 ---
 
@@ -54,23 +54,25 @@ The Image Generation panel also has a **Use as Background** shortcut after gener
 | **Add Generated Images to Character Gallery** | On | Links each generated image into the active chat's character gallery as a "Generated image" entry. The link is best-effort — the image is always saved regardless. |
 | **Recycle Generated Images Into Context** | Off | When on, recently generated images attached to the chat are re-sent to the LLM as multimodal input on subsequent turns. Only matters if your LLM is multimodal. |
 | **Generated Images To Re-Send** | 1 | Maximum number of recent generated images included when recycling is enabled. |
+| **Recycle Generated Videos Into Context** | Off | When on, recently generated video attachments are re-sent to video-capable LLM providers on subsequent turns. |
+| **Generated Videos To Re-Send** | 1 | Maximum number of recent generated videos included when recycling is enabled. |
 
-### Removing an image from a message
+### Removing media from a message
 
-Right-click (or long-press on touch) an attached image inside a message to bring up the message context menu — it has a **Remove image** action that detaches the image from the message. The image itself stays in your gallery; only the attachment is removed.
+Right-click (or long-press on touch) an attachment inside a message to use **Remove image** or **Remove video**. This detaches the asset from the message without deleting the stored asset.
 
 ---
 
 ## Timeouts
 
-Image generation has **two independent timeouts** so a slow parser doesn't block a fast provider (and vice versa).
+Generation has **two independent timeouts** so a slow parser doesn't block a fast provider (and vice versa).
 
 | Setting | Default | What it covers |
 |---------|---------|----------------|
 | **Prompt Generation Timeout** | 60 s | Time allowed for the parser LLM phase — Scene parsing or Chat-aware Custom rewriting. Set to `0` to disable. |
-| **Image Generation Timeout** | 300 s (5 min) | Time allowed for the image provider itself, measured from the moment the prompt is ready. Set to `0` to disable. |
+| **Generation Timeout** | 300 s (5 min) | Time allowed for the provider itself, measured from the moment the prompt is ready. Set to `0` to disable. |
 
-Both timeouts abort the in-flight generation and surface an error to the panel. Bump the **Image Generation Timeout** when running long ComfyUI workflows or loading large checkpoints on a cold server.
+Both timeouts abort the in-flight generation and surface an error to the panel. Bump the **Generation Timeout** when running long ComfyUI workflows or loading large checkpoints on a cold server.
 
 !!! tip "Bypass either timeout by setting it to 0"
     `0` disables the timeout entirely. Use this on local ComfyUI / SwarmUI rigs where you trust the provider to finish eventually, but be aware that a wedged provider won't surface as an error until you cancel manually.

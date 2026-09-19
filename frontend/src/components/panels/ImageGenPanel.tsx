@@ -37,6 +37,7 @@ import {
 import styles from './ImageGenPanel.module.css'
 
 type RefImage = { data: string; mimeType?: string }
+type GeneratedMediaPreview = { url: string; type: 'image' | 'video' }
 const COMFY_CUSTOM_CONTROL_PREFIX = 'custom:'
 const DEFAULT_PROMPT_TIMEOUT_SECONDS = 60
 const DEFAULT_IMAGE_GEN_TIMEOUT_SECONDS = 300
@@ -484,6 +485,7 @@ export default function ImageGenPanel() {
   const { t } = useTranslation('panels')
   const imageGeneration = useStore((s) => s.imageGeneration)
   const sceneBackground = useStore((s) => s.sceneBackground)
+  const sceneBackgroundType = useStore((s) => s.sceneBackgroundType)
   const sceneGenerating = useStore((s) => s.sceneGenerating)
   const activeChatId = useStore((s) => s.activeChatId)
   const setImageGenSettings = useStore((s) => s.setImageGenSettings)
@@ -503,7 +505,7 @@ export default function ImageGenPanel() {
   const [lastScene, setLastScene] = useState<SceneData | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [lightboxOpen, setLightboxOpen] = useState(false)
-  const [generatedPreview, setGeneratedPreview] = useState<string | null>(null)
+  const [generatedPreview, setGeneratedPreview] = useState<GeneratedMediaPreview | null>(null)
   const [presetName, setPresetName] = useState('')
   const [availableMacros, setAvailableMacros] = useState<MacroGroup[]>(() => getAvailableMacros())
   const [editTarget, setEditTarget] = useState<'main' | 'character' | 'persona' | 'captioning'>('main')
@@ -1231,12 +1233,16 @@ export default function ImageGenPanel() {
         generationTimeoutSeconds: imageGeneration.generationTimeoutSeconds ?? DEFAULT_IMAGE_GEN_TIMEOUT_SECONDS,
       })
       setLastScene(res.scene || null)
-      if (res.generated && res.imageDataUrl) {
+      const mediaType = res.mediaType ?? 'image'
+      const mediaUrl = mediaType === 'video'
+        ? res.mediaUrl
+        : (res.imageDataUrl || res.mediaUrl)
+      if (res.generated && mediaUrl) {
         if (input.outputTarget === 'background') {
-          setSceneBackground(res.imageDataUrl)
+          setSceneBackground(mediaUrl, mediaType)
           setGeneratedPreview(null)
         } else {
-          setGeneratedPreview(res.imageDataUrl)
+          setGeneratedPreview({ url: mediaUrl, type: mediaType })
         }
       }
       if (!res.generated && res.reason) setError(res.reason)
@@ -1416,7 +1422,8 @@ export default function ImageGenPanel() {
     return staticModel?.label || activeConnection.model
   }, [activeConnection?.model, capabilities?.staticModels])
 
-  const previewSrc = generatedPreview || sceneBackground
+  const previewMedia: GeneratedMediaPreview | null = generatedPreview
+    ?? (sceneBackground ? { url: sceneBackground, type: sceneBackgroundType } : null)
 
   return (
     <div className={styles.panel}>
@@ -2069,12 +2076,6 @@ export default function ImageGenPanel() {
               label={t('imageGenPanel.recycleGeneratedImages')}
               hint={t('imageGenPanel.recycleGeneratedImagesHint')}
             />
-            <ToggleRow
-              checked={imageGeneration.addToGallery !== false}
-              onChange={(checked) => updateTop({ addToGallery: checked })}
-              label={t('imageGenPanel.addGeneratedToGallery')}
-              hint={t('imageGenPanel.addGeneratedToGalleryHint')}
-            />
             {imageGeneration.recycleGeneratedImages && (
               <FormField label={t('imageGenPanel.generatedImagesResend')} hint={t('imageGenPanel.generatedImagesResendHint')}>
                 <TextInput
@@ -2089,6 +2090,32 @@ export default function ImageGenPanel() {
                 />
               </FormField>
             )}
+            <ToggleRow
+              checked={!!imageGeneration.recycleGeneratedVideos}
+              onChange={(checked) => updateTop({ recycleGeneratedVideos: checked })}
+              label={t('imageGenPanel.recycleGeneratedVideos')}
+              hint={t('imageGenPanel.recycleGeneratedVideosHint')}
+            />
+            {imageGeneration.recycleGeneratedVideos && (
+              <FormField label={t('imageGenPanel.generatedVideosResend')} hint={t('imageGenPanel.generatedVideosResendHint')}>
+                <TextInput
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={String(imageGeneration.recycledVideoLimit ?? 1)}
+                  onChange={(value) => {
+                    const parsed = Number(value)
+                    updateTop({ recycledVideoLimit: Math.max(1, Math.min(20, Number.isFinite(parsed) ? Math.floor(parsed) : 1)) })
+                  }}
+                />
+              </FormField>
+            )}
+            <ToggleRow
+              checked={imageGeneration.addToGallery !== false}
+              onChange={(checked) => updateTop({ addToGallery: checked })}
+              label={t('imageGenPanel.addGeneratedToGallery')}
+              hint={t('imageGenPanel.addGeneratedToGalleryHint')}
+            />
             <FormField label={t('imageGenPanel.contextMessageLimit')} hint={t('imageGenPanel.contextMessageLimitHint')}>
               <TextInput
                 type="number"
@@ -2137,14 +2164,33 @@ export default function ImageGenPanel() {
 
           {currentJobId && <ImageGenProgressBar jobId={currentJobId} />}
 
-          {previewSrc && <div className={styles.preview} onClick={() => setLightboxOpen(true)}><img src={previewSrc} alt={t('imageGenPanel.generatedPreview')} className={styles.previewImg} /></div>}
+          {previewMedia && (
+            <div
+              className={styles.preview}
+              style={previewMedia.type === 'video' ? { cursor: 'default' } : undefined}
+              onClick={previewMedia.type === 'image' ? () => setLightboxOpen(true) : undefined}
+            >
+              {previewMedia.type === 'video' ? (
+                <video
+                  src={previewMedia.url}
+                  className={styles.previewImg}
+                  controls
+                  playsInline
+                  preload="metadata"
+                  aria-label={t('imageGenPanel.generatedVideoPreview')}
+                />
+              ) : (
+                <img src={previewMedia.url} alt={t('imageGenPanel.generatedPreview')} className={styles.previewImg} />
+              )}
+            </div>
+          )}
           {lastScene && <div className={styles.sceneInfo}><div><strong>{t('imageGenPanel.scene')}:</strong> {lastScene.environment}</div><div><strong>{t('imageGenPanel.time')}:</strong> {lastScene.time_of_day}</div><div><strong>{t('imageGenPanel.mood')}:</strong> {lastScene.mood}</div></div>}
 
           <div className={styles.actions}>
             <Button variant="primary" size="sm" icon={<ImageIcon size={14} />} {...generateNowTap} disabled={genDisabled}>{sceneGenerating ? t('imageGenPanel.generating') : t('imageGenPanel.generateNow')}</Button>
             <Button variant="secondary" size="sm" icon={<IconBrush size={14} />} {...forceGenerateTap} disabled={genDisabled}>{t('imageGenPanel.forceGenerate')}</Button>
-            {generatedPreview && <Button variant="secondary" size="sm" onClick={() => { setSceneBackground(generatedPreview); setGeneratedPreview(null) }}>{t('imageGenPanel.useAsBackground')}</Button>}
-            {previewSrc && <Button variant="danger" size="sm" icon={<Trash2 size={14} />} onClick={() => { setSceneBackground(null); setGeneratedPreview(null) }}>{t('imageGenPanel.clear')}</Button>}
+            {generatedPreview && <Button variant="secondary" size="sm" onClick={() => { setSceneBackground(generatedPreview.url, generatedPreview.type); setGeneratedPreview(null) }}>{t('imageGenPanel.useAsBackground')}</Button>}
+            {previewMedia && <Button variant="danger" size="sm" icon={<Trash2 size={14} />} onClick={() => { setSceneBackground(null); setGeneratedPreview(null) }}>{t('imageGenPanel.clear')}</Button>}
           </div>
 
           {!activeImageGenConnectionId && (
@@ -2154,9 +2200,9 @@ export default function ImageGenPanel() {
         </>
       )}
 
-      {lightboxOpen && previewSrc && (
+      {lightboxOpen && previewMedia?.type === 'image' && (
         <ImageLightbox
-          src={previewSrc}
+          src={previewMedia.url}
           onClose={() => setLightboxOpen(false)}
           onDelete={() => { setSceneBackground(null); setGeneratedPreview(null) }}
         />

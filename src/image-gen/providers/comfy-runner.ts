@@ -1,6 +1,8 @@
 import { openWebSocket } from "./ws-helpers"
 import { parseProviderErrorBody, readBoundedText } from "../../utils/provider-errors"
 
+const MAX_COMFY_OUTPUT_BYTES = 250 * 1024 * 1024
+
 export interface ComfyRunnerOptions {
   label: string
   // Sent as Cookie header on every HTTP + WS call. Used for SwarmUI's
@@ -15,10 +17,15 @@ export type ComfyStreamEvent =
   | { type: "preview"; imageBase64: string }
 
 export interface ComfyRunnerResult {
-  imageDataUrl: string
+  mediaType: "image" | "video"
+  mimeType: string
+  filename: string
+  imageDataUrl?: string
+  mediaData?: Uint8Array
 }
 
-interface ComfyImageResult {
+export interface ComfyMediaResult {
+  mediaType: "image" | "video"
   filename: string
   subfolder: string
   type: string
@@ -30,9 +37,12 @@ function buildHeaders(cookie?: string, extra?: Record<string, string>): Record<s
   return h
 }
 
-export function buildComfyImageViewUrl(baseUrl: string, image: ComfyImageResult): string {
-  return `${baseUrl}/view?filename=${encodeURIComponent(image.filename)}&subfolder=${encodeURIComponent(image.subfolder)}&type=${encodeURIComponent(image.type)}`
+export function buildComfyMediaViewUrl(baseUrl: string, media: ComfyMediaResult): string {
+  return `${baseUrl}/view?filename=${encodeURIComponent(media.filename)}&subfolder=${encodeURIComponent(media.subfolder)}&type=${encodeURIComponent(media.type)}`
 }
+
+/** @deprecated Use buildComfyMediaViewUrl. */
+export const buildComfyImageViewUrl = buildComfyMediaViewUrl
 
 /**
  * Upload a source image to ComfyUI's input directory so a LoadImage node can
@@ -77,42 +87,127 @@ export async function uploadComfyImage(
   return { name: data.name, subfolder: typeof data.subfolder === "string" ? data.subfolder : "" }
 }
 
-export function findFirstComfyImageResult(
+function normalizeComfyOutputEntry(value: unknown, mediaType: "image" | "video"): ComfyMediaResult | null {
+  if (!value || typeof value !== "object") return null
+  const record = value as Record<string, unknown>
+  if (typeof record.filename !== "string" || !record.filename.trim()) return null
+  return {
+    mediaType,
+    filename: record.filename,
+    subfolder: typeof record.subfolder === "string" ? record.subfolder : "",
+    type: typeof record.type === "string" ? record.type : "output",
+  }
+}
+
+function isMp4Output(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false
+  const record = value as Record<string, unknown>
+  const filename = typeof record.filename === "string" ? record.filename.toLowerCase() : ""
+  const format = typeof record.format === "string" ? record.format.toLowerCase() : ""
+  return filename.endsWith(".mp4") || format === "video/mp4" || format.includes("mp4")
+}
+
+/**
+ * Resolve a final workflow output. Video Helper Suite commonly reports MP4
+ * files under `gifs`; other nodes use `videos`, while ordinary Save Image
+ * nodes use `images`. A real MP4 wins over preview/still outputs so video
+ * workflows do not accidentally return their first frame.
+ */
+export function findFirstComfyMediaResult(
   outputs: Record<string, any> | null | undefined,
-): ComfyImageResult | null {
+): ComfyMediaResult | null {
   if (!outputs || typeof outputs !== "object") return null
+
+  for (const nodeOutput of Object.values(outputs) as any[]) {
+    for (const key of ["videos", "gifs", "images"] as const) {
+      const candidates = Array.isArray(nodeOutput?.[key]) ? nodeOutput[key] : []
+      const video = candidates.find(isMp4Output)
+      const normalized = normalizeComfyOutputEntry(video, "video")
+      if (normalized) return normalized
+    }
+  }
+
   for (const nodeOutput of Object.values(outputs) as any[]) {
     if (!Array.isArray(nodeOutput?.images) || nodeOutput.images.length === 0) continue
-    const image = nodeOutput.images[0]
-    if (!image || typeof image.filename !== "string") continue
-    return {
-      filename: image.filename,
-      subfolder: typeof image.subfolder === "string" ? image.subfolder : "",
-      type: typeof image.type === "string" ? image.type : "output",
-    }
+    const image = nodeOutput.images.find((entry: unknown) => !isMp4Output(entry))
+    const normalized = normalizeComfyOutputEntry(image, "image")
+    if (normalized) return normalized
   }
   return null
 }
 
+/** @deprecated Use findFirstComfyMediaResult. */
+export function findFirstComfyImageResult(
+  outputs: Record<string, any> | null | undefined,
+): ComfyMediaResult | null {
+  const result = findFirstComfyMediaResult(outputs)
+  return result?.mediaType === "image" ? result : null
+}
+
 function logOutputsShape(label: string, outputs: Record<string, any>, promptId: string): void {
   try {
-    const summary: Record<string, { keys: string[]; imageCount: number; imageShape?: any }> = {}
+    const summary: Record<string, { keys: string[]; imageCount: number; videoCount: number; gifCount: number; outputShape?: any }> = {}
     for (const [nodeId, nodeOutput] of Object.entries(outputs)) {
       const keys = nodeOutput && typeof nodeOutput === "object" ? Object.keys(nodeOutput) : []
       const images = Array.isArray(nodeOutput?.images) ? nodeOutput.images : []
+      const videos = Array.isArray(nodeOutput?.videos) ? nodeOutput.videos : []
+      const gifs = Array.isArray(nodeOutput?.gifs) ? nodeOutput.gifs : []
+      const firstOutput = videos[0] ?? gifs[0] ?? images[0]
       summary[nodeId] = {
         keys,
         imageCount: images.length,
-        ...(images.length > 0 && images[0] ? { imageShape: Object.keys(images[0]) } : {}),
+        videoCount: videos.length,
+        gifCount: gifs.length,
+        ...(firstOutput ? { outputShape: Object.keys(firstOutput) } : {}),
       }
     }
     console.error(
-      "[%s] No image found in outputs. promptId=%s nodeCount=%d outputShape=%j",
+      "[%s] No supported media found in outputs. promptId=%s nodeCount=%d outputShape=%j",
       label, promptId, Object.keys(outputs).length, summary,
     )
   } catch {
-    console.error("[%s] No image found in outputs and failed to log shape. promptId=%s", label, promptId)
+    console.error("[%s] No supported media found in outputs and failed to log shape. promptId=%s", label, promptId)
   }
+}
+
+function isMp4Bytes(bytes: Uint8Array): boolean {
+  const scanEnd = Math.min(bytes.byteLength - 3, 64)
+  for (let i = 4; i < scanEnd; i++) {
+    if (bytes[i] === 0x66 && bytes[i + 1] === 0x74 && bytes[i + 2] === 0x79 && bytes[i + 3] === 0x70) {
+      return true
+    }
+  }
+  return false
+}
+
+async function readMediaBytesCapped(response: Response, label: string): Promise<Uint8Array> {
+  const declaredLength = Number(response.headers.get("content-length"))
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_COMFY_OUTPUT_BYTES) {
+    throw new Error(`${label} output exceeds the 250 MB generation limit`)
+  }
+  if (!response.body) return new Uint8Array(0)
+
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    if (!value) continue
+    total += value.byteLength
+    if (total > MAX_COMFY_OUTPUT_BYTES) {
+      try { await reader.cancel() } catch {}
+      throw new Error(`${label} output exceeds the 250 MB generation limit`)
+    }
+    chunks.push(value)
+  }
+  const output = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    output.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return output
 }
 
 export async function* executeComfyWorkflowStream(
@@ -202,21 +297,38 @@ export async function* executeComfyWorkflowStream(
     throw new Error(`No outputs in ${label} history`)
   }
 
-  const imageResult = findFirstComfyImageResult(outputs)
-  if (!imageResult) {
+  const mediaResult = findFirstComfyMediaResult(outputs)
+  if (!mediaResult) {
     logOutputsShape(label, outputs, promptId)
-    throw new Error(`No image output found in ${label} results`)
+    throw new Error(`No supported image or MP4 output found in ${label} results`)
   }
-  console.debug("[%s] Found image result: filename=%s subfolder=%s type=%s", label, imageResult.filename, imageResult.subfolder, imageResult.type)
+  console.debug("[%s] Found %s result: filename=%s subfolder=%s type=%s", label, mediaResult.mediaType, mediaResult.filename, mediaResult.subfolder, mediaResult.type)
 
-  const imageUrl = buildComfyImageViewUrl(baseUrl, imageResult)
-  const imageRes = await fetch(imageUrl, { headers: buildHeaders(cookie), signal })
-  if (!imageRes.ok) throw new Error(`Failed to fetch ${label} output image: ${imageRes.status}`)
+  const mediaUrl = buildComfyMediaViewUrl(baseUrl, mediaResult)
+  const mediaRes = await fetch(mediaUrl, { headers: buildHeaders(cookie), signal })
+  if (!mediaRes.ok) throw new Error(`Failed to fetch ${label} output media: ${mediaRes.status}`)
 
-  const imageBuffer = await imageRes.arrayBuffer()
-  const base64 = Buffer.from(imageBuffer).toString("base64")
-  const mimeType = imageRes.headers.get("content-type") || "image/png"
-  return { imageDataUrl: `data:${mimeType};base64,${base64}` }
+  const mediaBuffer = await readMediaBytesCapped(mediaRes, label)
+  if (mediaResult.mediaType === "video") {
+    if (!isMp4Bytes(mediaBuffer)) {
+      throw new Error(`${label} returned a video output that is not a valid MP4 file`)
+    }
+    return {
+      mediaType: "video",
+      mimeType: "video/mp4",
+      filename: mediaResult.filename,
+      mediaData: mediaBuffer,
+    }
+  }
+
+  const mimeType = mediaRes.headers.get("content-type") || "image/png"
+  const base64 = Buffer.from(mediaBuffer).toString("base64")
+  return {
+    mediaType: "image",
+    mimeType,
+    filename: mediaResult.filename,
+    imageDataUrl: `data:${mimeType};base64,${base64}`,
+  }
 }
 
 export async function executeComfyWorkflow(

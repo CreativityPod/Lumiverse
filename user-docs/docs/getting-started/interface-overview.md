@@ -71,7 +71,7 @@ The drawer hosts every workspace panel as a tab. You can reorder them with drag-
 
 | Tab | Purpose |
 |-----|---------|
-| **Image Generation** | Configure and trigger AI image / scene generation |
+| **Image & Video Generation** | Configure and trigger AI image, video, and scene generation |
 | **Wallpaper** | Set global or per-chat backgrounds (images, video, animated GIFs) |
 | **Theme** | Customize colors, accents, fonts, glass effects, and CSS overrides |
 | **Regex Scripts** | Author find/replace transformations for prompts or rendered output |

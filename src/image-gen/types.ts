@@ -30,8 +30,22 @@ export interface ImageGenRequest {
   signal?: AbortSignal;
 }
 
+export type GeneratedMediaType = "image" | "video";
+
+/**
+ * Provider result used inside Lumiverse's generation pipeline.
+ *
+ * Image providers retain the long-standing `imageDataUrl` response for
+ * backwards compatibility. Workflow providers may instead return binary
+ * media (currently MP4) so large videos never have to be expanded into a
+ * base64 data URL before they are persisted.
+ */
 export interface ImageGenResponse {
-  imageDataUrl: string;
+  imageDataUrl?: string;
+  mediaType?: GeneratedMediaType;
+  mediaData?: Uint8Array;
+  mimeType?: string;
+  filename?: string;
   model: string;
   provider: string;
 }

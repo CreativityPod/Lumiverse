@@ -75,9 +75,9 @@ Click **Clear** in the Wallpaper Panel to remove the current wallpaper. Global a
 
 ---
 
-## Combining with Image Generation
+## Combining with Image & Video Generation
 
-If you have image generation enabled and generate scene art, those AI-generated scene images override both the global and per-chat wallpapers while they're active — letting your background evolve with the story. The Opacity slider above still controls how prominently the scene shows through.
+If you have generation enabled and create scene art, those AI-generated images or muted looping videos override both the global and per-chat wallpapers while they're active — letting your background evolve with the story. The Opacity slider above still controls how prominently the scene shows through.
 
 ---
 

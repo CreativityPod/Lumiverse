@@ -346,7 +346,7 @@ describe("NovelAIImageProvider", () => {
       prompt: "a fox", model: "nai-diffusion-5-full", parameters: {},
       connectionOptions: { novelai: { nonStreaming: true } },
     });
-    const decoded = Buffer.from(result.imageDataUrl.split(",")[1], "base64");
+    const decoded = Buffer.from(result.imageDataUrl!.split(",")[1], "base64");
     expect(decoded.equals(png)).toBe(true);
     expect(await sharp(decoded).raw().toBuffer()).toEqual(Buffer.from(pixels));
   });

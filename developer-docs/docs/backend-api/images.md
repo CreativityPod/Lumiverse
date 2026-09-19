@@ -172,7 +172,7 @@ Same ownership and `specificity` fields as `ImageListOptionsDTO`, minus paginati
 - `spindle.images.get()` returns metadata plus a URL, not the binary asset bytes themselves.
 - Thumbnail generation is supported automatically. `has_thumbnail` tells you whether thumbnails are available or can be lazily generated. `uploadMany` defers thumbnail (and width/height) generation to a background job for throughput; the underlying row populates these fields asynchronously after the call returns. Assets uploaded with `skip_thumbnail_processing: true` keep `has_thumbnail: false` and `width`/`height` as `null`, and all thumbnail-sized URLs serve the original asset.
 - Video assets stored here can be used as `spindle.media` inputs via `source: { kind: "image", image_id }`. Despite the source name, that media source kind accepts still images and video assets from this store.
-- Generated images persisted through `spindle.imageGen.generate()` also participate in this ownership model when `owner_character_id` or `owner_chat_id` are supplied.
+- Generated images and videos persisted through `spindle.imageGen.generate()` also participate in this ownership model when `owner_character_id` or `owner_chat_id` are supplied.
 
 !!! note
     For user-scoped extensions, the user context is inferred automatically. For operator-scoped extensions, pass `userId` when working on behalf of a specific user.

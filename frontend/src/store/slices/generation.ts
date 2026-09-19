@@ -27,11 +27,14 @@ export const createGenerationSlice: StateCreator<AppStore, [], [], GenerationSli
     forceGeneration: false,
     recycleGeneratedImages: false,
     recycledImageLimit: 1,
+    recycleGeneratedVideos: false,
+    recycledVideoLimit: 1,
     backgroundOpacity: 0.35,
     fadeTransitionMs: 800,
   },
   pendingImageGenerationPatch: undefined,
   sceneBackground: null,
+  sceneBackgroundType: 'image',
   sceneGenerating: false,
 
   setImageGenSettings: (settings) =>
@@ -53,6 +56,6 @@ export const createGenerationSlice: StateCreator<AppStore, [], [], GenerationSli
       }
       return patch
     }),
-  setSceneBackground: (url) => set({ sceneBackground: url }),
+  setSceneBackground: (url, type = 'image') => set({ sceneBackground: url, sceneBackgroundType: type }),
   setSceneGenerating: (generating) => set({ sceneGenerating: generating }),
 })

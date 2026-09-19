@@ -441,7 +441,9 @@
   },
   "attachments": {
     "removeImage": "Remove image",
-    "couldNotRemoveImage": "Could not remove image"
+    "couldNotRemoveImage": "Could not remove image",
+    "removeVideo": "Remove video",
+    "couldNotRemoveVideo": "Could not remove video"
   },
   "ooc": {
     "expand": "Expand",

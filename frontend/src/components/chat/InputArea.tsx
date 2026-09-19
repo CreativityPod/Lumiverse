@@ -1639,7 +1639,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
           original_filename: file.name,
           width: 'width' in media ? media.width ?? undefined : undefined,
           height: 'height' in media ? media.height ?? undefined : undefined,
-          previewUrl: isImage ? imagesApi.smallUrl(media.id) : undefined,
+          previewUrl: isImage || isVideo ? imagesApi.smallUrl(media.id) : undefined,
         }
         setPendingAttachments((prev) => [...prev, att])
       }
@@ -4289,7 +4289,7 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
         <div className={styles.attachmentStrip}>
           {pendingAttachments.map((att) => (
             <div key={att.image_id} className={styles.attachmentPreview}>
-              {att.type === 'image' && att.previewUrl ? (
+              {(att.type === 'image' || att.type === 'video') && att.previewUrl ? (
                 <img src={att.previewUrl} alt={att.original_filename} className={styles.attachmentThumb} />
               ) : (
                 <span className={styles.attachmentLabel}>{att.original_filename}</span>

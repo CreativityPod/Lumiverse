@@ -14,7 +14,7 @@ export default function ImageGenProgressBar({ jobId, showPreview = true }: Props
 
   // Nothing to show until the first progress event arrives. Once generation has
   // started we stay mounted through the 'finalizing' phase so the last preview
-  // frame bridges the gap until the panel swaps in the final image (and unmounts
+  // frame bridges the gap until the panel swaps in the final result (and unmounts
   // this component by clearing the job id).
   if (phase === 'idle' && !preview) return null
 

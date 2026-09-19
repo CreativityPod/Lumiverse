@@ -31,6 +31,7 @@ import type { ImageParameterSchemaMap } from "../image-gen/param-schema";
 import { rawGenerate } from "./generate.service";
 import type { LlmMessage } from "../llm/types";
 import type { ImageGenRequest } from "../image-gen/types";
+import { resolveGeneratedMedia } from "../image-gen/generated-media";
 import type { Message } from "../types/message";
 import type { ImageGenConnectionProfile } from "../types/image-gen-connection";
 import { scheduleLowPriorityTask } from "../utils/low-priority-task";
@@ -101,6 +102,10 @@ interface ImageGenSettings {
   recycleGeneratedImages: boolean;
   /** Maximum generated images to re-send when recycling is enabled. */
   recycledImageLimit: number;
+  /** When true, generated chat attachment videos may be re-sent to multimodal LLM context. */
+  recycleGeneratedVideos: boolean;
+  /** Maximum generated videos to re-send when recycling is enabled. */
+  recycledVideoLimit: number;
   /** When true, generated images are also linked into the active chat's character gallery. */
   addToGallery?: boolean;
   backgroundOpacity: number;
@@ -156,6 +161,8 @@ const DEFAULT_IMAGE_SETTINGS: ImageGenSettings = {
   forceGeneration: false,
   recycleGeneratedImages: false,
   recycledImageLimit: 1,
+  recycleGeneratedVideos: false,
+  recycledVideoLimit: 1,
   addToGallery: true,
   backgroundOpacity: 0.35,
   fadeTransitionMs: 800,
@@ -211,6 +218,16 @@ export interface ImageGenResult {
   imageId?: string;
   /** Public URL for the image (works without authentication) */
   imageUrl?: string;
+  /** Generic persisted media type for image/video generation results. */
+  mediaType?: "image" | "video";
+  /** Persisted asset ID. Mirrors imageId for image results. */
+  mediaId?: string;
+  /** Public URL for the generated media. */
+  mediaUrl?: string;
+  /** Stored content type, such as image/png or video/mp4. */
+  mimeType?: string;
+  /** Poster/thumbnail URL for generated video when available. */
+  posterUrl?: string;
   /** Message created (chat_attachment) or patched (attach_to_message) by this generation. */
   message?: Message;
   /** Job id streamed alongside progress events so the frontend can correlate. */
@@ -268,7 +285,7 @@ export interface GenerateImageOptions {
   /** Override native gallery linkage; omitted preserves settings behavior. */
   addToGallery?: boolean;
   outputTarget?: ImageGenOutputTarget;
-  /** Existing message to attach the generated image to (output target = attach_to_message). */
+  /** Existing message to attach the generated result to (output target = attach_to_message). */
   attachToMessageId?: string;
   /** When true, the parser is skipped and `prompt`/`negativePrompt` are sent verbatim. Used after the preview-prompt modal. */
   skipParse?: boolean;
@@ -530,7 +547,7 @@ export async function generateSceneBackground(
     const generationSignal = createPhaseTimeoutSignal(
       controller.signal,
       generationTimeoutSecs,
-      `Image generation timed out after ${generationTimeoutSecs}s`,
+      `Generation timed out after ${generationTimeoutSecs}s`,
     );
     const request: ImageGenRequest = {
       prompt: promptResult.prompt,
@@ -549,7 +566,7 @@ export async function generateSceneBackground(
         userId,
       });
     } catch (err) {
-      const message = clampErrorMessage(describeProviderError(err, "Image generation failed"));
+      const message = clampErrorMessage(describeProviderError(err, "Media generation failed"));
       eventBus.emit(
         EventType.IMAGE_GEN_ERROR,
         { assetId: jobId, chatId, message },
@@ -560,26 +577,59 @@ export async function generateSceneBackground(
       generationSignal.cleanup();
     }
 
-    // Persist the generated image to the images table
+    // Persist the generated media to the shared image/video asset table.
     let imageId: string | undefined;
     let imageUrl: string | undefined;
+    let mediaType: "image" | "video" | undefined;
+    let mediaId: string | undefined;
+    let mediaUrl: string | undefined;
+    let mimeType: string | undefined;
+    let posterUrl: string | undefined;
     let message: Message | undefined;
-    if (response.imageDataUrl) {
-      const image = await imagesSvc.saveImageFromDataUrl(
-        userId,
-        response.imageDataUrl,
-        `image-gen-${connection.provider}-${Date.now()}.png`,
-        {
-          owner_extension_identifier: opts?.ownerExtensionIdentifier,
-          owner_chat_id: opts?.ownerChatId ?? chatId,
-        },
-      );
-      imageId = image.id;
-      imageUrl = `/api/v1/image-gen/results/${image.id}`;
-      const relayPreviewUrl = await buildRelayImagePreview(response.imageDataUrl);
+    const generatedMedia = resolveGeneratedMedia(
+      response,
+      `image-gen-${connection.provider}-${Date.now()}`,
+    );
+    // Preserve the legacy provider contract: an empty imageDataUrl is allowed
+    // to complete without persistence (some integrations use this for dry-run
+    // or connection checks). Valid image and video results take this path.
+    if (generatedMedia) {
+      const ownership = {
+        owner_extension_identifier: opts?.ownerExtensionIdentifier,
+        owner_chat_id: opts?.ownerChatId ?? chatId,
+      };
+      const generatedVideoBytes = generatedMedia.data
+        ? Uint8Array.from(generatedMedia.data).buffer
+        : undefined;
+      const image = generatedMedia.type === "video"
+        ? await imagesSvc.uploadImage(
+            userId,
+            new File([generatedVideoBytes!], generatedMedia.filename, { type: generatedMedia.mimeType }),
+            { ...ownership, transcode_video_codec: "h264" },
+          )
+        : await imagesSvc.saveImageFromDataUrl(
+            userId,
+            generatedMedia.imageDataUrl!,
+            generatedMedia.filename,
+            ownership,
+          );
+      mediaType = generatedMedia.type;
+      mediaId = image.id;
+      mediaUrl = `/api/v1/image-gen/results/${image.id}`;
+      mimeType = image.mime_type;
+      posterUrl = generatedMedia.type === "video" && image.has_thumbnail
+        ? `${mediaUrl}?size=lg`
+        : undefined;
+      if (generatedMedia.type === "image") {
+        imageId = image.id;
+        imageUrl = mediaUrl;
+      }
+      const relayPreviewUrl = generatedMedia.type === "image"
+        ? await buildRelayImagePreview(generatedMedia.imageDataUrl!)
+        : undefined;
 
       const newAttachment = {
-        type: "image" as const,
+        type: generatedMedia.type,
         image_id: image.id,
         mime_type: image.mime_type,
         original_filename: image.original_filename,
@@ -589,6 +639,7 @@ export async function generateSceneBackground(
       };
       const imageGenMeta = {
         provider: connection.provider,
+        mediaType: generatedMedia.type,
         prompt: promptResult.prompt,
         negativePrompt: promptResult.negativePrompt,
         mode: promptMode,
@@ -618,19 +669,19 @@ export async function generateSceneBackground(
             { image_gen: imageGenMeta },
           );
           if (!updated) {
-            throw new Error("Target message for image attachment was not found");
+            throw new Error("Target message for generated attachment was not found");
           }
           message = updated;
         }
       } catch (err) {
-        // Image is already saved to our DB and (for streaming providers) sits
+        // The media is already saved to our DB and (for streaming providers) sits
         // in the provider's history — surface the failure so the user sees
         // why nothing landed in chat instead of silently dropping it.
         const detail = err instanceof Error ? err.message : String(err);
-        console.error("[image-gen] Failed to attach generated image to chat:", err);
+        console.error("[image-gen] Failed to attach generated media to chat:", err);
         eventBus.emit(
           EventType.IMAGE_GEN_ERROR,
-          { assetId: jobId, chatId, message: `Image generated but chat attachment failed: ${detail}` },
+          { assetId: jobId, chatId, message: `Media generated but chat attachment failed: ${detail}` },
           userId,
         );
         throw err;
@@ -639,7 +690,8 @@ export async function generateSceneBackground(
       // Gallery linkage is best-effort and not on the response's critical
       // path — defer to a microtask so the HTTP response (and the chat
       // re-render that follows from MESSAGE_EDITED) lands sooner.
-      const shouldAddToGallery = opts?.addToGallery ?? (settings.addToGallery !== false);
+      const shouldAddToGallery = generatedMedia.type === "image"
+        && (opts?.addToGallery ?? (settings.addToGallery !== false));
       if (shouldAddToGallery) {
         const characterId = chatsSvc.getChat(userId, chatId)?.character_id;
         if (characterId) {
@@ -656,7 +708,11 @@ export async function generateSceneBackground(
 
     if (promptResult.scene) sceneCacheSet(cacheKey, promptResult.scene);
 
-    eventBus.emit(EventType.IMAGE_GEN_COMPLETE, { assetId: jobId, chatId, imageId, imageUrl }, userId);
+    eventBus.emit(
+      EventType.IMAGE_GEN_COMPLETE,
+      { assetId: jobId, chatId, imageId, imageUrl, mediaType, mediaId, mediaUrl, mimeType, posterUrl },
+      userId,
+    );
 
     return {
       generated: true,
@@ -667,6 +723,11 @@ export async function generateSceneBackground(
       imageDataUrl: response.imageDataUrl,
       imageId,
       imageUrl,
+      mediaType,
+      mediaId,
+      mediaUrl,
+      mimeType,
+      posterUrl,
       message,
       jobId,
     };
@@ -2038,6 +2099,8 @@ const TRANSFERABLE_SETTING_TYPES: Record<string, "boolean" | "number" | "string"
   forceGeneration: "boolean",
   recycleGeneratedImages: "boolean",
   recycledImageLimit: "number",
+  recycleGeneratedVideos: "boolean",
+  recycledVideoLimit: "number",
   addToGallery: "boolean",
   backgroundOpacity: "number",
   fadeTransitionMs: "number",

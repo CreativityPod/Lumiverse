@@ -4,7 +4,7 @@ title: Visual Studio
 
 # Visual Studio
 
-Once a card is finalized, its dashboard grows an image side: generate a **portrait**, then derive a full **expression set** from it. It runs through your existing **image-gen connections** — the same ones the [Image Generation](../image-generation/index.md) feature uses — so any provider you've already set up is available here, with no extra configuration.
+Once a card is finalized, its dashboard grows an image side: generate a **portrait**, then derive a full **expression set** from it. It runs through your existing **image-gen connections** — the same ones the [Image & Video Generation](../image-generation/index.md) feature uses — so any provider you've already set up is available here, with no extra configuration.
 
 The dashboard rail holds the panes: **Card** (the finished fields), **Portrait**, **Expressions** (characters only — a world's narrator card runs a place, not a face), and for worlds the **World** hub and **People** panes. Scene and alternate-portrait panes are on the roadmap and marked as such in the rail.
 
@@ -25,7 +25,7 @@ Portraits are generated at a tall 2:3 aspect ratio (832 × 1216) suited to chara
 
 Setting the avatar takes effect immediately — no re-upload, no extra step — and you can keep generating and swap it as often as you like. The committed portrait also becomes the **source** for expressions, so commit the face you want the whole set to share before moving on.
 
-For connecting and configuring a provider in the first place, see [Image Generation → Setup & Providers](../image-generation/setup.md).
+For connecting and configuring a provider in the first place, see [Image & Video Generation → Setup & Providers](../image-generation/setup.md).
 
 ---
 
@@ -74,7 +74,7 @@ What you can control depends on which provider the connection uses.
 
 ### ComfyUI
 
-ComfyUI gives you the most control, but it needs a one-time setup on the connection first: **import your workflow and map its fields** (at minimum, map a node field as the _positive prompt_). See [Image Generation → Setup & Providers](../image-generation/setup.md) for importing and mapping.
+ComfyUI gives you the most control, but it needs a one-time setup on the connection first: **import your workflow and map its fields** (at minimum, map a node field as the _positive prompt_). See [Image & Video Generation → Setup & Providers](../image-generation/setup.md) for importing and mapping.
 
 Once a workflow is mapped, the Visual Studio fills your prompt, negative prompt, size, and seed into the nodes you mapped — and any **extra fields you mapped** (steps, CFG, sampler, scheduler, checkpoint, or custom node inputs) appear as controls you can tune per generation. In the Expressions pane, Advanced shows only the denoise strength — the rest of the workflow's parameters belong to the workflow's own mapped fields, configured on the connection.
 

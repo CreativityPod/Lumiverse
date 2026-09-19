@@ -212,17 +212,36 @@ export default function ChatView() {
   const isMobile = useIsMobile()
   const portraitBackdropVisible = !portraitSurfaceOccupied && isMobile && portraitPanelOpen && portraitPanelSide !== 'none'
   const sceneBackground = useStore((s) => s.sceneBackground)
+  const sceneBackgroundType = useStore((s) => s.sceneBackgroundType)
   const imageGeneration = useStore((s) => s.imageGeneration)
   const wallpaper = useStore((s) => s.wallpaper)
   const useCharacterBackground = useStore((s) => s.useCharacterBackground)
   const chatWidthMode = useStore((s) => s.chatWidthMode)
   const chatContentMaxWidth = useStore((s) => s.chatContentMaxWidth)
   const videoRef = useRef<HTMLVideoElement>(null)
+  const sceneVideoRef = useRef<HTMLVideoElement>(null)
   const chatColumnInnerRef = useRef<HTMLDivElement>(null)
   const chatColumnTopRef = useRef<HTMLDivElement>(null)
   const chatTopDockRef = useRef<HTMLDivElement>(null)
   const chatComposerAboveRef = useRef<HTMLSpanElement>(null)
   const wallpaperTransitionTimeouts = useRef<number[]>([])
+
+  useEffect(() => {
+    if (!sceneBackground || sceneBackgroundType !== 'video') return
+    const video = sceneVideoRef.current
+    if (!video) return
+    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+    const syncPlayback = () => {
+      if (document.hidden || reducedMotion) video.pause()
+      else void video.play().catch(() => {})
+    }
+    syncPlayback()
+    document.addEventListener('visibilitychange', syncPlayback)
+    return () => {
+      document.removeEventListener('visibilitychange', syncPlayback)
+      video.pause()
+    }
+  }, [sceneBackground, sceneBackgroundType])
   const chromeEnterTimerRef = useRef<number | null>(null)
   const chromeLeaveTimerRef = useRef<number | null>(null)
   // Stabilization is independent of animation preference: reduced-motion
@@ -1154,14 +1173,32 @@ export default function ChatView() {
       />
 
       {/* Scene background layer — overrides wallpaper when active */}
-      <div
-        className={styles.sceneBackgroundLayer}
-        style={{
-          backgroundImage: sceneBackground ? `url("${sceneBackground}")` : 'none',
-          opacity: sceneBackground ? Math.max(0, Math.min(1, imageGeneration.backgroundOpacity ?? 0.35)) : 0,
-          transitionDuration: `${Math.max(100, imageGeneration.fadeTransitionMs ?? 800)}ms`,
-        }}
-      />
+      {sceneBackgroundType === 'video' && sceneBackground ? (
+        <video
+          ref={sceneVideoRef}
+          key={sceneBackground}
+          className={styles.sceneBackgroundVideo}
+          src={sceneBackground}
+          autoPlay
+          muted
+          loop
+          playsInline
+          preload="metadata"
+          style={{
+            opacity: Math.max(0, Math.min(1, imageGeneration.backgroundOpacity ?? 0.35)),
+            transitionDuration: `${Math.max(100, imageGeneration.fadeTransitionMs ?? 800)}ms`,
+          }}
+        />
+      ) : (
+        <div
+          className={styles.sceneBackgroundLayer}
+          style={{
+            backgroundImage: sceneBackground ? `url("${sceneBackground}")` : 'none',
+            opacity: sceneBackground ? Math.max(0, Math.min(1, imageGeneration.backgroundOpacity ?? 0.35)) : 0,
+            transitionDuration: `${Math.max(100, imageGeneration.fadeTransitionMs ?? 800)}ms`,
+          }}
+        />
+      )}
       <div
         className={styles.sceneTextContextLayer}
         style={{

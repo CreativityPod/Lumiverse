@@ -63,7 +63,7 @@ export class ComfyUIImageProvider implements ImageProvider {
       throw new Error("ComfyUI provider requires a pre-built workflow in parameters.workflow")
     }
 
-    const { imageDataUrl } = await executeComfyWorkflow(
+    const result = await executeComfyWorkflow(
       baseUrl,
       workflow as Record<string, any>,
       request.signal,
@@ -71,7 +71,7 @@ export class ComfyUIImageProvider implements ImageProvider {
     )
 
     return {
-      imageDataUrl,
+      ...result,
       model: request.model || "comfyui-workflow",
       provider: this.name,
     }
@@ -105,7 +105,7 @@ export class ComfyUIImageProvider implements ImageProvider {
       const next = await stream.next()
       if (next.done) {
         return {
-          imageDataUrl: next.value.imageDataUrl,
+          ...next.value,
           model: request.model || "comfyui-workflow",
           provider: this.name,
         }
