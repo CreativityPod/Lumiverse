@@ -37,6 +37,18 @@
   transition-timing-function: ease;
 }
 
+.sceneBackgroundVideo {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+  transition-property: opacity;
+  transition-timing-function: ease;
+}
+
 .sceneTextContextLayer {
   position: absolute;
   inset: 0;

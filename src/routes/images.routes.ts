@@ -17,12 +17,14 @@ import { userMediaServingHeaders } from "../utils/user-media-headers";
 const app = new Hono();
 
 const MAX_IMAGE_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_VIDEO_UPLOAD_BYTES = 250 * 1024 * 1024; // 250 MB
 const MAX_WALLPAPER_UPLOAD_BYTES = 250 * 1024 * 1024; // 250 MB
 const REMOTE_IMAGE_PROXY_MAX_BYTES = 25 * 1024 * 1024; // 25 MB
 const REMOTE_IMAGE_PROXY_MAX_HTML_BYTES = 1 * 1024 * 1024; // 1 MB
 const REMOTE_IMAGE_PROXY_MAX_RESOLUTION_DEPTH = 1;
 type WallpaperVideoCodec = "h264" | "hevc";
 type WallpaperUploadProgressId = string;
+const VIDEO_UPLOAD_EXTENSION_RE = /\.(?:mp4|mpeg|mpg|mov|m4v|avi|flv|webm|wmv|3gp)$/i;
 
 function isTruthyFlag(value: string | undefined): boolean {
   if (!value) return false;
@@ -35,6 +37,10 @@ function parseWallpaperVideoCodec(value: string | undefined): WallpaperVideoCode
   if (!normalized) return undefined;
   if (normalized === "h264" || normalized === "hevc") return normalized;
   return null;
+}
+
+function isVideoUpload(file: File): boolean {
+  return file.type.toLowerCase().startsWith("video/") || VIDEO_UPLOAD_EXTENSION_RE.test(file.name);
 }
 
 function parseWallpaperUploadProgressId(value: string | undefined): WallpaperUploadProgressId | null | undefined {
@@ -206,17 +212,30 @@ app.post("/", async (c) => {
   const userId = c.get("userId");
   const formData = await c.req.formData();
   const file = formData.get("image") as File | null;
-  if (!file) return c.json({ error: "image file is required" }, 400);
+  if (!file) return c.json({ error: "media file is required" }, 400);
   const stripAudio = isTruthyFlag(c.req.query("strip_audio"));
+  const videoCodec = parseWallpaperVideoCodec(c.req.query("video_codec"));
+  if (videoCodec === null) {
+    return c.json({ error: "Unsupported video codec. Use h264 or hevc." }, 400);
+  }
+  const isVideo = isVideoUpload(file);
+  const maxUploadBytes = isVideo ? MAX_VIDEO_UPLOAD_BYTES : MAX_IMAGE_UPLOAD_BYTES;
 
   // Bound the upload to keep a single request from filling memory or disk.
   // The 10 MB API-wide bodyLimit middleware skips this route to allow chunkier
-  // image uploads, so the cap has to live here.
-  if (typeof file.size === "number" && file.size > MAX_IMAGE_UPLOAD_BYTES) {
-    return c.json({ error: "Image too large", maxBytes: MAX_IMAGE_UPLOAD_BYTES }, 413);
+  // media uploads, so the cap has to live here. Videos get the same 250 MB
+  // ceiling as video wallpapers and generated Comfy output.
+  if (typeof file.size === "number" && file.size > maxUploadBytes) {
+    return c.json({
+      error: `${isVideo ? "Video" : "Image"} too large`,
+      maxBytes: maxUploadBytes,
+    }, 413);
   }
 
-  const image = await svc.uploadImage(userId, file, { strip_audio: stripAudio });
+  const image = await svc.uploadImage(userId, file, {
+    strip_audio: stripAudio,
+    transcode_video_codec: isVideo ? (videoCodec ?? "h264") : undefined,
+  });
   return c.json(image, 201);
 });
 

@@ -10,7 +10,7 @@ Lumiverse builds the final image prompt from three things: the **prompt mode** y
 
 ## Prompt Modes
 
-Set the mode under **Image Generation → Prompt Mode**.
+Set the mode under **Image & Video Generation → Prompt Mode**.
 
 ### Scene tool
 
@@ -131,7 +131,7 @@ Swap to a different persona or character mid-chat and the splices update automat
 ---
 ## LoRA Presets
 
-**Image Generation → LoRA Presets** saves an ordered stack of LoRA filenames, strengths, and optional base tags. Load a preset from **Active LoRA Preset**, then add rows or edit its name before saving. Base tags are prepended to the generated prompt only while that preset is active and not bypassed.
+**Image & Video Generation → LoRA Presets** saves an ordered stack of LoRA filenames, strengths, and optional base tags. Load a preset from **Active LoRA Preset**, then add rows or edit its name before saving. Base tags are prepended to the generated prompt only while that preset is active and not bypassed.
 
 When the active connection supports model discovery (**ComfyUI**, **SwarmUI**, or **SD API**), the filename picker offers its available LoRAs. Selecting an option stores its exact provider filename. You can always type a filename manually instead—useful for a new file that has not appeared in a model list yet. A failed lookup remains visible with **Retry** and never locks the manual filename field.
 

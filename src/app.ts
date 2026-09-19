@@ -32,6 +32,7 @@ import { packsRoutes } from "./routes/packs.routes";
 import { councilRoutes } from "./routes/council.routes";
 import { weaverRoutes } from "./routes/weaver.routes";
 import { imageGenRoutes } from "./routes/image-gen.routes";
+import { parseRangeHeader } from "./routes/http-range";
 import { imageGenConnectionsRoutes } from "./routes/image-gen-connections.routes";
 import { characterGalleryRoutes } from "./routes/character-gallery.routes";
 import { embeddingsRoutes } from "./routes/embeddings.routes";
@@ -462,14 +463,39 @@ app.get("/api/v1/image-gen/results/:id", async (c) => {
   const filepath = await getImageFilePathPublic(id, tier);
   if (!filepath) return c.json({ error: "Not found" }, 404);
   const file = Bun.file(filepath);
-  const response = new Response(file);
-  response.headers.set("Cache-Control", "public, max-age=86400");
+  const totalSize = file.size;
+  const baseHeaders: Record<string, string> = {
+    "Cache-Control": "public, max-age=86400, no-transform",
+    "Accept-Ranges": "bytes",
+    "X-Accel-Buffering": "no",
+  };
+  if (file.type) baseHeaders["Content-Type"] = file.type;
   // This route is unauthenticated: apply the stored-XSS boundary (sandbox CSP,
   // nosniff, active-content demotion) before the bytes reach any browser.
-  for (const [key, value] of Object.entries(userMediaServingHeaders(file.type))) {
-    response.headers.set(key, value);
+  Object.assign(baseHeaders, userMediaServingHeaders(file.type));
+  const parsed = parseRangeHeader(c.req.header("range"), totalSize);
+  if (parsed === "invalid") {
+    return new Response("Range Not Satisfiable", {
+      status: 416,
+      headers: { "Content-Range": `bytes */${totalSize}`, ...baseHeaders },
+    });
   }
-  return response;
+  if (parsed === null) {
+    return new Response(file, {
+      status: 200,
+      headers: { ...baseHeaders, "Content-Length": String(totalSize) },
+    });
+  }
+  const { start, end } = parsed;
+  const chunk = new Uint8Array(await file.slice(start, end + 1).arrayBuffer());
+  return new Response(chunk, {
+    status: 206,
+    headers: {
+      ...baseHeaders,
+      "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+      "Content-Length": String(end - start + 1),
+    },
+  });
 });
 
 // Auth middleware — AFTER auth handler, BEFORE routes

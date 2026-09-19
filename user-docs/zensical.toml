@@ -97,7 +97,7 @@ nav = [
     { "Overview" = "packs/index.md" },
     { "Managing Packs" = "packs/managing-packs.md" },
   ] },
-  { "Image Generation" = [
+  { "Image & Video Generation" = [
     { "Overview" = "image-generation/index.md" },
     { "Setup & Providers" = "image-generation/setup.md" },
     { "Prompts & Presets" = "image-generation/prompts-and-presets.md" },

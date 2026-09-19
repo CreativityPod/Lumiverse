@@ -1,24 +1,34 @@
-# Image Generation
+# Image and Video Generation
 
 !!! warning "Permission required: `image_gen`"
 
-Generate images programmatically via the user's configured image gen connection profiles. Supports listing providers, connections, available models, ordinary request/response generations, and WebSocket-backed preview streams where the provider supports them.
+Generate media programmatically via the user's configured image-gen connection profiles. Most providers return images; ComfyUI and Comfy-backed SwarmUI workflows may return a final MP4 video. The API name and `image_gen` permission remain unchanged for backward compatibility.
 
 ## `spindle.imageGen.generate(input)`
 
-Generate an image using a connection profile. If `connection_id` is omitted, uses the user's default image gen connection.
+Generate a result using a connection profile. If `connection_id` is omitted, the user's default image-gen connection is used.
 
 ```ts
 const result = await spindle.imageGen.generate({
   prompt: 'A serene mountain landscape at sunset, anime style',
   connection_id: 'optional-connection-id',
 })
-// result: { imageDataUrl: "data:image/png;base64,...", model: "...", provider: "..." }
+// result: {
+//   mediaType: "image",
+//   mediaId: "img-...",
+//   mediaUrl: "/api/v1/image-gen/results/img-...",
+//   mimeType: "image/png",
+//   imageDataUrl: "data:image/png;base64,...", // legacy image field
+//   imageId: "img-...",                       // legacy image field
+//   imageUrl: "/api/v1/image-gen/results/img-...",
+//   model: "...",
+//   provider: "..."
+// }
 ```
 
-When the extension only needs the persisted image (`imageId` / `imageUrl`), pass
+When the extension only needs the persisted image (`imageId` / `imageUrl`) or generic media reference (`mediaId` / `mediaUrl`), pass
 `includeDataUrl: false` to omit the base64 `imageDataUrl` from the result. The
-host still persists the image (so `imageId` / `imageUrl` remain available) but
+host still persists the result but
 skips shipping the largest per-image RPC payload back to the worker:
 
 ```ts
@@ -27,11 +37,27 @@ const result = await spindle.imageGen.generate({
   connection_id: 'optional-connection-id',
   includeDataUrl: false,
 })
-// result: { imageId: "img-...", imageUrl: "/api/v1/image-gen/results/img-...", model: "...", provider: "..." }
+// result: { mediaType: "image", mediaId: "img-...", mediaUrl: "/api/v1/image-gen/results/img-...", imageId: "img-...", imageUrl: "/api/v1/image-gen/results/img-...", model: "...", provider: "..." }
 ```
 
 The default (`includeDataUrl` omitted or `true`) keeps the data URL for
-backward compatibility.
+backward compatibility. MP4 results are always persisted and returned by URL;
+video bytes are never expanded into an extension-facing data URL.
+
+For a ComfyUI workflow whose final output is MP4 (including Video Helper Suite
+outputs reported under `gifs`), the result is shaped like this:
+
+```ts
+{
+  mediaType: 'video',
+  mediaId: 'asset-id',
+  mediaUrl: '/api/v1/image-gen/results/asset-id',
+  mimeType: 'video/mp4',
+  posterUrl: '/api/v1/image-gen/results/asset-id?size=lg',
+  model: 'comfyui-workflow',
+  provider: 'comfyui',
+}
+```
 
 
 You can override the model and pass provider-specific parameters:
@@ -67,9 +93,9 @@ const result = await spindle.imageGen.generate({
 
 ## `spindle.imageGen.generateStream(input)`
 
-Generate an image while receiving live WebSocket status updates and preview frames. This API is available only for connection providers that advertise `websocketPreviewStreaming`; currently, that includes **SwarmUI** and **ComfyUI**.
+Generate media while receiving live WebSocket status updates and image preview frames. This API is available only for connection providers that advertise `websocketPreviewStreaming`; currently, that includes **SwarmUI** and **ComfyUI**. A video workflow still emits image preview frames, then returns the persisted MP4 in its terminal `done` event.
 
-Unlike [`generate()`](#spindleimagegengenerateinput), this returns an async iterator. It yields a terminal `done` event rather than returning the final image directly.
+Unlike [`generate()`](#spindleimagegengenerateinput), this returns an async iterator. It yields a terminal `done` event rather than returning the final media result directly.
 
 ```ts
 let latestPreview: string | undefined
@@ -100,7 +126,7 @@ for await (const event of stream) {
 
     case 'done':
       // Same shape as the result from spindle.imageGen.generate().
-      spindle.log.info(`Saved generated image: ${event.result.imageId ?? 'not persisted'}`)
+      spindle.log.info(`Saved generated media: ${event.result.mediaId ?? 'not persisted'}`)
       break
   }
 }
@@ -160,7 +186,7 @@ try {
   }
 } catch (err) {
   if (err instanceof DOMException && err.name === 'AbortError') {
-    spindle.log.info('Image generation cancelled')
+    spindle.log.info('Media generation cancelled')
   } else {
     throw err
   }
@@ -177,7 +203,7 @@ try {
 |---|---|---|
 | `status` | `step?`, `totalSteps?`, `nodeId?` | A provider progress or workflow-node update. Some providers omit numerical progress. |
 | `preview` | `imageDataUrl`, `step?`, `totalSteps?`, `nodeId?` | A preview image data URL, with status metadata when available. |
-| `done` | `result: ImageGenResultDTO` | The completed, persisted final image result. |
+| `done` | `result: ImageGenResultDTO` | The completed, persisted image or video result. |
 
 `generateStream()` requires the same `image_gen` permission and accepts all fields from `ImageGenRequestDTO`, plus an optional `signal: AbortSignal`.
 
@@ -190,25 +216,30 @@ try {
 | `model` | `string` | Optional. Override the connection profile's model. |
 | `negativePrompt` | `string` | Optional. Negative prompt (provider-dependent). |
 | `parameters` | `Record<string, unknown>` | Optional. Provider-specific parameters, merged with the connection's `default_parameters`. |
-| `owner_character_id` | `string` | Optional. Tag the persisted generated image to a specific character. |
-| `owner_chat_id` | `string` | Optional. Tag the persisted generated image to a specific chat. |
+| `owner_character_id` | `string` | Optional. Tag the persisted generated media to a specific character. |
+| `owner_chat_id` | `string` | Optional. Tag the persisted generated media to a specific chat. |
 | `userId` | `string` | **Required for operator-scoped extensions.** |
 
-### ImageGenResultDTO
+### ImageGenResultDTO (media-capable)
 
 | Field | Type | Description |
 |---|---|---|
-| `imageDataUrl` | `string` | Base64-encoded data URL of the generated image (e.g. `data:image/png;base64,...`). |
+| `mediaType` | `'image' \| 'video'` | Type of the final persisted result. |
+| `mediaId` | `string` | Persisted asset ID in the shared image/video table. |
+| `mediaUrl` | `string` | Public URL for the generated media. MP4 responses support byte ranges. |
+| `mimeType` | `string` | Stored content type, such as `image/png` or `video/mp4`. |
+| `posterUrl` | `string` | Optional generated-video poster URL. |
+| `imageDataUrl` | `string?` | Image-only legacy field. Base64-encoded generated image; absent for video. |
 | `model` | `string` | The model that was used. |
-| `provider` | `string` | The provider that was used (`google_gemini`, `nanogpt`, `novelai`). |
-| `imageId` | `string` | Optional. The persisted image ID in the images table. Present when persistence succeeds. |
-| `imageUrl` | `string` | Optional. Public URL path for the image (e.g. `/api/v1/image-gen/results/{id}`). Works without authentication — suitable for push notification `image` field, embeds, and external references. |
+| `provider` | `string` | Identifier of the provider that produced the result, such as `comfyui`, `swarmui`, `google_gemini`, `nanogpt`, or `novelai`. |
+| `imageId` | `string` | Image-only compatibility alias for `mediaId`. |
+| `imageUrl` | `string` | Image-only compatibility alias for `mediaUrl`. |
 
-### Image Persistence
+### Media Persistence
 
-Generated images are automatically saved to the images table with full thumbnail support. The persisted row is automatically tagged to the current extension, and you can additionally pass `owner_character_id` and/or `owner_chat_id` to make later retrieval via `spindle.images.list()` and `spindle.images.get()` much cheaper and more targeted.
+Generated images and videos are automatically saved to the shared images table with thumbnail or poster support. The persisted row is automatically tagged to the current extension, and you can additionally pass `owner_character_id` and/or `owner_chat_id` to make later retrieval via `spindle.images.list()` and `spindle.images.get()` much cheaper and more targeted.
 
-The `imageId` can be used to reference the image in other APIs (gallery, backgrounds, etc.), and `imageUrl` provides unauthenticated public access.
+Use `mediaId` / `mediaUrl` for either result type. The legacy `imageId` / `imageUrl` aliases remain available for image results and existing integrations.
 
 ```ts
 const result = await spindle.imageGen.generate({

@@ -853,6 +853,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     const lineCount = proseContent.length > 0 ? Math.max(1, explicitLines, wrappedLines) : 0
     const codeBlockCount = (proseContent.match(/```/g)?.length ?? 0) / 2
     const imageCount = message.extra?.attachments?.filter((a) => a.type === 'image').length ?? 0
+    const videoCount = message.extra?.attachments?.filter((a) => a.type === 'video').length ?? 0
     const audioCount = message.extra?.attachments?.filter((a) => a.type === 'audio').length ?? 0
     const inlineStyleCount = proseContent.match(/\bstyle\s*=/gi)?.length ?? 0
     const htmlBlockCount = proseContent.match(/<(div|section|article|aside|nav|main|header|footer|form|fieldset|figure|details|table|tr|td|th|iframe|svg|video|audio)\b/gi)?.length ?? 0
@@ -862,7 +863,7 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     const hasExtensionTags = customTagCount > 0 || selfClosingCustomTagCount > 0
     const base = isBubble ? (isPhoneWidth ? 88 : isCompactWidth ? 96 : 104) : 76
     const lineHeight = 23
-    const mediaHeight = imageCount > 0 ? (isPhoneWidth ? 190 : isCompactWidth ? 220 : 250) : 0
+    const mediaHeight = imageCount > 0 || videoCount > 0 ? (isPhoneWidth ? 190 : isCompactWidth ? 220 : 250) : 0
     const audioHeight = audioCount * 58
     const codeHeight = codeBlockCount * 44
     const htmlBoost = hasStyledHtml

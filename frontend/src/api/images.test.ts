@@ -7,14 +7,16 @@ const post = mock((..._args: unknown[]) => Promise.resolve({
   skipped: 0,
   failed: 0,
 }))
+const upload = mock((..._args: unknown[]) => Promise.resolve({ id: 'media-id' }))
+const uploadWithProgress = mock((..._args: unknown[]) => Promise.resolve({ id: 'media-id' }))
 
 mock.module('./client', () => ({
   BASE_URL: '/custom/api',
   del: mock(),
   get: mock(),
   post,
-  upload: mock(),
-  uploadWithProgress: mock(),
+  upload,
+  uploadWithProgress,
 }))
 
 const { imagesApi } = await import('./images')
@@ -23,6 +25,43 @@ const originalFetch = globalThis.fetch
 afterEach(() => {
   globalThis.fetch = originalFetch
   post.mockClear()
+  upload.mockClear()
+  uploadWithProgress.mockClear()
+})
+
+describe('imagesApi uploads', () => {
+  test('keeps ordinary image uploads on the compatibility endpoint', async () => {
+    const file = new File(['image'], 'portrait.png', { type: 'image/png' })
+
+    await imagesApi.upload(file)
+
+    expect(upload).toHaveBeenCalledWith('/images', expect.any(FormData), undefined)
+  })
+
+  test('normalizes video uploads to H.264 without a client timeout', async () => {
+    const file = new File(['video'], 'clip.mp4', { type: 'video/mp4' })
+
+    await imagesApi.upload(file)
+
+    expect(upload).toHaveBeenCalledWith(
+      '/images?video_codec=h264',
+      expect.any(FormData),
+      { timeout: 0 },
+    )
+  })
+
+  test('uses the video upload endpoint when reporting upload progress', async () => {
+    const file = new File(['video'], 'clip.mp4', { type: 'video/mp4' })
+    const onProgress = mock(() => {})
+
+    await imagesApi.upload(file, onProgress)
+
+    expect(uploadWithProgress).toHaveBeenCalledWith(
+      '/images?video_codec=h264',
+      expect.any(FormData),
+      onProgress,
+    )
+  })
 })
 
 describe('imagesApi thumbnail rebuild', () => {

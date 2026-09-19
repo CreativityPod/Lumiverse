@@ -16,7 +16,7 @@ import clsx from 'clsx'
 interface MessageAttachmentsProps {
   attachments: MessageAttachment[]
   isUser?: boolean
-  /** Chat + message ids enable per-image actions (Remove image). Omit to render in read-only mode. */
+  /** Chat + message ids enable attachment actions. Omit to render in read-only mode. */
   chatId?: string
   messageId?: string
 }
@@ -56,6 +56,7 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
   const [lightboxImageId, setLightboxImageId] = useState<string | null>(null)
   const [contextMenuPos, setContextMenuPos] = useState<ContextMenuPos | null>(null)
   const [targetImageId, setTargetImageId] = useState<string | null>(null)
+  const [targetAttachmentType, setTargetAttachmentType] = useState<'image' | 'video'>('image')
   const messageContextMenuEnabled = useStore((s) => s.messageContextMenuEnabled ?? true)
   const addToast = useStore((s) => s.addToast)
 
@@ -76,10 +77,12 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
   const closeContextMenu = useCallback(() => {
     setContextMenuPos(null)
     setTargetImageId(null)
+    setTargetAttachmentType('image')
   }, [])
 
-  const openImageMenu = useCallback((imageId: string, pos: ContextMenuPos) => {
+  const openImageMenu = useCallback((imageId: string, type: 'image' | 'video', pos: ContextMenuPos) => {
     setTargetImageId(imageId)
+    setTargetAttachmentType(type)
     setContextMenuPos(pos)
   }, [])
 
@@ -96,9 +99,12 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
         useStore.getState().updateMessage(messageId, updated)
       }
     } catch (err: any) {
-      addToast({ type: 'error', title: t('attachments.couldNotRemoveImage'), message: err?.body?.error || err?.message || 'Unknown error' })
+      const key = targetAttachmentType === 'video'
+        ? 'attachments.couldNotRemoveVideo'
+        : 'attachments.couldNotRemoveImage'
+      addToast({ type: 'error', title: t(key), message: err?.body?.error || err?.message || 'Unknown error' })
     }
-  }, [addToast, chatId, closeContextMenu, messageId, targetImageId, t])
+  }, [addToast, chatId, closeContextMenu, messageId, targetAttachmentType, targetImageId, t])
 
   // Removes the image currently shown in the lightbox. Throws on failure so the
   // lightbox surfaces its own error toast (the thumbnail context-menu path uses
@@ -109,41 +115,41 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
     if (updated) useStore.getState().updateMessage(messageId, updated)
   }, [chatId, messageId, lightboxImageId])
 
+  // Track which attachment started the touch so the long-press callback knows
+  // both the polymorphic asset id and its user-facing media type.
+  const longPressTargetRef = useMemo(() => ({ current: null as { id: string; type: 'image' | 'video' } | null }), [])
+
   const longPress = useLongPress({
     onLongPress: (pos) => {
-      // Long-press fires for the most-recently armed image (set in onTouchStart below).
+      // Long-press fires for the most-recently armed attachment.
       if (!canActOnImage) return
       const armed = longPressTargetRef.current
       if (!armed) return
-      openImageMenu(armed, pos)
+      openImageMenu(armed.id, armed.type, pos)
     },
   })
 
-  // Track which image started the touch so the long-press callback knows the target.
-  // (useLongPress doesn't pass the event target through.)
-  const longPressTargetRef = useMemo(() => ({ current: null as string | null }), [])
-
-  const onImageTouchStart = useCallback((imageId: string) => (e: React.TouchEvent) => {
-    longPressTargetRef.current = imageId
+  const onImageTouchStart = useCallback((imageId: string, type: 'image' | 'video') => (e: React.TouchEvent) => {
+    longPressTargetRef.current = { id: imageId, type }
     longPress.onTouchStart(e)
   }, [longPress, longPressTargetRef])
 
-  const onImageContextMenu = useCallback((imageId: string) => (e: React.MouseEvent) => {
+  const onImageContextMenu = useCallback((imageId: string, type: 'image' | 'video') => (e: React.MouseEvent) => {
     if (!canActOnImage) return
     e.preventDefault()
     e.stopPropagation()
-    openImageMenu(imageId, { x: e.clientX, y: e.clientY })
+    openImageMenu(imageId, type, { x: e.clientX, y: e.clientY })
   }, [canActOnImage, openImageMenu])
 
   const contextMenuItems: ContextMenuEntry[] = useMemo(() => [
     {
-      key: 'remove-image',
-      label: t('attachments.removeImage'),
+      key: 'remove-attachment',
+      label: t(targetAttachmentType === 'video' ? 'attachments.removeVideo' : 'attachments.removeImage'),
       icon: <Trash2 size={14} />,
       danger: true,
       onClick: () => { void removeAttachment() },
     },
-  ], [removeAttachment, t])
+  ], [removeAttachment, t, targetAttachmentType])
 
   // Audio attachments are rendered by the separate MessageAudioSlot
   // component as a sibling of MessageAttachments — keeping it out of the
@@ -167,8 +173,8 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
               playsInline
               title={att.original_filename}
               onLoadedMetadata={(event) => dispatchMessageContentLayout(event.currentTarget)}
-              onContextMenu={onImageContextMenu(att.image_id)}
-              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id) : undefined}
+              onContextMenu={onImageContextMenu(att.image_id, 'video')}
+              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id, 'video') : undefined}
               onTouchMove={canActOnImage ? longPress.onTouchMove : undefined}
               onTouchEnd={canActOnImage ? longPress.onTouchEnd : undefined}
             />
@@ -179,8 +185,8 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
               className={styles.imageThumbUser}
               style={getImageFrameStyle(att)}
               onClick={() => openLightbox(att)}
-              onContextMenu={onImageContextMenu(att.image_id)}
-              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id) : undefined}
+              onContextMenu={onImageContextMenu(att.image_id, 'image')}
+              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id, 'image') : undefined}
               onTouchMove={canActOnImage ? longPress.onTouchMove : undefined}
               onTouchEnd={canActOnImage ? longPress.onTouchEnd : undefined}
               title={att.original_filename}
@@ -211,8 +217,8 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
               className={styles.inlineImageBtn}
               style={getImageFrameStyle(att)}
               onClick={() => openLightbox(att)}
-              onContextMenu={onImageContextMenu(att.image_id)}
-              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id) : undefined}
+              onContextMenu={onImageContextMenu(att.image_id, 'image')}
+              onTouchStart={canActOnImage ? onImageTouchStart(att.image_id, 'image') : undefined}
               onTouchMove={canActOnImage ? longPress.onTouchMove : undefined}
               onTouchEnd={canActOnImage ? longPress.onTouchEnd : undefined}
             >

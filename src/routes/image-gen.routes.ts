@@ -30,7 +30,7 @@ app.post("/generate", async (c) => {
     });
     return c.json(result);
   } catch (err: any) {
-    const msg = clampErrorMessage(describeProviderError(err, "Image generation failed"));
+    const msg = clampErrorMessage(describeProviderError(err, "Media generation failed"));
     const status = /required|not found|unsupported|parse|No API key|missing|connection/i.test(msg) ? 400 : 502;
     return c.json({ error: msg }, status);
   }

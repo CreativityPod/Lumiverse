@@ -223,9 +223,9 @@ export interface MessageAttachment {
   /**
    * Audio-only: the message swipe this audio was generated for. The
    * player is only visible when `message.swipe_id` matches. Undefined
-   * on legacy audio (saved before this field existed) and on images —
-   * interpreted as "applies to all swipes" so pre-existing recordings
-   * aren't lost across the migration window.
+   * on legacy audio (saved before this field existed) and on image/video
+   * attachments — interpreted as "applies to all swipes" so pre-existing
+   * recordings aren't lost across the migration window.
    */
   swipe_id?: number;
 }

@@ -3,8 +3,8 @@ export interface MessageAttachment {
   image_id: string;           // Polymorphic media ID retained for wire compatibility
   mime_type: string;          // e.g. "image/png", "audio/wav", "video/mp4"
   original_filename: string;
-  width?: number;             // images only
-  height?: number;            // images only
+  width?: number;             // visual media metadata
+  height?: number;            // visual media metadata
   /** Image-only: bounded WebP data URL for multiplayer peers that cannot fetch the host's image row. */
   relay_preview_url?: string;
   /**
@@ -12,8 +12,8 @@ export interface MessageAttachment {
    * a per-swipe artifact (regenerating a swipe should not invalidate the
    * audio of another swipe). When set, the player is only visible when
    * `message.swipe_id` matches. Undefined on legacy audio (saved before
-   * this field existed) and on images — interpreted as "applies to all
-   * swipes" so we don't strand any pre-existing recordings.
+   * this field existed) and on image/video attachments — interpreted as
+   * "applies to all swipes" so we don't strand any pre-existing recordings.
    */
   swipe_id?: number;
 }

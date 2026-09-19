@@ -10,7 +10,7 @@ Image generation uses its own connection profiles, separate from your LLM connec
 
 ## Creating an Image-Gen Connection
 
-1. Open **Settings → Connections** (or the **Image Generation** panel and click the connection picker).
+1. Open **Settings → Connections** (or the **Image & Video Generation** panel and click the connection picker).
 2. Add a new connection and choose the **Provider**.
 3. Fill in the required fields for that provider (URL, API key, etc.).
 4. Click **Test** to validate the connection.
@@ -110,7 +110,7 @@ The connection's **Capabilities** button queries the live ComfyUI server for ava
 Every numeric/select parameter shown in the panel can be set at three levels:
 
 1. **Connection default** — set on the connection itself, applied to every generation.
-2. **Panel override** — temporary, lives in the open Image Generation panel.
+2. **Panel override** — temporary, lives in the open Image & Video Generation panel.
 3. **Provider-level fallback** — the provider's own default if neither of the above is set.
 
 Lower levels override higher ones, so anything you change in the panel only affects the current chat session unless you explicitly save it back to the connection.
@@ -119,7 +119,7 @@ Lower levels override higher ones, so anything you change in the panel only affe
 
 ## Migration From Legacy Settings
 
-If you ran a previous version of Lumiverse that stored Gemini / NanoGPT / NovelAI keys in the global settings blob, those entries are migrated to encrypted connection profiles the first time you open the Image Generation panel. You don't need to do anything — the old keys disappear from settings and new connections appear in the picker.
+If you ran a previous version of Lumiverse that stored Gemini / NanoGPT / NovelAI keys in the global settings blob, those entries are migrated to encrypted connection profiles the first time you open the Image & Video Generation panel. You don't need to do anything — the old keys disappear from settings and new connections appear in the picker.
 
 ---
 
@@ -129,7 +129,7 @@ If you ran a previous version of Lumiverse that stored Gemini / NanoGPT / NovelA
     Run a generation with a one-off panel value first; once you're happy with the result, copy it back to the connection's default parameters so future chats pick it up automatically.
 
 !!! tip "Pre-warm slow connections"
-    For ComfyUI / SwarmUI with large models, the first generation after a server restart can be slow while the checkpoint loads. Either bump the **Image Generation Timeout** (see [Scene, Output & Timeouts](scene-and-output.md)) or run a quick test from your server's UI first.
+    For ComfyUI / SwarmUI with large models, the first generation after a server restart can be slow while the checkpoint loads. Either bump the **Generation Timeout** (see [Scene, Output & Timeouts](scene-and-output.md)) or run a quick test from your server's UI first.
 
 !!! warning "Local providers need network access"
     If Lumiverse is running in a container or VM, make sure the ComfyUI / SwarmUI URL is reachable from the Lumiverse process — not just from your browser.

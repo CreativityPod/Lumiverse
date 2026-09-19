@@ -603,14 +603,14 @@ export class SwarmUIImageProvider implements ImageProvider {
     // Workflow mode: route to ComfyUI via SwarmUI's /ComfyBackendDirect proxy.
     const workflow = request.parameters?.workflow
     if (workflow && typeof workflow === "object") {
-      const { imageDataUrl } = await executeComfyWorkflow(
+      const result = await executeComfyWorkflow(
         `${base}/ComfyBackendDirect`,
         workflow as Record<string, any>,
         request.signal,
         { label: "SwarmUI/ComfyBackendDirect", cookie: token ? `swarm_token=${token}` : undefined, wsTimeoutMs: 15_000 },
       )
       return {
-        imageDataUrl,
+        ...result,
         model: this.resolvedModel(request) || "comfyui-workflow",
         provider: this.name,
       }
@@ -704,7 +704,7 @@ export class SwarmUIImageProvider implements ImageProvider {
         const next = await stream.next()
         if (next.done) {
           return {
-            imageDataUrl: next.value.imageDataUrl,
+            ...next.value,
             model: this.resolvedModel(request) || "comfyui-workflow",
             provider: this.name,
           }
