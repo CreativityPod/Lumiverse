@@ -22,6 +22,7 @@ import { shouldAdjustMessageListScrollOnResize } from './messageListScrollAdjust
 import { shouldPinMessageListTail } from './messageListPinning'
 import { COLLAPSIBLE_TOGGLE_LAYOUT_EVENT, isCollapsibleToggleElement } from './collapsibleLayout'
 import { getLongMessageCollapseHeight, isLongMessageCollapseEligible, longMessageExpansionKey } from '@/lib/longMessageCollapse'
+import { resolveVisualAttachmentKind } from '@/lib/messageAttachmentMedia'
 import {
   MESSAGE_CONTENT_LAYOUT_EVENT,
   shouldPreserveScrollAnchorForLayout,
@@ -852,8 +853,8 @@ export default function MessageList({ messages, chatId, isStreaming, findTarget 
     const wrappedLines = Math.ceil(proseContent.length / charsPerLine)
     const lineCount = proseContent.length > 0 ? Math.max(1, explicitLines, wrappedLines) : 0
     const codeBlockCount = (proseContent.match(/```/g)?.length ?? 0) / 2
-    const imageCount = message.extra?.attachments?.filter((a) => a.type === 'image').length ?? 0
-    const videoCount = message.extra?.attachments?.filter((a) => a.type === 'video').length ?? 0
+    const imageCount = message.extra?.attachments?.filter((a) => resolveVisualAttachmentKind(a) === 'image').length ?? 0
+    const videoCount = message.extra?.attachments?.filter((a) => resolveVisualAttachmentKind(a) === 'video').length ?? 0
     const audioCount = message.extra?.attachments?.filter((a) => a.type === 'audio').length ?? 0
     const inlineStyleCount = proseContent.match(/\bstyle\s*=/gi)?.length ?? 0
     const htmlBlockCount = proseContent.match(/<(div|section|article|aside|nav|main|header|footer|form|fieldset|figure|details|table|tr|td|th|iframe|svg|video|audio)\b/gi)?.length ?? 0

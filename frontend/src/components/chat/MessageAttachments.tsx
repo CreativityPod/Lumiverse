@@ -10,6 +10,7 @@ import ContextMenu, { type ContextMenuEntry, type ContextMenuPos } from '@/compo
 import ImageLightbox from '@/components/shared/ImageLightbox'
 import LazyImage from '@/components/shared/LazyImage'
 import { dispatchMessageContentLayout } from '@/lib/message-content-layout'
+import { resolveVisualAttachmentKind } from '@/lib/messageAttachmentMedia'
 import styles from './MessageAttachments.module.css'
 import clsx from 'clsx'
 
@@ -155,15 +156,18 @@ export default function MessageAttachments({ attachments, isUser, chatId, messag
   // component as a sibling of MessageAttachments — keeping it out of the
   // flex-wrap row here means the slot can collapse to 0 height (without
   // dragging this wrapper's padding along) when there's no audio.
-  const visualMedia = attachments.filter((a) => a.type === 'image' || a.type === 'video')
+  const visualMedia = attachments.flatMap((attachment) => {
+    const kind = resolveVisualAttachmentKind(attachment)
+    return kind ? [{ attachment, kind }] : []
+  })
 
   if (visualMedia.length === 0) return null
 
   return (
     <>
       <div className={clsx(styles.attachments, isUser && styles.attachmentsUser)}>
-        {visualMedia.map((att) =>
-          att.type === 'video' ? (
+        {visualMedia.map(({ attachment: att, kind }) =>
+          kind === 'video' ? (
             <video
               key={att.image_id}
               src={getLocalImageUrl(att)}

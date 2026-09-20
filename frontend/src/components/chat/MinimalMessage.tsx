@@ -6,6 +6,7 @@ import MinimalMessageDefault, { type MinimalMessageDefaultProps } from './Minima
 import MessageContent from './MessageContent'
 import ReasoningBlock from './ReasoningBlock'
 import MessageAttachments from './MessageAttachments'
+import { resolveVisualAttachmentKind } from '@/lib/messageAttachmentMedia'
 import { useStore } from '@/store'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import type { Message } from '@/types/api'
@@ -69,7 +70,7 @@ function MinimalMessageNative({ message, chatId, depth = 0, isSelectMode = false
       total: message.swipes.length,
     },
     attachments: (message.extra?.attachments || []).map((a: any) => ({
-      type: a.type,
+      type: resolveVisualAttachmentKind(a) ?? a.type,
       imageId: a.image_id,
       mimeType: a.mime_type,
       filename: a.original_filename,
