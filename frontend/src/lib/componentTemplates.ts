@@ -61,7 +61,7 @@ const BUBBLE_MESSAGE: ComponentTemplate = {
       { name: 'total', type: 'number', description: 'Total swipe count' },
     ]},
     { name: 'attachments', type: 'array', description: 'Inline attachments', children: [
-      { name: '[].type', type: '"image" | "audio"', description: 'Attachment type' },
+      { name: '[].type', type: '"image" | "audio" | "video"', description: 'Attachment type' },
       { name: '[].imageId', type: 'string', description: 'Image ID for URL resolution' },
       { name: '[].mimeType', type: 'string', description: 'MIME type' },
       { name: '[].filename', type: 'string', description: 'Original filename' },
@@ -88,7 +88,7 @@ const BUBBLE_MESSAGE: ComponentTemplate = {
     { name: '<Original />', type: 'slot tag', description: 'Renders the complete built-in component. Keep this slot to preserve native actions, swipes, editing, greetings, accessibility, and future host updates.' },
     { name: '<Content />', type: 'slot tag', description: 'Renders the fully-formatted message body (markdown, code highlighting, macros, interactivity) exactly like the built-in renderer. Place this tag where the message text should appear.' },
     { name: '<Reasoning />', type: 'slot tag', description: 'Renders the built-in reasoning/CoT collapsible block. Renders nothing when there is no reasoning.' },
-    { name: '<Attachments />', type: 'slot tag', description: 'Renders inline image/audio attachments. Renders nothing when there are none.' },
+    { name: '<Attachments />', type: 'slot tag', description: 'Renders inline image, audio, and video attachments. Renders nothing when there are none.' },
   ],
 }
 

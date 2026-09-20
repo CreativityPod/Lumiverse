@@ -86,7 +86,7 @@ export interface OverrideSwipes {
 }
 
 export interface OverrideAttachment {
-  type: 'image' | 'audio'
+  type: 'image' | 'audio' | 'video'
   imageId: string
   mimeType: string
   filename: string

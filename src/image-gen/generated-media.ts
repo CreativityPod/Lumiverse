@@ -8,6 +8,17 @@ export interface ResolvedGeneratedMedia {
   data?: Uint8Array;
 }
 
+/** Prefer the MIME recorded by persistence over a stale provider discriminator. */
+export function resolveStoredGeneratedMediaType(
+  declaredType: GeneratedMediaType,
+  storedMimeType: string,
+): GeneratedMediaType {
+  const mimeType = storedMimeType.trim().toLowerCase().split(";", 1)[0];
+  if (mimeType.startsWith("video/")) return "video";
+  if (mimeType.startsWith("image/")) return "image";
+  return declaredType;
+}
+
 function mimeTypeFromDataUrl(dataUrl: string): string | null {
   return dataUrl.match(/^data:([^;]+);base64,/)?.[1] ?? null;
 }

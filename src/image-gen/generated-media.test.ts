@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolveGeneratedMedia } from "./generated-media";
+import { resolveGeneratedMedia, resolveStoredGeneratedMediaType } from "./generated-media";
 
 describe("resolveGeneratedMedia", () => {
   test("normalizes a legacy image-only provider response", () => {
@@ -30,5 +30,15 @@ describe("resolveGeneratedMedia", () => {
       filename: "fallback.mp4",
       data: bytes,
     });
+  });
+});
+
+describe("resolveStoredGeneratedMediaType", () => {
+  test("repairs a stale image discriminator from the persisted MP4 MIME", () => {
+    expect(resolveStoredGeneratedMediaType("image", "video/mp4")).toBe("video");
+  });
+
+  test("falls back to the provider discriminator for a generic MIME", () => {
+    expect(resolveStoredGeneratedMediaType("video", "application/octet-stream")).toBe("video");
   });
 });

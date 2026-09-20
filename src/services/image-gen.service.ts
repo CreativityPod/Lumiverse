@@ -31,7 +31,7 @@ import type { ImageParameterSchemaMap } from "../image-gen/param-schema";
 import { rawGenerate } from "./generate.service";
 import type { LlmMessage } from "../llm/types";
 import type { ImageGenRequest } from "../image-gen/types";
-import { resolveGeneratedMedia } from "../image-gen/generated-media";
+import { resolveGeneratedMedia, resolveStoredGeneratedMediaType } from "../image-gen/generated-media";
 import type { Message } from "../types/message";
 import type { ImageGenConnectionProfile } from "../types/image-gen-connection";
 import { scheduleLowPriorityTask } from "../utils/low-priority-task";
@@ -613,14 +613,15 @@ export async function generateSceneBackground(
             generatedMedia.filename,
             ownership,
           );
-      mediaType = generatedMedia.type;
+      const storedMediaType = resolveStoredGeneratedMediaType(generatedMedia.type, image.mime_type);
+      mediaType = storedMediaType;
       mediaId = image.id;
       mediaUrl = `/api/v1/image-gen/results/${image.id}`;
       mimeType = image.mime_type;
-      posterUrl = generatedMedia.type === "video" && image.has_thumbnail
+      posterUrl = storedMediaType === "video" && image.has_thumbnail
         ? `${mediaUrl}?size=lg`
         : undefined;
-      if (generatedMedia.type === "image") {
+      if (storedMediaType === "image") {
         imageId = image.id;
         imageUrl = mediaUrl;
       }
@@ -629,7 +630,7 @@ export async function generateSceneBackground(
         : undefined;
 
       const newAttachment = {
-        type: generatedMedia.type,
+        type: storedMediaType,
         image_id: image.id,
         mime_type: image.mime_type,
         original_filename: image.original_filename,
@@ -639,7 +640,7 @@ export async function generateSceneBackground(
       };
       const imageGenMeta = {
         provider: connection.provider,
-        mediaType: generatedMedia.type,
+        mediaType: storedMediaType,
         prompt: promptResult.prompt,
         negativePrompt: promptResult.negativePrompt,
         mode: promptMode,
