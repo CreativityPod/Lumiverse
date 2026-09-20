@@ -105,6 +105,7 @@ export interface VideoTranscodeProgress {
 
 interface NormalizeVideoBufferOptions {
   codec: NormalizedVideoCodec;
+  /** Opt-in audio removal. Omitted/false preserves any source audio stream. */
   stripAudio?: boolean;
   onProgress?: (progress: VideoTranscodeProgress) => void;
 }
@@ -460,12 +461,13 @@ export async function normalizeVideoBuffer(
     const outputPath = join(workdir, "output.mp4");
     await Bun.write(inputPath, input);
     const probe = await probeInputVideo(ffmpeg, inputPath);
+    const preserveAudio = options.stripAudio !== true;
 
     if (isVideoStreamCopyCompatible(probe, options.codec)) {
       const copyArgs = [
         "-i", inputPath,
         "-map", "0:v:0",
-        ...(options.stripAudio === false ? ["-map", "0:a?", "-c:a", "copy"] : ["-an"]),
+        ...(preserveAudio ? ["-map", "0:a?", "-c:a", "copy"] : ["-an"]),
         "-c:v", "copy",
         ...(options.codec === "hevc" ? ["-tag:v", "hvc1"] : []),
         "-movflags", "+faststart",
@@ -492,7 +494,7 @@ export async function normalizeVideoBuffer(
       const hardwareArgs = [
         "-i", inputPath,
         "-map", "0:v:0",
-        ...(options.stripAudio === false ? ["-map", "0:a?"] : ["-an"]),
+        ...(preserveAudio ? ["-map", "0:a?"] : ["-an"]),
         ...hardwareEncoder.args,
         "-pix_fmt", "yuv420p",
         ...(options.codec === "hevc" ? ["-tag:v", "hvc1"] : []),
@@ -527,7 +529,7 @@ export async function normalizeVideoBuffer(
     const ffmpegArgs = [
       "-i", inputPath,
       "-map", "0:v:0",
-      ...(options.stripAudio === false ? ["-map", "0:a?"] : ["-an"]),
+      ...(preserveAudio ? ["-map", "0:a?"] : ["-an"]),
       ...codecArgs,
       "-movflags", "+faststart",
       "-y",

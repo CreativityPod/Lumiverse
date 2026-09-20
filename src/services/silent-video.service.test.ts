@@ -151,6 +151,76 @@ describe("silent-video.service", () => {
     }
   });
 
+  test("preserves audio by default and strips it only when explicitly requested", async () => {
+    const ffmpeg = await resolveFfmpegBinary();
+    if (!ffmpeg) return;
+
+    const workdir = mkdtempSync(join(tmpdir(), "lumiverse-video-audio-test-"));
+    try {
+      const inputPath = join(workdir, "input.mp4");
+      const outputPath = join(workdir, "output.mp4");
+      const silentOutputPath = join(workdir, "output-silent.mp4");
+      const generator = Bun.spawn([
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=64x64:d=0.4",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=0.4",
+        "-shortest",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-y",
+        inputPath,
+      ], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      expect(await generator.exited).toBe(0);
+
+      const input = Buffer.from(await Bun.file(inputPath).bytes());
+      const out = await normalizeVideoBuffer(input, "video/mp4", "input.mp4", {
+        codec: "h264",
+      });
+
+      expect(out).not.toBeNull();
+      await Bun.write(outputPath, out!.buffer);
+      const probe = Bun.spawn([ffmpeg, "-hide_banner", "-i", outputPath], {
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const stderr = await Bun.readableStreamToText(probe.stderr as ReadableStream);
+      await probe.exited;
+      expect(stderr).toMatch(/Stream #.*Audio:/i);
+
+      const silentOut = await normalizeVideoBuffer(input, "video/mp4", "input.mp4", {
+        codec: "h264",
+        stripAudio: true,
+      });
+      expect(silentOut).not.toBeNull();
+      await Bun.write(silentOutputPath, silentOut!.buffer);
+      const silentProbe = Bun.spawn([ffmpeg, "-hide_banner", "-i", silentOutputPath], {
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const silentStderr = await Bun.readableStreamToText(silentProbe.stderr as ReadableStream);
+      await silentProbe.exited;
+      expect(silentStderr).not.toMatch(/Stream #.*Audio:/i);
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  });
+
   test("reports ffmpeg transcode progress while normalizing a mov upload", async () => {
     const ffmpeg = await resolveFfmpegBinary();
     if (!ffmpeg) return;
