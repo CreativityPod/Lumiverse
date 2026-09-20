@@ -605,7 +605,7 @@ export async function generateSceneBackground(
         ? await imagesSvc.uploadImage(
             userId,
             new File([generatedVideoBytes!], generatedMedia.filename, { type: generatedMedia.mimeType }),
-            { ...ownership, transcode_video_codec: "h264" },
+            { ...ownership, transcode_video_codec: "h264", strip_audio: false },
           )
         : await imagesSvc.saveImageFromDataUrl(
             userId,

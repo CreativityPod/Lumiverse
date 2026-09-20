@@ -129,6 +129,7 @@ export interface ImageOwnershipOptions {
   owner_character_id?: string;
   owner_chat_id?: string;
   skip_thumbnail_processing?: boolean;
+  /** Opt-in audio removal for video assets. Omitted/false preserves audio. */
   strip_audio?: boolean;
   transcode_video_codec?: NormalizedVideoCodec;
   sidecar_video_codecs?: NormalizedVideoCodec[];

@@ -210,7 +210,7 @@ export class WorkerHostImageGenApi {
           ? await imagesSvc.uploadImage(
               generation.userId,
               new File([generatedVideoBytes!], generatedMedia.filename, { type: generatedMedia.mimeType }),
-              { ...ownership, transcode_video_codec: "h264" },
+              { ...ownership, transcode_video_codec: "h264", strip_audio: false },
             )
           : await imagesSvc.saveImageFromDataUrl(
               generation.userId,
