@@ -340,6 +340,7 @@ type RuntimeWorkerToHost =
   | { type: "toast_show"; toastType: "success" | "warning" | "error" | "info"; message: string; title?: string; duration?: number; userId?: string }
   | { type: "prompt_regex_set_owned"; chatIds: string[] }
   | { type: "image_gen_generate_native"; requestId: string; input: any }
+  | { type: "image_gen_activity"; requestId: string; userId?: string }
   | { type: "user_storage_read_binary"; requestId: string; path: string; userId?: string }
   | {
       type: "user_storage_write_binary";
@@ -747,6 +748,8 @@ type RuntimeSpindleAPI = Omit<SpindleAPI, "presets" | "imageGen" | "world_books"
      * image or video result. Breaking out of the iterator aborts the upstream job.
      */
     generateStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void>;
+    /** Which of the user's connections are busy with a built-in ImgGen job. */
+    getActivity(userId?: string): Promise<{ imageGenBusy: boolean; busyConnectionIds: string[] }>;
   };
   mcp: {
     servers: {
@@ -2425,6 +2428,11 @@ const spindleApi: RuntimeSpindleAPI = {
     },
     generateStream(input: ImageGenStreamInput): AsyncGenerator<ImageGenStreamEvent, void, void> {
       return requestImageGenStream(input);
+    },
+    async getActivity(userId?: string): Promise<{ imageGenBusy: boolean; busyConnectionIds: string[] }> {
+      const requestId = crypto.randomUUID();
+      const result = await request({ type: "image_gen_activity", requestId, userId });
+      return result as { imageGenBusy: boolean; busyConnectionIds: string[] };
     },
     async getProviders(userId?: string): Promise<any[]> {
       const requestId = crypto.randomUUID();

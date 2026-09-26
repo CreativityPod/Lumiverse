@@ -324,6 +324,7 @@ type RuntimeWorkerToHost =
   | { type: "toast_show"; toastType: "success" | "warning" | "error" | "info"; message: string; title?: string; duration?: number; userId?: string }
   | { type: "prompt_regex_set_owned"; chatIds: string[] }
   | { type: "image_gen_generate_native"; requestId: string; input: any }
+  | { type: "image_gen_activity"; requestId: string; userId?: string }
   | { type: "user_storage_read_binary"; requestId: string; path: string; userId?: string }
   | { type: "user_get_role"; requestId: string; userId?: string }
   | {
@@ -2506,6 +2507,9 @@ export class WorkerHost {
         break;
       case "image_gen_providers":
         this.imageGenApi.handleProviders(msg.requestId);
+        break;
+      case "image_gen_activity":
+        this.imageGenApi.handleActivity(msg.requestId, msg.userId);
         break;
       case "image_gen_connections_list":
         this.imageGenApi.handleConnectionsList(msg.requestId, msg.userId);

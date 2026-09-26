@@ -607,7 +607,7 @@ export class SwarmUIImageProvider implements ImageProvider {
         `${base}/ComfyBackendDirect`,
         workflow as Record<string, any>,
         request.signal,
-        { label: "SwarmUI/ComfyBackendDirect", cookie: token ? `swarm_token=${token}` : undefined, wsTimeoutMs: 15_000 },
+        { label: "SwarmUI/ComfyBackendDirect", cookie: token ? `swarm_token=${token}` : undefined, wsTimeoutMs: 15_000, queueFront: request.queueFront },
       )
       return {
         ...result,
@@ -698,7 +698,7 @@ export class SwarmUIImageProvider implements ImageProvider {
         `${base}/ComfyBackendDirect`,
         workflow as Record<string, any>,
         request.signal,
-        { label: "SwarmUI/ComfyBackendDirect", cookie: token ? `swarm_token=${token}` : undefined, wsTimeoutMs: 15_000 },
+        { label: "SwarmUI/ComfyBackendDirect", cookie: token ? `swarm_token=${token}` : undefined, wsTimeoutMs: 15_000, queueFront: request.queueFront },
       )
       while (true) {
         const next = await stream.next()

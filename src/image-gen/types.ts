@@ -28,6 +28,8 @@ export interface ImageGenRequest {
     novelai?: { nonStreaming?: boolean };
   };
   signal?: AbortSignal;
+  /** Workflow providers only: queue ahead of pending ComfyUI prompts. */
+  queueFront?: boolean;
 }
 
 export type GeneratedMediaType = "image" | "video";

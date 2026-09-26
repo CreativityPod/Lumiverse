@@ -281,6 +281,57 @@ const thumbUrl = `${result.imageUrl}?size=sm`  // ~300px thumbnail
 
 ---
 
+## `spindle.imageGen.generateNative(input)`
+
+Run Lumiverse's built-in ImgGen pipeline for a chat: prompt mode and parsing, prompt presets, LoRA layers, the ComfyUI workflow library, persistence and `IMAGE_GEN_PROGRESS` / `IMAGE_GEN_COMPLETE` / `IMAGE_GEN_ERROR` events keyed by `clientJobId`. Prompt-parser, context and character-inclusion settings come from the user's ImgGen settings.
+
+```ts
+const result = await spindle.imageGen.generateNative({
+  chat_id: chatId,
+  connection_id: 'comfy-video-connection',   // optional; defaults to ImgGen's active connection
+  parameters: { workflow_id: 'wan-i2v' },    // pick a workflow from that connection's library
+  job_namespace: 'video',                    // optional; see "Job lanes" below
+  promptMode: 'custom',
+  prompt: 'the heroine turns toward the window',
+  outputTarget: 'chat_attachment',           // 'preview' (default) | 'chat_attachment' | 'attach_to_message'
+  clientJobId: crypto.randomUUID(),
+  includeDataUrl: false,
+})
+// result: { generated, reason?, prompt, negativePrompt, provider, jobId, messageId?,
+//           mediaType, mediaId, mediaUrl, mimeType, posterUrl?, imageId?, imageUrl? }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `chat_id` | `string` | **Required.** Chat whose context feeds the prompt. |
+| `connection_id` | `string` | Optional. Use this connection instead of the ImgGen panel's active one. |
+| `job_namespace` | `string` | Optional. Run in a separate job lane (see below). |
+| `outputTarget` | `string` | `preview` (default), `chat_attachment` or `attach_to_message`. The chat targets also require `chat_mutation`. |
+| `attachToMessageId` | `string` | Required for `attach_to_message`. |
+| `promptMode`, `prompt`, `negativePrompt`, `promptPresetId`, `skipParse` | | Same meaning as in the ImgGen panel. |
+| `parameters` | `object` | Merged over the connection's defaults. `workflow_id` selects a saved ComfyUI workflow. |
+| `characterLora`, `extraLoras`, `extraBaseTags`, `loraStrengthScale`, `bypassActiveLoraPreset` | | LoRA layering overrides. |
+| `promptGenerationTimeoutSeconds`, `generationTimeoutSeconds` | `number` | Phase timeouts. |
+
+### Job lanes
+
+Without `job_namespace`, the call shares the ImgGen panel's lane: a newer request for the same chat aborts the older one, and both share one scene-change cache.
+
+With `job_namespace`, the job runs in a lane owned by your extension. It never aborts, and is never aborted by, ImgGen jobs, and it keeps its own scene cache. ImgGen has priority on a shared ComfyUI server (compared by host and port):
+
+- A namespaced call fails with an error starting with `IMAGE_GEN_BUSY:` while an ImgGen job runs on the same server.
+- An ImgGen job started while namespaced jobs are active on its server is queued at the front of ComfyUI's pending queue. It cannot pre-empt a prompt that is already executing.
+
+## `spindle.imageGen.getActivity(userId?)`
+
+Report which of the user's connections currently have a built-in ImgGen job on their ComfyUI server. Use it to disable UI before calling `generateNative` with a `job_namespace`; the host still enforces the rule.
+
+```ts
+const { imageGenBusy, busyConnectionIds } = await spindle.imageGen.getActivity()
+```
+
+---
+
 ## `spindle.imageGen.getProviders(userId?)`
 
 List available image generation providers with their capability schemas. The schemas describe each provider's supported parameters, models, and features — useful for building dynamic settings UIs.

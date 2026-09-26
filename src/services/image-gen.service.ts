@@ -32,6 +32,17 @@ import { rawGenerate } from "./generate.service";
 import type { LlmMessage } from "../llm/types";
 import type { ImageGenRequest } from "../image-gen/types";
 import { resolveGeneratedMedia, resolveStoredGeneratedMediaType } from "../image-gen/generated-media";
+import {
+  IMAGE_GEN_BUSY_PREFIX,
+  clearActiveGenerationJob,
+  comfyServerKey,
+  generationJobKey,
+  getActiveGenerationJob,
+  hasNamespacedGenerationOn,
+  isPrimaryGenerationBusyOn,
+  normalizeJobNamespace,
+  setActiveGenerationJob,
+} from "../image-gen/job-activity";
 import type { Message } from "../types/message";
 import type { ImageGenConnectionProfile } from "../types/image-gen-connection";
 import { scheduleLowPriorityTask } from "../utils/low-priority-task";
@@ -293,6 +304,14 @@ export interface GenerateImageOptions {
   clientJobId?: string;
   promptGenerationTimeoutSeconds?: number;
   generationTimeoutSeconds?: number;
+  /** Use this connection profile instead of the ImgGen panel's active one. */
+  connectionId?: string;
+  /**
+   * Run in a named lane instead of the built-in ImgGen lane. Named-lane jobs
+   * keep their own supersede slot and scene cache per chat, and yield to ImgGen
+   * on a shared ComfyUI server.
+   */
+  jobNamespace?: string;
 }
 
 const SCENE_CACHE_MAX = 200;
@@ -334,10 +353,6 @@ Override any earlier environment-only instruction: include ${visibleSubjects} wh
 ${SUBJECT_AWARE_SCENE_SCHEMA}`;
 }
 
-// Tracks in-flight image generations keyed by `${userId}:${chatId}` so a new
-// request for the same chat can abort an existing one mid-flight.
-const activeImageGenerations = new Map<string, { controller: AbortController; startedAt: number }>();
-
 function sceneCacheSet(key: string, value: SceneData): void {
   // Delete first so re-insertion moves key to end (most-recently-used)
   sceneCache.delete(key);
@@ -371,7 +386,7 @@ export async function generateSceneBackground(
   settings = getImageGenSettings(userId);
 
   // Resolve connection profile
-  const connectionId = settings.activeImageGenConnectionId;
+  const connectionId = opts?.connectionId || settings.activeImageGenConnectionId;
   if (!connectionId) {
     throw new Error("No image generation connection selected. Create one in Settings → Image Gen Connections.");
   }
@@ -387,21 +402,29 @@ export async function generateSceneBackground(
     throw new Error(`No API key for image generation connection "${connection.name}"`);
   }
 
+  const namespace = normalizeJobNamespace(opts?.jobNamespace);
+  const serverKey = comfyServerKey(connection);
+  // ImgGen has priority on a shared ComfyUI server: named lanes do not start
+  // while it is busy there (including its prompt-parsing phase).
+  if (namespace && isPrimaryGenerationBusyOn(serverKey)) {
+    throw new Error(`${IMAGE_GEN_BUSY_PREFIX} Image generation is running on this ComfyUI server. Try again when it finishes.`);
+  }
+
   // Register this generation up-front so a newer request for the same chat
   // can abort it during *any* phase (scene analysis as well as image gen).
   const controller = new AbortController();
 
-  const registryKey = `${userId}:${chatId}`;
-  const existing = activeImageGenerations.get(registryKey);
+  const registryKey = generationJobKey(userId, chatId, namespace);
+  const existing = getActiveGenerationJob(registryKey);
   if (existing) {
     existing.controller.abort(new Error("Image generation superseded by a newer request"));
   }
-  activeImageGenerations.set(registryKey, { controller, startedAt: Date.now() });
+  setActiveGenerationJob(registryKey, { controller, startedAt: Date.now(), namespace, serverKey });
 
   const jobId = opts?.clientJobId || crypto.randomUUID();
 
   try {
-    const cacheKey = `${userId}:${chatId}`;
+    const cacheKey = registryKey;
     const promptInput = await resolvePromptInput(userId, chatId, settings, opts);
     const promptMode = opts?.skipParse
       ? "custom"
@@ -556,6 +579,8 @@ export async function generateSceneBackground(
       parameters: params,
       connectionOptions: connection.metadata,
       signal: generationSignal.signal,
+      // Jump ahead of pending named-lane (e.g. video) prompts on this server.
+      queueFront: !namespace && hasNamespacedGenerationOn(serverKey),
     };
 
     let response: Awaited<ReturnType<typeof provider.generate>>;
@@ -735,9 +760,7 @@ export async function generateSceneBackground(
   } finally {
     // Only clear the registry entry if it still points at our controller —
     // a newer request may have already overwritten it.
-    if (activeImageGenerations.get(registryKey)?.controller === controller) {
-      activeImageGenerations.delete(registryKey);
-    }
+    clearActiveGenerationJob(registryKey, controller);
   }
 }
 

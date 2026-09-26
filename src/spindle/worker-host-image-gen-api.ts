@@ -3,6 +3,7 @@ import "../image-gen/index";
 import type { ImageProvider } from "../image-gen/provider";
 import type { ImageGenRequest, ImageGenResponse } from "../image-gen/types";
 import { resolveGeneratedMedia } from "../image-gen/generated-media";
+import { comfyServerKey, isPrimaryGenerationBusyOn } from "../image-gen/job-activity";
 import * as imageGenConnSvc from "../services/image-gen-connections.service";
 import { applyActiveComfyUIWorkflowConfig } from "../services/image-gen.service";
 import * as nativeImageGenSvc from "../services/image-gen.service";
@@ -313,6 +314,29 @@ export class WorkerHostImageGenApi {
           }))
         : undefined;
 
+      const outputTarget = input?.outputTarget === undefined || input?.outputTarget === "preview"
+        ? "preview"
+        : input.outputTarget;
+      if (outputTarget !== "preview" && outputTarget !== "chat_attachment" && outputTarget !== "attach_to_message") {
+        throw new Error(`Unsupported native outputTarget: ${String(outputTarget)}`);
+      }
+      if (outputTarget !== "preview" && !this.context.hasPermission("chat_mutation")) {
+        throw new Error(`${PERMISSION_DENIED_PREFIX} chat_mutation — Chat mutation permission not granted`);
+      }
+      const attachToMessageId = typeof input?.attachToMessageId === "string" ? input.attachToMessageId.trim() : "";
+      if (outputTarget === "attach_to_message" && !attachToMessageId) {
+        throw new Error("attachToMessageId is required for the attach_to_message output target");
+      }
+      const connectionId = typeof input?.connection_id === "string" ? input.connection_id.trim() : "";
+      if (connectionId && !imageGenConnSvc.getConnection(userId, connectionId)) {
+        throw new Error("Image gen connection not found");
+      }
+      // Extension lanes are prefixed so they can never alias ImgGen's lane or
+      // another extension's lane.
+      const jobNamespace = typeof input?.job_namespace === "string" && input.job_namespace.trim()
+        ? `ext:${this.context.extensionIdentifier}:${input.job_namespace.trim()}`
+        : undefined;
+
       const promptMode = input?.promptMode === "scene"
         || input?.promptMode === "custom"
         || input?.promptMode === "parsed_custom"
@@ -345,7 +369,10 @@ export class WorkerHostImageGenApi {
         parameters: input?.parameters && typeof input.parameters === "object" && !Array.isArray(input.parameters)
           ? input.parameters
           : undefined,
-        outputTarget: "preview",
+        outputTarget,
+        attachToMessageId: attachToMessageId || undefined,
+        connectionId: connectionId || undefined,
+        jobNamespace,
         clientJobId: typeof input?.clientJobId === "string" ? input.clientJobId : undefined,
         promptGenerationTimeoutSeconds: input?.promptGenerationTimeoutSeconds,
         generationTimeoutSeconds: input?.generationTimeoutSeconds,
@@ -368,6 +395,7 @@ export class WorkerHostImageGenApi {
         mediaUrl: result.mediaUrl,
         mimeType: result.mimeType,
         posterUrl: result.posterUrl,
+        messageId: result.message?.id,
         jobId: result.jobId,
       };
       this.postResponse(
@@ -401,6 +429,27 @@ export class WorkerHostImageGenApi {
       this.context.enforceScopedUser(resolvedUserId);
       const result = imageGenConnSvc.listConnections(resolvedUserId, { limit: 100, offset: 0 });
       this.postResponse(requestId, result.data);
+    } catch (err: any) {
+      this.postResponse(requestId, undefined, err?.message ?? String(err));
+    }
+  }
+
+  /**
+   * Report which of the user's connections currently have a built-in ImgGen
+   * job on their ComfyUI server. Named-lane `generateNative` calls on those
+   * connections are refused until ImgGen finishes.
+   */
+  handleActivity(requestId: string, userId?: string): void {
+    try {
+      this.requirePermission();
+      const resolvedUserId = this.context.resolveEffectiveUserId(userId);
+      if (!resolvedUserId) throw new Error("userId is required for operator-scoped extensions");
+      this.context.enforceScopedUser(resolvedUserId);
+      const connections = imageGenConnSvc.listConnections(resolvedUserId, { limit: 100, offset: 0 }).data;
+      const busyConnectionIds = connections
+        .filter((connection) => isPrimaryGenerationBusyOn(comfyServerKey(connection)))
+        .map((connection) => connection.id);
+      this.postResponse(requestId, { imageGenBusy: busyConnectionIds.length > 0, busyConnectionIds });
     } catch (err: any) {
       this.postResponse(requestId, undefined, err?.message ?? String(err));
     }

@@ -67,7 +67,7 @@ export class ComfyUIImageProvider implements ImageProvider {
       baseUrl,
       workflow as Record<string, any>,
       request.signal,
-      { label: "ComfyUI", wsTimeoutMs: 10_000 },
+      { label: "ComfyUI", wsTimeoutMs: 10_000, queueFront: request.queueFront },
     )
 
     return {
@@ -98,7 +98,7 @@ export class ComfyUIImageProvider implements ImageProvider {
       baseUrl,
       workflow as Record<string, any>,
       request.signal,
-      { label: "ComfyUI", wsTimeoutMs: 10_000 },
+      { label: "ComfyUI", wsTimeoutMs: 10_000, queueFront: request.queueFront },
     )
 
     while (true) {

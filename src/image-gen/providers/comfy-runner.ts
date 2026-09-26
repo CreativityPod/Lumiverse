@@ -9,6 +9,9 @@ export interface ComfyRunnerOptions {
   // /ComfyBackendDirect proxy when the instance is auth-gated.
   cookie?: string
   wsTimeoutMs?: number
+  // Ask ComfyUI to place this prompt ahead of already-pending prompts. It
+  // cannot pre-empt a prompt that is already executing.
+  queueFront?: boolean
 }
 
 export type ComfyStreamEvent =
@@ -235,7 +238,7 @@ export async function* executeComfyWorkflowStream(
   const queueRes = await fetch(`${baseUrl}/prompt`, {
     method: "POST",
     headers: buildHeaders(cookie, { "Content-Type": "application/json" }),
-    body: JSON.stringify({ prompt: workflow, client_id: clientId }),
+    body: JSON.stringify({ prompt: workflow, client_id: clientId, ...(opts.queueFront ? { front: true } : {}) }),
     signal,
   })
 
